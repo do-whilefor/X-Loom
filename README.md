@@ -4,6 +4,8 @@
 
 仅支持 Linux。计划与验收依据见 [DEVELOPMENT.md](DEVELOPMENT.md)，实际兼容边界见 [docs/compatibility.md](docs/compatibility.md)。
 
+[DEVELOPMENT-NEXT.md](DEVELOPMENT-NEXT.md) 的会话、压缩与 FGS 扩展已接入。新增接口和重试方式见 [FGS 与执行登记 API](docs/next-state-api.md)，恢复及图工具边界见 [执行会话](docs/session-recovery.md)，验证结果见 [下一阶段验收记录](docs/validation-next.md)。
+
 ## 目录
 
 ```text

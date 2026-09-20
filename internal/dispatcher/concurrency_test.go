@@ -11,7 +11,6 @@ import (
 
 	"xloom/internal/board"
 	"xloom/internal/config"
-	"xloom/internal/contract"
 	"xloom/internal/server"
 	"xloom/internal/worker"
 )
@@ -344,6 +343,15 @@ func TestTriggersIgnoreNewIntentButReactToFactsHintsAndDrain(t *testing.T) {
 	if s.trigger(g) == "" {
 		t.Fatal("open intent drain missed")
 	}
+	g = base
+	g.Intents = []board.Intent{{ID: "i", ConcludedAt: board.Ptr("abandoned-by-decide")}}
+	if s.trigger(g) != "" {
+		t.Fatal("planner's own abandonment retriggered Decide")
+	}
+	s.stateRevisions["p"] = 1
+	if s.trigger(g) == "" {
+		t.Fatal("external execution failure revision missed")
+	}
 }
 
 func TestLateResultAfterStopOrDeleteNeverWrites(t *testing.T) {
@@ -432,7 +440,7 @@ func TestLostLeaseCancelsOnlyItsTaskAndCannotReleaseNewOwner(t *testing.T) {
 			t.Fatal("old release cleared replacement")
 		}
 	}
-	if err = s.apply(ctx, task, contract.Result{Kind: "fact", Fact: "late"}); err == nil {
+	if err = s.status(ctx, task, "result_pending", worker.Result{Status: "success", Text: `{"description":"late"}`}); err == nil {
 		t.Fatal("lost lease wrote a fact")
 	}
 }

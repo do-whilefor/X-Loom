@@ -28,7 +28,7 @@ func (f modelFunc) Generate(c context.Context, m []agent.Message, d []agent.Defi
 func TestExpiredExplorationBudgetConcludesBeforeResumedRequest(t *testing.T) {
 	j := job(t, "explore")
 	runDir := t.TempDir()
-	writeSession(t, runDir, session{RunID: j.RunID, Kind: j.Kind, StartedAt: time.Now().Add(-time.Minute), History: []agent.Message{agent.Text("user", "original task")}})
+	writeSession(t, runDir, j, session{RunID: j.RunID, Kind: j.Kind, StartedAt: time.Now().Add(-time.Minute), History: []agent.Message{agent.Text("user", "original task")}})
 	r, err := Run(context.Background(), j, Options{RunDir: runDir, Provider: modelFunc(func(_ context.Context, m []agent.Message, d []agent.Definition, _ agent.Emit) (agent.Message, error) {
 		if !strings.Contains(m[len(m)-1].Text(), "Stop exploration") {
 			t.Fatal("resumed without conclusion")
@@ -206,20 +206,42 @@ func TestConclusionHasHardIndependentDeadline(t *testing.T) {
 		t.Fatal(r, calls, err)
 	}
 }
-func writeSession(t *testing.T, dir string, s session) {
+func writeSession(t *testing.T, dir string, j Job, s session) {
 	t.Helper()
-	raw, err := json.Marshal(s)
+	var err error
+	s.SchemaVersion = sessionSchemaVersion
+	s.Identity, err = identityFor(j, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = os.WriteFile(filepath.Join(dir, "session.json"), raw, 0600); err != nil {
+	if j.Budget.Timeout > 0 {
+		s.ExecutionDeadline = s.StartedAt.Add(time.Duration(j.Budget.Timeout) * time.Second)
+	}
+	if s.Concluding && s.ConcludeDeadline.IsZero() {
+		s.ConcludeDeadline = s.ConcludeStartedAt.Add(time.Duration(j.Budget.ConcludeTimeout) * time.Second)
+	}
+	journal, err := openJournal(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.file.Close()
+	s.ContextCheckpoint = &agent.ContextCheckpoint{Version: agent.ContextCheckpointVersion}
+	for i := range s.History {
+		s.History[i].Sequence = uint64(i + 1)
+		s.ContextCheckpoint.LastSequence = uint64(i + 1)
+		if err := journal.append(agent.Event{Type: "message_end", Message: &s.History[i]}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.save(dir, journal); err != nil {
 		t.Fatal(err)
 	}
 }
+
 func TestRecoveryDoesNotReplayUncertainActionsOrDuplicatePrompt(t *testing.T) {
 	j := job(t, "explore")
 	runDir := t.TempDir()
-	writeSession(t, runDir, session{RunID: j.RunID, Kind: j.Kind, StartedAt: time.Now(), History: []agent.Message{agent.Text("user", "original task"), toolCall("write")}})
+	writeSession(t, runDir, j, session{RunID: j.RunID, Kind: j.Kind, StartedAt: time.Now(), History: []agent.Message{agent.Text("user", "original task"), toolCall("write")}})
 	p := modelFunc(func(_ context.Context, m []agent.Message, _ []agent.Definition, _ agent.Emit) (agent.Message, error) {
 		if len(m) != 3 || m[0].Text() != "original task" || !m[2].Content[0].IsError {
 			t.Fatalf("bad recovery: %#v", m)
@@ -249,7 +271,7 @@ func TestRecoveryDoesNotReplayUncertainActionsOrDuplicatePrompt(t *testing.T) {
 func TestExpiredConclusionIsNotResetOnRecovery(t *testing.T) {
 	j := job(t, "explore")
 	runDir := t.TempDir()
-	writeSession(t, runDir, session{RunID: j.RunID, Kind: j.Kind, StartedAt: time.Now().Add(-time.Hour), Concluding: true, ConcludeStartedAt: time.Now().Add(-time.Minute), History: []agent.Message{agent.Text("user", "summarize")}})
+	writeSession(t, runDir, j, session{RunID: j.RunID, Kind: j.Kind, StartedAt: time.Now().Add(-time.Hour), Concluding: true, ConcludeStartedAt: time.Now().Add(-time.Minute), History: []agent.Message{agent.Text("user", "summarize")}})
 	r, err := Run(context.Background(), j, Options{RunDir: runDir, Provider: modelFunc(func(context.Context, []agent.Message, []agent.Definition, agent.Emit) (agent.Message, error) {
 		t.Fatal("reset expired conclusion budget")
 		return agent.Message{}, nil

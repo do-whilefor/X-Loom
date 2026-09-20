@@ -21,6 +21,17 @@ func TestInvalidCommandsFailBeforeSideEffects(t *testing.T) {
 	}
 }
 
+func TestWorkerInterruptFlags(t *testing.T) {
+	for _, args := range [][]string{{"--job", "a", "--interrupt", "b"}, {"--cancel", "a", "--interrupt", "b"}, {"--interrupt", "a", "--force"}} {
+		if err := work(context.Background(), args, io.Discard, io.Discard); err == nil {
+			t.Fatal("accepted conflicting worker mode", args)
+		}
+	}
+	if err := work(context.Background(), []string{"--interrupt", t.TempDir()}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestHelpDoesNotStartServices(t *testing.T) {
 	for _, args := range [][]string{{"--help"}, {"serve", "--help"}, {"dispatch", "--help"}, {"worker", "--help"}} {
 		var out bytes.Buffer

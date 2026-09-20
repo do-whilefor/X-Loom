@@ -5,7 +5,9 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,9 +26,11 @@ import (
 )
 
 type Client struct {
-	Config config.Container
-	http   *http.Client
-	locks  sync.Map
+	Config       config.Container
+	http         *http.Client
+	locks        sync.Map
+	graphMu      sync.RWMutex
+	graphHandler func(context.Context, worker.Job, worker.GraphRequest) (any, error)
 }
 type APIError struct{ Status int }
 
@@ -236,6 +240,7 @@ type resultSink struct {
 	pending []byte
 	result  worker.Result
 	found   bool
+	graph   func(worker.GraphRequest) error
 }
 
 func (s *resultSink) Write(p []byte) (int, error) {
@@ -251,6 +256,18 @@ func (s *resultSink) Write(p []byte) (int, error) {
 			return 0, errors.New("worker event too large")
 		}
 		var result worker.Result
+		var event worker.GraphRequestEvent
+		if json.Unmarshal(s.pending, &event) == nil && event.Type == "graph_request" {
+			if len(s.pending) > worker.MaxGraphRPCBytes {
+				return 0, errors.New("graph request exceeds 128 KiB")
+			}
+			if s.graph == nil {
+				return 0, errors.New("worker requested an unavailable graph bridge")
+			}
+			if err := s.graph(event.Request); err != nil {
+				return 0, err
+			}
+		}
 		if json.Unmarshal(s.pending, &result) == nil && result.Type == "result" {
 			if s.found {
 				return 0, errors.New("worker emitted multiple results")
@@ -287,15 +304,31 @@ func (c *Client) Run(ctx context.Context, w config.Worker, j worker.Job) (worker
 	if err = c.archive(ctx, name, target, raw); err != nil {
 		return worker.Result{}, err
 	}
+	launch := make([]byte, 16)
+	if _, err = rand.Read(launch); err != nil {
+		return worker.Result{}, err
+	}
+	launchToken := hex.EncodeToString(launch)
+	if err = c.archive(ctx, name, path.Join(path.Dir(target), "launch-token"), []byte(launchToken)); err != nil {
+		return worker.Result{}, err
+	}
 	env := []string{}
 	for k, v := range w.Env {
+		if k == "XLOOM_LAUNCH_TOKEN" {
+			continue
+		}
 		env = append(env, k+"="+v)
 	}
+	env = append(env, "XLOOM_LAUNCH_TOKEN="+launchToken)
 	sort.Strings(env)
-	sink := &resultSink{}
+	sink := &resultSink{graph: c.graphBridge(ctx, name, path.Dir(target), j)}
 	_, err = c.exec(ctx, name, []string{"/usr/local/bin/xloom", "worker", "--job", target}, env, sink)
 	if err != nil || ctx.Err() != nil {
-		c.cancel(name, path.Dir(target))
+		if ctx.Err() != nil && !errors.Is(context.Cause(ctx), worker.ErrInterrupted) {
+			c.cancel(name, path.Dir(target))
+		} else if stopErr := c.interrupt(name, path.Dir(target)); stopErr != nil {
+			return worker.Result{}, errors.Join(err, fmt.Errorf("cannot confirm execution interruption: %w", stopErr))
+		}
 		if ctx.Err() != nil {
 			return worker.Result{}, ctx.Err()
 		}
@@ -310,6 +343,13 @@ func (c *Client) Run(ctx context.Context, w config.Worker, j worker.Job) (worker
 		return worker.Result{}, errors.New("worker exited without a result")
 	}
 	return sink.result, nil
+}
+
+func (c *Client) interrupt(name, runDir string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	_, err := c.exec(ctx, name, []string{"/usr/local/bin/xloom", "worker", "--interrupt", runDir}, nil, io.Discard)
+	return err
 }
 func (c *Client) cancel(name, runDir string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,6 +15,95 @@ import (
 	"testing"
 	"time"
 )
+
+func TestInterruptWorkerHelper(t *testing.T) {
+	dir := os.Getenv("XLOOM_TEST_INTERRUPT_DIR")
+	if dir == "" {
+		return
+	}
+	unlock, err := Lock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if err := RegisterWorker(dir); err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.Create(filepath.Join(dir, "output.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	if err := Run(context.Background(), dir, dir, out, "bash", "-c", "sleep 60 & echo $! > child.pid; wait"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInterruptStopsWorkerAndChildrenWithoutPermanentlyCancelling(t *testing.T) {
+	dir := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestInterruptWorkerHelper$")
+	cmd.Env = append(os.Environ(), "XLOOM_TEST_INTERRUPT_DIR="+dir)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	child := awaitPID(t, filepath.Join(dir, "child.pid"))
+	if err := Interrupt(dir); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+	awaitGone(t, child)
+	if Cancelled(dir) {
+		t.Fatal("infrastructure interruption became a hard stop")
+	}
+	unlock, err := Lock(dir)
+	if err != nil {
+		t.Fatal("resume lock unavailable", err)
+	}
+	unlock()
+	if err := Cancel(dir, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := Interrupt(dir); err != nil {
+		t.Fatal(err)
+	}
+	if !Cancelled(dir) {
+		t.Fatal("interrupt cleared a previous hard stop")
+	}
+}
+
+func TestLaunchTokenRejectsLateInterruptedProcess(t *testing.T) {
+	dir := t.TempDir()
+	old := strings.Repeat("a", 32)
+	next := strings.Repeat("b", 32)
+	t.Setenv("XLOOM_LAUNCH_TOKEN", old)
+	if err := os.WriteFile(filepath.Join(dir, "launch-token"), []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckLaunch(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := Interrupt(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckLaunch(dir); err == nil {
+		t.Fatal("late old exec accepted after interruption without PID")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "launch-token"), []byte(next), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckLaunch(dir); err == nil {
+		t.Fatal("old exec accepted after next launch")
+	}
+	t.Setenv("XLOOM_LAUNCH_TOKEN", next)
+	if err := CheckLaunch(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XLOOM_LAUNCH_TOKEN", "")
+	if err := CheckLaunch(dir); err != nil {
+		t.Fatal("manual worker compatibility broken", err)
+	}
+}
 
 func awaitPID(t *testing.T, path string) int {
 	t.Helper()

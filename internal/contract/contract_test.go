@@ -5,6 +5,21 @@ import (
 	"testing"
 )
 
+func TestGraphDecisionReceiptContract(t *testing.T) {
+	result, err := Parse(`{"accepted":true,"data":{"decided":true}}`, "reason", false, 0, 3)
+	if err != nil || result.Kind != "decided" {
+		t.Fatalf("%+v %v", result, err)
+	}
+	for _, output := range []string{`{"decided":true}`, `{"accepted":true,"data":{"decided":false}}`, `{"accepted":true,"data":{"decided":true,"intents":[]}}`} {
+		if _, err := Parse(output, "reason", false, 0, 3); err == nil {
+			t.Fatalf("invalid receipt accepted: %s", output)
+		}
+	}
+	if _, err := Parse(`{"accepted":true,"data":{"decided":true}}`, "explore", false, 0, 3); err == nil {
+		t.Fatal("execution used a decision receipt")
+	}
+}
+
 func TestMixedOutputAndTaskContracts(t *testing.T) {
 	cases := []struct {
 		name, text, kind string

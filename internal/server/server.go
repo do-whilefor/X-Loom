@@ -71,6 +71,8 @@ func New(store *b.Store) http.Handler {
 			s.wrap(s.intentAction)(w, r)
 		})
 	}
+	s.registerStateRoutes(m)
+	s.registerExecutionRoutes(m)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, pattern := m.Handler(r)
 		if pattern == "" {
@@ -267,6 +269,29 @@ func guard(t *b.Tx, g b.Graph, r *http.Request) error {
 		Intent: r.Header.Get("X-Xloom-Intent"), AllowConcluded: r.Header.Get("X-Xloom-Lease") == "bootstrap" && strings.HasSuffix(r.URL.Path, "/complete"),
 	})
 }
+
+// Unregistered clients without execution headers retain Cairn's ability to
+// reuse a worker name after stopping and reactivating a project. Registered
+// runs and explicitly fenced requests must never revive a revoked identity.
+func guardClaim(t *b.Tx, project, worker string, r *http.Request) error {
+	if r.Header.Get("X-Xloom-Run") == "" {
+		var registered bool
+		if err := t.QueryRow("SELECT EXISTS(SELECT 1 FROM xloom_executions WHERE project_id=? AND lease=?)", project, worker).Scan(&registered); err != nil {
+			return err
+		}
+		if !registered {
+			return nil
+		}
+	}
+	revoked, err := t.RunRevoked(project, worker)
+	if err != nil {
+		return err
+	}
+	if revoked {
+		return b.Err(409, "Execution was revoked")
+	}
+	return nil
+}
 func (s *Server) health(t *b.Tx, _ *request, _ *http.Request) (int, any, error) {
 	_, err := t.Settings()
 	return 200, map[string]string{"status": "ok"}, err
@@ -386,6 +411,11 @@ func (s *Server) reason(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 	if err = g.RequireActive(); err != nil {
 		return 0, nil, err
 	}
+	if op == "claim" || op == "heartbeat" {
+		if err := guardClaim(t, g.Project.ID, worker, r); err != nil {
+			return 0, nil, err
+		}
+	}
 	lease := g.Project.Reason
 	if lease != nil && lease.Worker != worker {
 		return 0, nil, b.Err(409, "Project reason is currently claimed by "+lease.Worker)
@@ -424,6 +454,9 @@ func (s *Server) hint(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 }
 func (s *Server) intent(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 	from, desc, creator, worker := q.sources(), q.text("description"), q.text("creator"), q.optional("worker")
+	if q.err != nil {
+		return 0, nil, q.err
+	}
 	g, err := t.Load(r.PathValue("pid"))
 	if err != nil {
 		return 0, nil, err
@@ -434,11 +467,28 @@ func (s *Server) intent(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 	if err = guard(t, g, r); err != nil {
 		return 0, nil, err
 	}
+	if r.Header.Get("X-Xloom-Run") != "" && r.Header.Get("X-Xloom-Lease") != "reason" {
+		return 0, nil, b.Err(403, "only Decide can create steps")
+	}
 	if err = g.ValidateSources(from); err != nil {
 		return 0, nil, err
 	}
+	if r.Header.Get("X-Xloom-Run") != "" {
+		state, err := t.State(g.Project.ID)
+		if err != nil {
+			return 0, nil, err
+		}
+		if err = state.ValidateFactSources(from, false); err != nil {
+			return 0, nil, err
+		}
+	}
 	if worker != nil && *worker != creator {
 		return 0, nil, b.Err(400, "worker must be null or equal to creator")
+	}
+	if r.Header.Get("X-Xloom-Lease") == "reason" && r.Header.Get("X-Xloom-Run") != "" {
+		if err = t.CheckNewStepLimit(g.Project.ID, r.Header.Get("X-Xloom-Run")); err != nil {
+			return 0, nil, err
+		}
 	}
 	id, err := t.Next(g.Project.ID, "intent")
 	if err != nil {
@@ -467,6 +517,14 @@ func (s *Server) intentAction(t *b.Tx, q *request, r *http.Request) (int, any, e
 	}
 	if err = g.RequireActive(); err != nil {
 		return 0, nil, err
+	}
+	if err = t.StepAvailable(g.Project.ID, r.PathValue("iid")); err != nil {
+		return 0, nil, err
+	}
+	if op == "heartbeat" {
+		if err := guardClaim(t, g.Project.ID, worker, r); err != nil {
+			return 0, nil, err
+		}
 	}
 	if err = guard(t, g, r); err != nil {
 		return 0, nil, err
@@ -516,6 +574,12 @@ func (s *Server) complete(t *b.Tx, q *request, r *http.Request) (int, any, error
 		return 0, nil, err
 	}
 	if err = g.ValidateSources(from); err != nil {
+		return 0, nil, err
+	}
+	if r.Header.Get("X-Xloom-Run") != "" && r.Header.Get("X-Xloom-Lease") != "reason" && r.Header.Get("X-Xloom-Lease") != "bootstrap" {
+		return 0, nil, b.Err(403, "Execute cannot complete the project")
+	}
+	if err = t.ValidateStateCompletion(g.Project.ID, from); err != nil {
 		return 0, nil, err
 	}
 	id, err := t.Next(g.Project.ID, "intent")

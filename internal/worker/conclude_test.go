@@ -151,8 +151,7 @@ func TestConclusionRecoveryReusesFrozenInputAndDeadline(t *testing.T) {
 	}
 	started := time.Now().Add(-500 * time.Millisecond)
 	originalDeadline := started.Add(time.Second)
-	writeSession(t, runDir, session{RunID: j.RunID, Kind: j.Kind, StartedAt: started.Add(-time.Minute), Concluding: true, ConcludeStartedAt: started, ConcludeDeadline: originalDeadline, ConclusionInputVersion: conclusionInputVersion, ConclusionPrompt: frozen, History: []agent.Message{agent.Text("user", "original task"), agent.Text("user", frozen)}})
-	j.Budget.ConcludeTimeout = 60 // Recovery must not apply a changed budget.
+	writeSession(t, runDir, j, session{RunID: j.RunID, Kind: j.Kind, StartedAt: started.Add(-time.Minute), Concluding: true, ConcludeStartedAt: started, ConcludeDeadline: originalDeadline, ConclusionInputVersion: conclusionInputVersion, ConclusionPrompt: frozen, History: []agent.Message{agent.Text("user", "original task"), agent.Text("user", frozen)}})
 	os.WriteFile(filepath.Join(runDir, "output-old.txt"), []byte("changed after boundary"), 0600)
 	os.WriteFile(filepath.Join(runDir, "output-new.txt"), []byte("new after boundary"), 0600)
 	r, err := Run(context.Background(), j, Options{RunDir: runDir, Provider: modelFunc(func(ctx context.Context, m []agent.Message, d []agent.Definition, _ agent.Emit) (agent.Message, error) {
@@ -206,7 +205,7 @@ func TestSnapshotFailurePersistsBoundaryBeforeRecovery(t *testing.T) {
 		t.Fatal("boundary was not durable before snapshot preparation", saved)
 	}
 	os.WriteFile(filepath.Join(runDir, "output-later.txt"), []byte("evidence appeared after failed snapshot"), 0600)
-	r, err := Run(context.Background(), j, Options{RunDir: runDir, Provider: modelFunc(func(_ context.Context, m []agent.Message, d []agent.Definition, _ agent.Emit) (agent.Message, error) {
+	r, err := Run(context.Background(), j, Options{RunDir: alias, Provider: modelFunc(func(_ context.Context, m []agent.Message, d []agent.Definition, _ agent.Emit) (agent.Message, error) {
 		last := m[len(m)-1].Text()
 		if d != nil || strings.Contains(last, "evidence appeared after failed snapshot") || !strings.Contains(last, "No files have been read on recovery") {
 			t.Fatal("recovery refreshed the failed snapshot")
@@ -218,12 +217,12 @@ func TestSnapshotFailurePersistsBoundaryBeforeRecovery(t *testing.T) {
 	}
 }
 
-func TestLegacyConclusionMigratesWithoutReadingCurrentOutputs(t *testing.T) {
+func TestIncompleteConclusionSnapshotRecoversWithoutReadingCurrentOutputs(t *testing.T) {
 	j := job(t, "explore")
 	runDir := t.TempDir()
 	started := time.Now()
 	os.WriteFile(filepath.Join(runDir, "output-new.txt"), []byte("post-boundary secret"), 0600)
-	writeSession(t, runDir, session{RunID: j.RunID, Kind: j.Kind, StartedAt: started.Add(-time.Minute), Concluding: true, ConcludeStartedAt: started, ConclusionPrompt: "Read graph.yaml and inspect files", History: []agent.Message{agent.Text("user", "old task"), agent.Text("user", "Read graph.yaml and inspect files")}})
+	writeSession(t, runDir, j, session{RunID: j.RunID, Kind: j.Kind, StartedAt: started.Add(-time.Minute), Concluding: true, ConcludeStartedAt: started, ConclusionPrompt: "Read graph.yaml and inspect files", History: []agent.Message{agent.Text("user", "old task"), agent.Text("user", "Read graph.yaml and inspect files")}})
 	r, err := Run(context.Background(), j, Options{RunDir: runDir, Provider: modelFunc(func(_ context.Context, m []agent.Message, d []agent.Definition, _ agent.Emit) (agent.Message, error) {
 		last := m[len(m)-1].Text()
 		if d != nil || !strings.Contains(last, "No files have been read on recovery") || !strings.Contains(last, "<task_graph>") || strings.Contains(last, "post-boundary secret") {
@@ -251,7 +250,7 @@ func TestRecoveryAfterSnapshotSavedBeforeInstructionWasAppended(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeSession(t, runDir, session{RunID: j.RunID, Kind: j.Kind, StartedAt: started.Add(-time.Minute), Concluding: true, ConcludeStartedAt: started, ConclusionInputVersion: conclusionInputVersion, ConclusionPrompt: frozen, History: []agent.Message{agent.Text("user", "original task"), agent.Text("assistant", "pre-conclusion unfinished answer")}})
+	writeSession(t, runDir, j, session{RunID: j.RunID, Kind: j.Kind, StartedAt: started.Add(-time.Minute), Concluding: true, ConcludeStartedAt: started, ConclusionInputVersion: conclusionInputVersion, ConclusionPrompt: frozen, History: []agent.Message{agent.Text("user", "original task"), agent.Text("assistant", "pre-conclusion unfinished answer")}})
 	os.WriteFile(filepath.Join(runDir, "output-before.txt"), []byte("changed after crash"), 0600)
 	called := false
 	r, err := Run(context.Background(), j, Options{RunDir: runDir, Provider: modelFunc(func(_ context.Context, m []agent.Message, d []agent.Definition, _ agent.Emit) (agent.Message, error) {

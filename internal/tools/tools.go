@@ -93,7 +93,14 @@ func (s *Set) output(f *os.File, err error) (string, error) {
 	data, readErr := io.ReadAll(io.LimitReader(f, int64(s.limit()+1)))
 	text := string(data)
 	if len(data) > s.limit() {
-		text = string(data[:s.limit()]) + "\n[Output truncated. Full output: " + f.Name() + "]"
+		head := s.limit() / 2
+		tailBytes := s.limit() - head
+		if _, seekErr := f.Seek(-int64(tailBytes), io.SeekEnd); seekErr != nil {
+			return "", errors.Join(err, readErr, seekErr)
+		}
+		tail, tailErr := io.ReadAll(io.LimitReader(f, int64(tailBytes)))
+		readErr = errors.Join(readErr, tailErr)
+		text = string(data[:head]) + "\n[Middle omitted. Full output: " + f.Name() + "]\n" + string(tail)
 	}
 	return strings.ToValidUTF8(text, "�"), errors.Join(err, readErr)
 }

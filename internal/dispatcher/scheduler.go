@@ -16,7 +16,6 @@ import (
 	"xloom/internal/agent"
 	"xloom/internal/board"
 	"xloom/internal/config"
-	"xloom/internal/contract"
 	"xloom/internal/provider"
 	"xloom/internal/worker"
 )
@@ -28,10 +27,13 @@ type Runner interface {
 }
 type checkpoint struct{ Facts, Hints, Open int }
 type task struct {
-	Job    worker.Job
-	Worker config.Worker
-	Lease  Lease
-	Cancel context.CancelFunc
+	Job          worker.Job
+	Worker       config.Worker
+	Lease        Lease
+	Cancel       context.CancelFunc
+	Root         context.Context
+	Execution    board.Execution
+	LeaseTimeout time.Duration
 }
 type finished struct {
 	Task    *task
@@ -43,26 +45,33 @@ type cleaned struct {
 	Err       error
 }
 type Scheduler struct {
-	Config      config.Config
-	Client      *Client
-	Runner      Runner
-	running     map[string]*task
-	admitted    map[string]bool
-	checkpoints map[string]checkpoint
-	unhealthy   map[string]time.Time
-	rejected    map[string]time.Time
-	cleanup     map[string]string
-	cleaned     map[string]string
-	done        chan finished
-	cleanupDone chan cleaned
-	wg          sync.WaitGroup
-	cursor      int
+	Config            config.Config
+	Client            *Client
+	Runner            Runner
+	running           map[string]*task
+	admitted          map[string]bool
+	checkpoints       map[string]checkpoint
+	unhealthy         map[string]time.Time
+	rejected          map[string]time.Time
+	cleanup           map[string]string
+	cleaned           map[string]string
+	done              chan finished
+	cleanupDone       chan cleaned
+	wg                sync.WaitGroup
+	cursor            int
+	executions        []board.Execution
+	decisionRevisions map[string]int64
+	stateRevisions    map[string]int64
+	states            map[string]board.State
+	leaseTimeout      time.Duration
 	// CheckHealth overrides the model readiness probe in tests or embeddings.
 	CheckHealth func(context.Context, config.Worker) error
 }
 
 func New(c config.Config, r Runner) *Scheduler {
-	return &Scheduler{Config: c, Runner: r, Client: &Client{Base: c.Server}, running: map[string]*task{}, admitted: map[string]bool{}, checkpoints: map[string]checkpoint{}, unhealthy: map[string]time.Time{}, rejected: map[string]time.Time{}, cleanup: map[string]string{}, cleaned: map[string]string{}, done: make(chan finished, c.Runtime.MaxWorkers), cleanupDone: make(chan cleaned, c.Runtime.MaxProjects+8)}
+	s := &Scheduler{Config: c, Runner: r, Client: &Client{Base: c.Server}, running: map[string]*task{}, admitted: map[string]bool{}, checkpoints: map[string]checkpoint{}, unhealthy: map[string]time.Time{}, rejected: map[string]time.Time{}, cleanup: map[string]string{}, cleaned: map[string]string{}, done: make(chan finished, c.Runtime.MaxWorkers), cleanupDone: make(chan cleaned, c.Runtime.MaxProjects+8), decisionRevisions: map[string]int64{}, stateRevisions: map[string]int64{}, states: map[string]board.State{}}
+	s.configureGraphHandler()
+	return s
 }
 func (s *Scheduler) Health(ctx context.Context, force bool) error {
 	if s.Config.Runtime.HealthMode == "disabled" && !force {
@@ -97,6 +106,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		return err
 	}
 	leaseTimeout := min(settings.IntentTimeout, settings.ReasonTimeout)
+	s.leaseTimeout = time.Duration(leaseTimeout) * time.Second
 	if s.Config.Runtime.Interval >= leaseTimeout {
 		return errors.New("heartbeat interval must be shorter than each server lease timeout")
 	}
@@ -153,6 +163,7 @@ func (s *Scheduler) reap() {
 			if f.Outcome == "success" && f.Task.Job.Kind == "reason" {
 				g := f.Task.Job.Graph
 				s.checkpoints[g.Project.ID] = checkpoint{len(g.Facts), len(g.Hints), g.OpenCount()}
+				s.decisionRevisions[g.Project.ID] = f.Task.Job.DecisionRevision
 			}
 			slog.Info("task finished", "project", f.Task.Job.Graph.Project.ID, "run", f.Task.Job.RunID, "task", f.Task.Job.Kind, "outcome", f.Outcome, "error", f.Err)
 		default:
@@ -179,6 +190,16 @@ func (s *Scheduler) Step(ctx context.Context) error {
 		return err
 	}
 	s.reap()
+	if s.leaseTimeout == 0 {
+		var settings board.Settings
+		if err := s.Client.Do(ctx, "GET", "/settings", nil, &settings, nil); err != nil {
+			return err
+		}
+		s.leaseTimeout = time.Duration(min(settings.IntentTimeout, settings.ReasonTimeout)) * time.Second
+		if s.leaseTimeout <= time.Duration(s.Config.Runtime.Interval)*time.Second {
+			return errors.New("heartbeat interval must be shorter than each server lease timeout")
+		}
+	}
 	summaries, err := s.Client.List(ctx)
 	if err != nil {
 		return err
@@ -205,6 +226,13 @@ func (s *Scheduler) Step(ctx context.Context) error {
 		if states[t.Job.Graph.Project.ID] != "active" {
 			t.Cancel()
 		}
+	}
+	if err := s.loadExecutions(ctx); err != nil {
+		return err
+	}
+	s.releaseIdleAdmissions()
+	if err := s.recoverExecutions(ctx, states); err != nil {
+		return err
 	}
 	managed, err := s.Runner.Projects(ctx)
 	if err != nil {
@@ -281,7 +309,7 @@ func (s *Scheduler) Step(ctx context.Context) error {
 	return nil
 }
 func bootstrap(i board.Intent) bool {
-	return i.To == nil && i.Description == "bootstrap" && i.Creator == "dispatcher.bootstrap" && len(i.From) == 1 && i.From[0] == "origin"
+	return i.To == nil && i.ConcludedAt == nil && i.Description == "bootstrap" && i.Creator == "dispatcher.bootstrap" && len(i.From) == 1 && i.From[0] == "origin"
 }
 func initial(g board.Graph) bool {
 	if len(g.Facts) != 2 {
@@ -306,7 +334,9 @@ func (s *Scheduler) trigger(g board.Graph) string {
 	if !ok {
 		return "initial"
 	}
-	if len(g.Facts) > p.Facts || len(g.Hints) > p.Hints || (p.Open > 0 && g.OpenCount() == 0) {
+	// Legacy To-based draining excludes the planner's own abandonment (To=nil).
+	// Actual scheduling separately filters State.Steps and ConcludedAt.
+	if len(g.Facts) > p.Facts || len(g.Hints) > p.Hints || (p.Open > 0 && g.OpenCount() == 0) || s.stateRevisions[g.Project.ID] > s.decisionRevisions[g.Project.ID] {
 		return "new_facts_or_hints_or_finished_intents"
 	}
 	return ""
@@ -327,14 +357,41 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 	if running >= s.Config.Runtime.MaxProjectWorkers {
 		return false, nil
 	}
-	g, err := s.Client.Get(ctx, id)
+	var state board.State
+	err := s.Client.Do(ctx, "GET", projectPath(id)+"/state", nil, &state, nil)
 	if err != nil {
 		return false, err
 	}
+	g := state.Graph
+	s.stateRevisions[id] = state.DecisionRevision
+	s.states[id] = state
 	if g.Project.Status != "active" {
 		return false, nil
 	}
-	if initial(g) {
+	// A failed bootstrap may already have handed planning to Decide. Explicit
+	// retry still refers to that same Step, even after normal steps were added.
+	// Drain current project work first, then run the authorized initialization
+	// attempt alone, just as the original bootstrap gate does.
+	for n := range g.Intents {
+		i := &g.Intents[n]
+		if bootstrap(*i) && s.previous(g, "bootstrap", i) != "" {
+			if running > 0 || g.Project.Reason != nil || i.Worker != nil {
+				return false, nil
+			}
+			return s.launch(ctx, g, "bootstrap", i, "")
+		}
+	}
+	bootstrapFailed := false
+	for _, step := range state.Steps {
+		if step.Status == "failed" {
+			for _, intent := range g.Intents {
+				if intent.ID == step.ID && bootstrap(intent) {
+					bootstrapFailed = true
+				}
+			}
+		}
+	}
+	if initial(g) && !bootstrapFailed {
 		if g.Project.Reason != nil || localReason || localBootstrap {
 			return false, nil
 		}
@@ -368,13 +425,19 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 	}
 	if g.Project.Reason == nil && !localReason {
 		if trigger := s.trigger(g); trigger != "" {
-			return s.launch(ctx, g, "reason", nil, trigger)
+			if ok, err := s.launch(ctx, g, "reason", nil, trigger); ok || err != nil {
+				return ok, err
+			}
 		}
+	}
+	stepState := map[string]board.Step{}
+	for _, step := range state.Steps {
+		stepState[step.ID] = step
 	}
 	var newest *board.Intent
 	for n := range g.Intents {
 		i := &g.Intents[n]
-		if i.To != nil || i.Worker != nil || bootstrap(*i) {
+		if i.To != nil || i.ConcludedAt != nil || i.Worker != nil || bootstrap(*i) || stepState[i.ID].Status == "abandoned" || s.executionBlocked(g, "explore", i) {
 			continue
 		}
 		local := false
@@ -383,7 +446,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 				local = true
 			}
 		}
-		if !local && (newest == nil || i.CreatedAt > newest.CreatedAt) {
+		if !local && (newest == nil || stepState[i.ID].Priority > stepState[newest.ID].Priority || (stepState[i.ID].Priority == stepState[newest.ID].Priority && i.CreatedAt > newest.CreatedAt)) {
 			newest = i
 		}
 	}
@@ -432,6 +495,9 @@ func (s *Scheduler) choose(project, kind string) *config.Worker {
 	return &candidates[0]
 }
 func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, intent *board.Intent, trigger string) (bool, error) {
+	if s.executionBlocked(g, kind, intent) {
+		return false, nil
+	}
 	w := s.choose(g.Project.ID, kind)
 	if w == nil {
 		return false, nil
@@ -458,17 +524,16 @@ func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, inte
 	// Worker owns its execution budget and the separate conclusion deadline.
 	// A dispatcher deadline measured from container startup could abort before
 	// a long current turn reaches the boundary where soft conclusion begins.
-	taskCtx, cancel := context.WithCancel(ctx)
-	t := &task{Job: worker.Job{RunID: id, Kind: kind, WorkerType: w.Type, Graph: g, Intent: intent, Budget: budget, Workspace: "/workspace"}, Worker: *w, Lease: lease, Cancel: cancel}
-	s.running[id] = t
-	s.admitted[g.Project.ID] = true
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		defer cancel()
-		outcome, err := s.runTask(taskCtx, t)
-		s.done <- finished{t, outcome, err}
-	}()
+	t := &task{Job: worker.Job{RunID: id, Kind: kind, WorkerType: w.Type, Graph: g, Intent: intent, Budget: budget, Workspace: "/workspace", GraphRPC: true, DecisionRevision: s.stateRevisions[g.Project.ID], EnvironmentID: s.environmentID(*w)}, Worker: *w, Lease: lease}
+	if state, ok := s.states[g.Project.ID]; ok {
+		state.Graph = g
+		t.Job.State = &state
+	}
+	if err := s.register(ctx, t); err != nil {
+		_ = s.Client.Do(ctx, "POST", s.leasePath(t)+"/release", map[string]string{"worker": lease.Run}, nil, nil)
+		return false, err
+	}
+	s.start(ctx, t)
 	return true, nil
 }
 func (s *Scheduler) runTask(ctx context.Context, t *task) (string, error) {
@@ -492,40 +557,7 @@ func (s *Scheduler) runTask(ctx context.Context, t *task) (string, error) {
 			return "unhealthy", err
 		}
 	}
-	result, err := s.Runner.Run(ctx, t.Worker, t.Job)
-	if ctx.Err() != nil {
-		return "cancelled", ctx.Err()
-	}
-	if err != nil {
-		return "failed", err
-	}
-	if result.Status != "success" {
-		return "failed", errors.New(result.Error)
-	}
-	r, err := contract.Parse(result.Text, t.Job.Kind, result.Conclude, t.Job.Graph.OpenCount(), s.Config.Tasks.Reason.MaxIntents)
-	if err != nil {
-		return "failed", err
-	}
-	if r.Kind == "rejected" {
-		return "rejected", nil
-	}
-	// Renew ownership before any write, including a no-op reason. The Server
-	// checks the execution identity again atomically with each mutation.
-	if err := s.Client.Do(ctx, "POST", s.leasePath(t)+"/heartbeat", map[string]string{"worker": t.Lease.Run}, nil, &t.Lease); err != nil {
-		return "failed", err
-	}
-	// A bootstrap conclusion closes its intent before project completion. Stop
-	// heartbeat renewal here so that the closed intent cannot cancel completion.
-	// Subsequent writes remain fenced by the Server's atomic ownership check.
-	stopLease()
-	<-heartbeatDone
-	if err := ctx.Err(); err != nil {
-		return "cancelled", err
-	}
-	if err = s.apply(ctx, t, r); err != nil {
-		return "failed", err
-	}
-	return "success", nil
+	return s.runRegistered(ctx, t, func() { stopLease(); <-heartbeatDone })
 }
 func (s *Scheduler) leasePath(t *task) string {
 	base := projectPath(t.Job.Graph.Project.ID)
@@ -539,12 +571,19 @@ func (s *Scheduler) heartbeat(ctx context.Context, t *task, cancel context.Cance
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	last := time.Now()
+	timeout := t.LeaseTimeout
+	if timeout <= interval {
+		timeout = 2 * interval
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			callCtx, c := context.WithTimeout(ctx, interval)
+			// Queueing behind other transactions must not turn a healthy busy
+			// Server into a hard cancellation after only two heartbeat intervals.
+			// Stop before the actual Server lease expires, including queue time.
+			callCtx, c := context.WithDeadline(ctx, last.Add(timeout-interval))
 			err := s.Client.Do(callCtx, "POST", s.leasePath(t)+"/heartbeat", map[string]string{"worker": t.Lease.Run}, nil, &t.Lease)
 			c()
 			if ctx.Err() != nil {
@@ -555,64 +594,10 @@ func (s *Scheduler) heartbeat(ctx context.Context, t *task, cancel context.Cance
 				continue
 			}
 			var pe *ProtocolError
-			if errors.As(err, &pe) && (pe.Status == 403 || pe.Status == 404 || pe.Status == 409) || time.Since(last) >= 2*interval {
+			if errors.As(err, &pe) && (pe.Status == 403 || pe.Status == 404 || pe.Status == 409) || time.Since(last) >= timeout-interval {
 				cancel()
 				return
 			}
 		}
 	}
-}
-func (s *Scheduler) apply(ctx context.Context, t *task, r contract.Result) error {
-	base := projectPath(t.Job.Graph.Project.ID)
-	post := func(path string, input, output any) error {
-		return s.Client.Do(ctx, "POST", base+path, input, output, &t.Lease)
-	}
-	if t.Job.Kind == "reason" {
-		switch r.Kind {
-		case "noop":
-			return nil
-		case "complete":
-			input := r.Complete.Input()
-			input["worker"] = t.Lease.Run
-			err := post("/complete", input, nil)
-			var pe *ProtocolError
-			if errors.As(err, &pe) && pe.Status == 403 {
-				return nil
-			}
-			return err
-		case "intents":
-			created := 0
-			var lastErr error
-			for _, i := range r.Intents {
-				input := i.Input()
-				input["creator"] = t.Lease.Run
-				err := post("/intents", input, nil)
-				if err != nil {
-					lastErr = err
-					var pe *ProtocolError
-					if errors.As(err, &pe) && pe.Status == 403 {
-						return nil
-					}
-					continue
-				}
-				created++
-			}
-			if created == 0 {
-				if lastErr != nil {
-					return lastErr
-				}
-				return errors.New("reason created no intents")
-			}
-			return nil
-		}
-		return errors.New("invalid reason outcome")
-	}
-	var concluded board.Conclusion
-	if err := post("/intents/"+t.Lease.Intent+"/conclude", map[string]string{"description": r.Fact, "worker": t.Lease.Run}, &concluded); err != nil {
-		return err
-	}
-	if t.Job.Kind == "bootstrap" && r.Kind == "complete" {
-		return post("/complete", map[string]any{"from": []string{concluded.Fact.ID}, "description": r.Complete.Description, "worker": t.Lease.Run}, nil)
-	}
-	return nil
 }

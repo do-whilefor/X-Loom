@@ -132,7 +132,8 @@ func TestOrphanedResultsRejected(t *testing.T) {
 }
 func TestCompactionRetainsPairedTailAndRejectsTruncation(t *testing.T) {
 	history := []Message{Text("user", "task"), Text("assistant", "a"), Text("user", "b"), {Role: "assistant", Content: []Block{call("old", "read", `{}`)}}, {Role: "user", Content: []Block{{Type: "tool_result", ToolUseID: "old", Content: json.RawMessage(`"evidence"`)}}}, Text("assistant", "c"), Text("user", "d"), Text("assistant", "e"), Text("user", "f"), Text("assistant", "g")}
-	l := Loop{History: history, ContextBytes: 1, Provider: providerFunc(func(_ context.Context, m []Message, d []Definition, _ Emit) (Message, error) {
+	inflateCompactionHistory(history)
+	l := Loop{History: history, ContextBytes: 6000, RecentBytes: 1500, SummaryBytes: 1200, Provider: providerFunc(func(_ context.Context, m []Message, d []Definition, _ Emit) (Message, error) {
 		if len(d) != 0 || !strings.Contains(m[0].Text(), "task") {
 			t.Fatal("bad summary request")
 		}
@@ -154,13 +155,14 @@ func TestCompactionRetainsPairedTailAndRejectsTruncation(t *testing.T) {
 func TestRepeatedCompactionPinsTaskAndConclusionVerbatim(t *testing.T) {
 	const task = "Unique contract: JSON fact must contain proof and origin."
 	const conclude = "Unique boundary: stop all exploration and summarize confirmed evidence."
-	l := Loop{TaskPrompt: task, ConclusionPrompt: conclude, Concluding: true, ContextBytes: 1, Provider: providerFunc(func(context.Context, []Message, []Definition, Emit) (Message, error) {
+	l := Loop{TaskPrompt: task, ConclusionPrompt: conclude, Concluding: true, ContextBytes: 6000, RecentBytes: 1500, SummaryBytes: 1200, Provider: providerFunc(func(context.Context, []Message, []Definition, Emit) (Message, error) {
 		return Text("assistant", "generic summary"), nil
 	})}
 	l.History = []Message{Text("user", task), Text("assistant", "old"), Text("user", conclude)}
 	for range 6 {
 		l.History = append(l.History, Text("assistant", "evidence"), Text("user", "read more evidence"))
 	}
+	inflateCompactionHistory(l.History)
 	for range 2 {
 		if err := l.compact(context.Background()); err != nil {
 			t.Fatal(err)
@@ -175,6 +177,12 @@ func TestRepeatedCompactionPinsTaskAndConclusionVerbatim(t *testing.T) {
 		if err := l.RepairHistory(); err != nil {
 			t.Fatal(err)
 		}
+		if err := l.append(Text("assistant", strings.Repeat("more evidence ", 1200))); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.append(Text("user", conclude)); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -182,7 +190,7 @@ func TestCompactionKeepsCurrentRuntimeInstructionAfterOldAssistant(t *testing.T)
 	for _, repair := range []bool{false, true} {
 		t.Run(map[bool]string{false: "conclusion", true: "repair"}[repair], func(t *testing.T) {
 			instruction := "Stop exploration and summarize existing evidence"
-			l := Loop{TaskPrompt: "original task", ConclusionPrompt: instruction, Concluding: true, ContextBytes: 1}
+			l := Loop{TaskPrompt: "original task", ConclusionPrompt: instruction, Concluding: true, ContextBytes: 6000, RecentBytes: 1500, SummaryBytes: 1200}
 			if repair {
 				instruction = "Rewrite the invalid result as complete JSON"
 				l.Repairing = true
@@ -193,6 +201,7 @@ func TestCompactionKeepsCurrentRuntimeInstructionAfterOldAssistant(t *testing.T)
 				l.History = append(l.History, Text("assistant", "old evidence"), Text("user", "next"))
 			}
 			l.History = append(l.History, Text("assistant", `{"invalid":`), Text("user", instruction))
+			inflateCompactionHistory(l.History)
 			calls := 0
 			l.Provider = providerFunc(func(_ context.Context, m []Message, d []Definition, _ Emit) (Message, error) {
 				calls++
@@ -211,5 +220,13 @@ func TestCompactionKeepsCurrentRuntimeInstructionAfterOldAssistant(t *testing.T)
 				t.Fatal("unexpected calls", calls)
 			}
 		})
+	}
+}
+
+func inflateCompactionHistory(history []Message) {
+	for i := 1; i < len(history); i++ {
+		if history[i].Role == "assistant" && len(history[i].Content) == 1 && history[i].Content[0].Type == "text" {
+			history[i].Content[0].Text += strings.Repeat(" earlier observation", 600)
+		}
 	}
 }

@@ -67,7 +67,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	defer migration.Rollback()
-	if _, err = migration.Exec(schema); err != nil {
+	if _, err = migration.Exec(schema + stateSchema + executionSchema); err != nil {
 		migration.Rollback()
 		db.Close()
 		return nil, err
@@ -158,7 +158,8 @@ func (t *Tx) Settings() (Settings, error) {
 func (t *Tx) RevokeRuns(project string) error {
 	_, err := t.Exec(`INSERT OR IGNORE INTO xloom_revoked_runs(project_id,worker)
 SELECT project_id,worker FROM intents WHERE project_id=? AND worker IS NOT NULL
-UNION SELECT id,reason_worker FROM projects WHERE id=? AND reason_worker IS NOT NULL`, project, project)
+UNION SELECT id,reason_worker FROM projects WHERE id=? AND reason_worker IS NOT NULL
+UNION SELECT project_id,lease FROM xloom_executions WHERE project_id=?`, project, project, project)
 	return err
 }
 

@@ -16,7 +16,6 @@ import (
 	"xloom/internal/agent"
 	"xloom/internal/process"
 	"xloom/internal/provider"
-	"xloom/internal/tools"
 )
 
 type Options struct {
@@ -27,25 +26,6 @@ type Options struct {
 	Now          func() time.Time
 	SoftStop     <-chan struct{}
 	ContextBytes int
-}
-type session struct {
-	RunID                  string          `json:"run_id"`
-	Kind                   string          `json:"kind"`
-	StartedAt              time.Time       `json:"started_at"`
-	ReasonDeadline         time.Time       `json:"reason_deadline,omitempty"`
-	ConcludeStartedAt      time.Time       `json:"conclude_started_at,omitempty"`
-	ConcludeDeadline       time.Time       `json:"conclude_deadline,omitempty"`
-	Concluding             bool            `json:"concluding"`
-	History                []agent.Message `json:"history"`
-	Result                 *Result         `json:"result,omitempty"`
-	TaskPrompt             string          `json:"task_prompt,omitempty"`
-	ConclusionPrompt       string          `json:"conclusion_prompt,omitempty"`
-	ConclusionInputVersion int             `json:"conclusion_input_version,omitempty"`
-	Repairing              bool            `json:"repairing,omitempty"`
-	RepairCount            int             `json:"repair_count,omitempty"`
-	RepairReason           string          `json:"repair_reason,omitempty"`
-	RepairPrompt           string          `json:"repair_prompt,omitempty"`
-	RepairPending          bool            `json:"repair_pending,omitempty"`
 }
 
 func Execute(ctx context.Context, jobPath string, output io.Writer) error {
@@ -69,6 +49,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	}
 	if j.RunID == "" {
 		return Result{}, errors.New("job requires run_id")
+	}
+	if j.PreviousRunID == j.RunID || j.Graph.Project.ID == "" {
+		return Result{}, errors.New("job requires a project and a distinct previous_run_id")
 	}
 	if j.Kind != "bootstrap" && j.Kind != "reason" && j.Kind != "explore" {
 		return Result{}, errors.New("invalid job kind")
@@ -102,6 +85,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		return Result{}, err
 	}
 	defer unlock()
+	if err = process.CheckLaunch(o.RunDir); err != nil {
+		return Result{}, err
+	}
 	if process.Cancelled(o.RunDir) {
 		return Result{}, context.Canceled
 	}
@@ -113,7 +99,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	defer func() {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && !errors.Is(context.Cause(parent), ErrInterrupted) {
 			_ = os.WriteFile(filepath.Join(o.RunDir, "cancelled"), []byte("hard stop\n"), 0600)
 		}
 	}()
@@ -142,67 +128,67 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	if o.Output == nil {
 		o.Output = io.Discard
 	}
-	log, err := os.OpenFile(filepath.Join(o.RunDir, "events.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	identity, err := identityFor(j, o.RunDir)
 	if err != nil {
 		return Result{}, err
 	}
-	defer log.Close()
-	enc := json.NewEncoder(io.MultiWriter(log, o.Output))
-	var logErr error
-	state := session{RunID: j.RunID, Kind: j.Kind, StartedAt: o.Now()}
-	emit := func(e agent.Event) {
-		// The following Save persists the response and its repair phase
-		// together. A crash before that save conservatively consumes a retry.
-		if state.Repairing && e.Type == "message_end" && e.Message != nil && e.Message.Role == "assistant" {
-			state.RepairPending = false
-		}
-		if logErr == nil {
-			logErr = enc.Encode(e)
-		}
+	state := session{SchemaVersion: sessionSchemaVersion, Identity: identity, RunID: j.RunID, Kind: j.Kind, StartedAt: o.Now()}
+	if j.Budget.Timeout > 0 {
+		state.ExecutionDeadline = state.StartedAt.Add(time.Duration(j.Budget.Timeout) * time.Second)
 	}
 	statePath := filepath.Join(o.RunDir, "session.json")
+	resuming := false
 	if previous, readErr := os.ReadFile(statePath); readErr == nil {
 		if err = json.Unmarshal(previous, &state); err != nil {
 			return Result{}, fmt.Errorf("invalid saved session: %w", err)
 		}
-		if state.RunID != j.RunID || state.Kind != j.Kind || state.StartedAt.IsZero() {
-			return Result{}, errors.New("session belongs to another execution or is invalid")
+		if err = state.validate(identity); err != nil {
+			return Result{}, err
 		}
-		if state.RepairCount < 0 || state.RepairCount > maxOutputRepairs || (state.RepairCount > 0 && !state.Repairing) || (state.Repairing && (state.RepairCount == 0 || state.RepairPrompt == "")) {
-			return Result{}, errors.New("invalid saved result-repair state")
-		}
+		resuming = true
 	} else if !os.IsNotExist(readErr) {
 		return Result{}, readErr
+	}
+	var checkpoint *journalCheckpoint
+	if resuming {
+		checkpoint = &state.Log
+	}
+	journal, err := openJournal(o.RunDir, checkpoint)
+	if err != nil {
+		return Result{}, err
+	}
+	defer journal.file.Close()
+	enc := json.NewEncoder(o.Output)
+	var logErr error
+	emit := func(e agent.Event) {
+		if state.Repairing && e.Type == "message_end" && e.Message != nil && e.Message.Role == "assistant" {
+			state.RepairPending = false
+		}
+		if logErr == nil {
+			logErr = journal.append(e)
+		}
+		if logErr == nil {
+			logErr = enc.Encode(e)
+		}
 	}
 	var l *agent.Loop
 	save := func(history []agent.Message) error {
 		if logErr != nil {
 			return logErr
 		}
+		before := state
 		state.History = history
 		if l != nil {
 			state.TaskPrompt = l.TaskPrompt
 			state.ConclusionPrompt = l.ConclusionPrompt
 			state.RepairPrompt = l.RepairPrompt
+			state.ContextCheckpoint = l.Checkpoint
 		}
-		raw, err := json.Marshal(state)
-		if err != nil {
+		if err := state.save(o.RunDir, journal); err != nil {
+			state = before
 			return err
 		}
-		tmp, err := os.CreateTemp(o.RunDir, "session-*.tmp")
-		if err != nil {
-			return err
-		}
-		name := tmp.Name()
-		defer os.Remove(name)
-		if _, err = tmp.Write(raw); err == nil {
-			err = tmp.Sync()
-		}
-		err = errors.Join(err, tmp.Close())
-		if err != nil {
-			return err
-		}
-		return os.Rename(name, statePath)
+		return nil
 	}
 	finish := func(r Result) (Result, error) {
 		if err := ctx.Err(); err != nil {
@@ -211,20 +197,49 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		if process.Cancelled(o.RunDir) {
 			return Result{}, context.Canceled
 		}
+		if r.Status == "failed" && r.FailureKind == "" {
+			r.FailureKind = "execution"
+		}
+		if err := journal.append(r); err != nil {
+			return r, err
+		}
 		state.Result = &r
 		if err := save(state.History); err != nil {
 			return r, err
 		}
 		return r, enc.Encode(r)
 	}
+	infrastructureResume := false
 	if state.Result != nil {
-		// Older versions could cache a parseable but truncated prefix. Never
-		// submit it as success; restore its transcript into bounded repair.
 		last, ok := lastAssistant(state.History)
-		if state.Result.Status != "success" || !ok || !truncated(last) {
-			return finish(*state.Result)
+		if state.Result.Retryable {
+			infrastructureResume = true
+			state.Result = nil
+		} else if state.Result.Status == "success" && ok && truncated(last) {
+			state.Result = nil
+		} else {
+			return *state.Result, enc.Encode(state.Result)
 		}
-		state.Result = nil
+	}
+	if resuming {
+		if state.RecoveryCount >= maxRunRecoveries {
+			return finish(Result{Type: "result", Status: "failed", Conclude: state.Concluding, FailureKind: "recovery_exhausted", Error: "same-run infrastructure recovery exhausted after 2 attempts"})
+		}
+		state.RecoveryCount++
+		if state.ContextCheckpoint == nil && (journal.lastSequence > 0 || journal.lastCompaction > 0) {
+			state.ContextCheckpoint = &agent.ContextCheckpoint{Version: agent.ContextCheckpointVersion}
+		}
+		if state.ContextCheckpoint != nil && state.ContextCheckpoint.LastSequence < journal.lastSequence {
+			state.ContextCheckpoint.LastSequence = journal.lastSequence
+		}
+		if state.ContextCheckpoint != nil && state.ContextCheckpoint.CompactionCount < journal.lastCompaction {
+			state.ContextCheckpoint.CompactionCount = journal.lastCompaction
+		}
+		emit(agent.Event{Type: "recovery", Text: fmt.Sprintf("same run recovery %d/%d; retained %d uncommitted log bytes; incomplete tail archive: %s", state.RecoveryCount, maxRunRecoveries, journal.uncommitted, journal.partialArchive)})
+	}
+	// The identity, budget and consumed recovery allowance precede any request.
+	if err := save(state.History); err != nil {
+		return Result{}, err
 	}
 	if j.WorkerType == "mock" {
 		return finish(mock(j))
@@ -240,17 +255,19 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		}
 		o.Provider = p
 	}
-	if o.Tools == nil {
-		set := tools.Set{Dir: j.Workspace, RunDir: o.RunDir}
-		o.Tools = set.All()
+	if err := ConfigureRuntimeTools(j, &o); err != nil {
+		return Result{}, err
 	}
 	if o.ContextBytes <= 0 {
 		o.ContextBytes = envInt("XLOOM_CONTEXT_BYTES", 240000)
 	}
-	l = &agent.Loop{Provider: o.Provider, Tools: o.Tools, History: state.History, Concluding: state.Concluding, Repairing: state.Repairing, RepairPrompt: state.RepairPrompt, Emit: emit, Save: save, ContextBytes: o.ContextBytes, TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt}
+	l = &agent.Loop{Provider: o.Provider, Tools: o.Tools, History: state.History, Concluding: state.Concluding, Repairing: state.Repairing, RepairPrompt: state.RepairPrompt, Emit: emit, Checkpoint: state.ContextCheckpoint, SaveState: func(history []agent.Message, _ *agent.ContextCheckpoint) error {
+		return save(history)
+	}, ContextBytes: o.ContextBytes, TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt}
 	var endCancel context.CancelFunc = func() {}
 	defer func() { endCancel() }()
 	runCtx := ctx
+	phaseCtx := ctx
 	prompt := ""
 	startConclusion := func() (context.Context, error) {
 		if err := ctx.Err(); err != nil {
@@ -266,8 +283,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 			state.ConcludeStartedAt = o.Now()
 		}
 		if state.ConcludeDeadline.IsZero() {
-			// Older sessions only persisted the start time; use their original
-			// job budget once. New sessions retain an absolute deadline.
+			// Only a newly entered conclusion can establish its deadline.
 			state.ConcludeDeadline = state.ConcludeStartedAt.Add(time.Duration(j.Budget.ConcludeTimeout) * time.Second)
 		}
 		remaining := state.ConcludeDeadline.Sub(o.Now())
@@ -276,6 +292,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		}
 		next, cancel := context.WithTimeout(ctx, remaining)
 		endCancel = cancel
+		phaseCtx = next
 		if !wasConcluding {
 			// Freeze the boundary before reading any artifact. A crash during
 			// preparation resumes conservatively without reading new outputs.
@@ -309,12 +326,13 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	}
 	if j.Kind == "reason" && (j.Budget.Timeout > 0 || !state.ReasonDeadline.IsZero()) {
 		if state.ReasonDeadline.IsZero() {
-			state.ReasonDeadline = state.StartedAt.Add(time.Duration(j.Budget.Timeout) * time.Second)
+			state.ReasonDeadline = state.ExecutionDeadline
 		}
 		remaining := state.ReasonDeadline.Sub(o.Now())
 		reasonCtx, reasonCancel := context.WithTimeout(ctx, remaining)
 		defer reasonCancel()
 		runCtx = reasonCtx
+		phaseCtx = reasonCtx
 	}
 	shouldConclude := func() bool {
 		if j.Kind == "reason" || l.Concluding {
@@ -325,7 +343,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 			return true
 		default:
 		}
-		return j.Budget.Timeout > 0 && o.Now().Sub(state.StartedAt) >= time.Duration(j.Budget.Timeout)*time.Second
+		return !state.ExecutionDeadline.IsZero() && !o.Now().Before(state.ExecutionDeadline)
 	}
 	prepareRepairHistory := func() error {
 		if err := l.RepairHistory(); err != nil {
@@ -387,7 +405,11 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		return turnCtx, "", nil
 	}
 	if state.Repairing && state.RepairPending {
-		if containsInstruction(l.History, l.RepairPrompt) {
+		if containsInstruction(l.History, l.RepairPrompt) && infrastructureResume {
+			// Transport recovery continues the unanswered request without buying
+			// or consuming another JSON-format repair attempt.
+			prompt = ""
+		} else if containsInstruction(l.History, l.RepairPrompt) {
 			// The request may have been sent before a crash. Do not reset or
 			// replay that attempt for free; use only a remaining repair slot.
 			prompt, err = startRepair(runCtx, &outputFailure{Reason: "interrupted_repair", Detail: "the previous repair request has no durable response"})
@@ -454,6 +476,11 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	if runErr != nil {
 		r.Status = "failed"
 		r.Error = runErr.Error()
+		r.FailureKind, r.Retryable = classifyFailure(runErr, phaseCtx)
+		if r.Retryable && state.RecoveryCount >= maxRunRecoveries {
+			r.Retryable = false
+			r.FailureKind = "recovery_exhausted"
+		}
 	}
 	if logErr != nil {
 		return r, logErr

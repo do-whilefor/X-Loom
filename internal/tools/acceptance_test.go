@@ -55,12 +55,32 @@ func TestLongOutputsAreSaved(t *testing.T) {
 			if at < 0 {
 				t.Fatalf("missing saved output: %s", got)
 			}
-			path := strings.TrimSuffix(got[at+len(marker):], "]")
+			path := strings.SplitN(got[at+len(marker):], "]", 2)[0]
 			full, err := os.ReadFile(path)
 			if err != nil || len(full) <= 40 {
 				t.Fatal(len(full), err)
 			}
 		})
+	}
+}
+
+func TestLongOutputRetainsBeginningAndFinalEvidence(t *testing.T) {
+	s := Set{Dir: t.TempDir(), RunDir: t.TempDir(), OutputBytes: 80}
+	full := "BEGIN_PROOF\n" + strings.Repeat("middle noise\n", 1000) + "FINAL_PROOF\n"
+	if err := os.WriteFile(filepath.Join(s.Dir, "proof.txt"), []byte(full), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := s.read(context.Background(), json.RawMessage(`{"path":"proof.txt"}`))
+	if err != nil || !strings.Contains(out, "BEGIN_PROOF") || !strings.Contains(out, "FINAL_PROOF") || !strings.Contains(out, "Middle omitted") {
+		t.Fatal(out, err)
+	}
+	files, _ := filepath.Glob(filepath.Join(s.RunDir, "output-*.txt"))
+	if len(files) != 1 {
+		t.Fatal(files)
+	}
+	saved, err := os.ReadFile(files[0])
+	if err != nil || string(saved) != full {
+		t.Fatal("original evidence was truncated", err)
 	}
 }
 func TestReadOffsetAndArgumentValidation(t *testing.T) {

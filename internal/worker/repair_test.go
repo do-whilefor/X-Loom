@@ -228,7 +228,7 @@ func TestRecoveryDoesNotSubmitAssistantBeforeUnansweredConclusion(t *testing.T) 
 		t.Fatal(err)
 	}
 	started := time.Now()
-	writeSession(t, runDir, session{RunID: j.RunID, Kind: j.Kind, StartedAt: started, Concluding: true, ConcludeStartedAt: started, ConcludeDeadline: started.Add(time.Second), ConclusionInputVersion: conclusionInputVersion, ConclusionPrompt: frozen, History: []agent.Message{agent.Text("user", "task"), agent.Text("assistant", conclusion), agent.Text("user", frozen)}})
+	writeSession(t, runDir, j, session{RunID: j.RunID, Kind: j.Kind, StartedAt: started, Concluding: true, ConcludeStartedAt: started, ConcludeDeadline: started.Add(time.Second), ConclusionInputVersion: conclusionInputVersion, ConclusionPrompt: frozen, History: []agent.Message{agent.Text("user", "task"), agent.Text("assistant", conclusion), agent.Text("user", frozen)}})
 	called := false
 	r, err := Run(context.Background(), j, Options{RunDir: runDir, Provider: modelFunc(func(_ context.Context, m []agent.Message, d []agent.Definition, _ agent.Emit) (agent.Message, error) {
 		called = true
@@ -279,8 +279,7 @@ func TestRepairRecoveryConsumesPersistedAllowance(t *testing.T) {
 			if tc.response != nil {
 				history = append(history, *tc.response)
 			}
-			writeSession(t, runDir, session{RunID: j.RunID, Kind: j.Kind, StartedAt: now, ReasonDeadline: deadline, History: history, Repairing: true, RepairCount: tc.count, RepairPending: tc.pending, RepairReason: "invalid_contract", RepairPrompt: instruction})
-			j.Budget.Timeout = 3600 // A restart must retain the saved deadline.
+			writeSession(t, runDir, j, session{RunID: j.RunID, Kind: j.Kind, StartedAt: now, ReasonDeadline: deadline, History: history, Repairing: true, RepairCount: tc.count, RepairPending: tc.pending, RepairReason: "invalid_contract", RepairPrompt: instruction})
 			calls := 0
 			r, err := Run(context.Background(), j, Options{RunDir: runDir, Tools: []agent.Tool{noExecutionTool(t, "write")}, Provider: modelFunc(func(ctx context.Context, m []agent.Message, d []agent.Definition, _ agent.Emit) (agent.Message, error) {
 				calls++
@@ -307,12 +306,12 @@ func TestRepairRecoveryConsumesPersistedAllowance(t *testing.T) {
 	}
 }
 
-func TestLegacyCachedTruncatedSuccessIsNotReemitted(t *testing.T) {
+func TestCachedTruncatedSuccessIsNotReemitted(t *testing.T) {
 	j := job(t, "reason")
 	runDir := t.TempDir()
 	m := agent.Text("assistant", `{"accepted":true,"data":{"complete":{"from":["origin"],"description":"partial completion"}}}`)
 	m.StopReason = "length"
-	writeSession(t, runDir, session{RunID: j.RunID, Kind: j.Kind, StartedAt: time.Now(), History: []agent.Message{agent.Text("user", "task"), m}, Result: &Result{Type: "result", Status: "success", Text: m.Text()}})
+	writeSession(t, runDir, j, session{RunID: j.RunID, Kind: j.Kind, StartedAt: time.Now(), History: []agent.Message{agent.Text("user", "task"), m}, Result: &Result{Type: "result", Status: "success", Text: m.Text()}})
 	calls := 0
 	r, err := Run(context.Background(), j, Options{RunDir: runDir, Provider: modelFunc(func(_ context.Context, _ []agent.Message, d []agent.Definition, _ agent.Emit) (agent.Message, error) {
 		calls++
@@ -340,7 +339,7 @@ func TestRepairRecoverySettlesUncertainCallsWithoutExecutingThem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeSession(t, runDir, session{RunID: j.RunID, Kind: j.Kind, StartedAt: when, Concluding: true, ConcludeStartedAt: when, ConcludeDeadline: when.Add(time.Second), ConclusionInputVersion: conclusionInputVersion, ConclusionPrompt: frozen, Repairing: true, RepairCount: 1, RepairReason: "output_truncated", RepairPrompt: instruction, RepairPending: true, History: []agent.Message{agent.Text("user", "task"), m}})
+	writeSession(t, runDir, j, session{RunID: j.RunID, Kind: j.Kind, StartedAt: when, Concluding: true, ConcludeStartedAt: when, ConcludeDeadline: when.Add(time.Second), ConclusionInputVersion: conclusionInputVersion, ConclusionPrompt: frozen, Repairing: true, RepairCount: 1, RepairReason: "output_truncated", RepairPrompt: instruction, RepairPending: true, History: []agent.Message{agent.Text("user", "task"), m}})
 	r, err := Run(context.Background(), j, Options{RunDir: runDir, Tools: []agent.Tool{noExecutionTool(t, "write")}, Provider: modelFunc(func(_ context.Context, m []agent.Message, d []agent.Definition, _ agent.Emit) (agent.Message, error) {
 		if d != nil || !containsInstruction(m, frozen) {
 			t.Fatal("repair recovery lost frozen evidence")

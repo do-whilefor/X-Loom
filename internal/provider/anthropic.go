@@ -55,6 +55,57 @@ func (p *Anthropic) endpoint() string {
 	return base + "/v1/messages"
 }
 func (p *Anthropic) Generate(ctx context.Context, messages []agent.Message, tools []agent.Definition, emit agent.Emit) (agent.Message, error) {
+	return p.generate(ctx, messages, tools, p.MaxTokens, emit)
+}
+
+func (p *Anthropic) GenerateSummary(ctx context.Context, messages []agent.Message, maxTokens int, emit agent.Emit) (agent.Message, error) {
+	return p.generate(ctx, messages, nil, maxTokens, emit)
+}
+
+// InputBytes counts the complete serialized request, including system text,
+// tools and output controls, without exposing local transcript metadata.
+func (p *Anthropic) InputBytes(messages []agent.Message, tools []agent.Definition) (int, error) {
+	raw, err := p.payload(messages, tools, p.MaxTokens)
+	return len(raw), err
+}
+
+func (p *Anthropic) payload(messages []agent.Message, tools []agent.Definition, limit int) ([]byte, error) {
+	model := p.Model
+	if model == "" {
+		model = DefaultModel
+	}
+	if limit <= 0 {
+		limit = DefaultMaxTokens
+	}
+	effort := p.ReasoningEffort
+	if effort == "" {
+		effort = DefaultReasoningEffort
+	}
+	switch effort {
+	case "low", "high", "max":
+	default:
+		return nil, errors.New("reasoning effort must be low, high, or max")
+	}
+	payload := struct {
+		Model     string             `json:"model"`
+		MaxTokens int                `json:"max_tokens"`
+		System    string             `json:"system"`
+		Messages  []agent.Message    `json:"messages"`
+		Tools     []agent.Definition `json:"tools,omitempty"`
+		Stream    bool               `json:"stream"`
+		Thinking  struct {
+			Type string `json:"type"`
+		} `json:"thinking"`
+		OutputConfig struct {
+			Effort string `json:"effort"`
+		} `json:"output_config"`
+	}{Model: model, MaxTokens: limit, System: System, Messages: agent.WireHistory(messages), Tools: tools, Stream: true}
+	payload.Thinking.Type = "enabled"
+	payload.OutputConfig.Effort = effort
+	return json.Marshal(payload)
+}
+
+func (p *Anthropic) generate(ctx context.Context, messages []agent.Message, tools []agent.Definition, maxTokens int, emit agent.Emit) (agent.Message, error) {
 	if strings.TrimSpace(p.Token) == "" {
 		return agent.Message{}, errors.New("missing model authentication token")
 	}
@@ -69,58 +120,16 @@ func (p *Anthropic) Generate(ctx context.Context, messages []agent.Message, tool
 	if p.sessionErr != nil {
 		return agent.Message{}, p.sessionErr
 	}
-	model := p.Model
-	if model == "" {
-		model = DefaultModel
-	}
-	// Stop reasons belong to session persistence, not Anthropic request messages.
-	type wireMessage struct {
-		Role    string        `json:"role"`
-		Content []agent.Block `json:"content"`
-	}
-	wire := make([]wireMessage, len(messages))
-	for i, m := range messages {
-		wire[i] = wireMessage{m.Role, m.Content}
-	}
-	limit := p.MaxTokens
-	if limit <= 0 {
-		limit = DefaultMaxTokens
-	}
-	effort := p.ReasoningEffort
-	if effort == "" {
-		effort = DefaultReasoningEffort
-	}
-	switch effort {
-	case "low", "high", "max":
-	default:
-		return agent.Message{}, errors.New("reasoning effort must be low, high, or max")
-	}
 	timeout := p.Timeout
 	if timeout <= 0 {
 		timeout = 3 * time.Minute
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	payload := struct {
-		Model     string             `json:"model"`
-		MaxTokens int                `json:"max_tokens"`
-		System    string             `json:"system"`
-		Messages  []wireMessage      `json:"messages"`
-		Tools     []agent.Definition `json:"tools,omitempty"`
-		Stream    bool               `json:"stream"`
-		Thinking  struct {
-			Type string `json:"type"`
-		} `json:"thinking"`
-		OutputConfig struct {
-			Effort string `json:"effort"`
-		} `json:"output_config"`
-	}{Model: model, MaxTokens: limit, System: System, Messages: wire, Tools: tools, Stream: true}
 	// DeepSeek's Anthropic format uses output_config.effort for reasoning
 	// strength; budget_tokens is ignored. A returned thinking:"" block is
 	// transcript data and is unrelated to these request controls.
-	payload.Thinking.Type = "enabled"
-	payload.OutputConfig.Effort = effort
-	data, err := json.Marshal(payload)
+	data, err := p.payload(messages, tools, maxTokens)
 	if err != nil {
 		return agent.Message{}, err
 	}
@@ -144,16 +153,20 @@ func (p *Anthropic) Generate(ctx context.Context, messages []agent.Message, tool
 		req.Header.Set("x-opencode-session", p.sessionID)
 		res, err = client.Do(req)
 		if err != nil {
-			return agent.Message{}, err
+			return agent.Message{}, &agent.ModelError{Kind: agent.ErrorTransport, Err: err}
 		}
 		if res.StatusCode >= 200 && res.StatusCode < 300 {
 			break
 		}
 		status := res.StatusCode
-		io.Copy(io.Discard, io.LimitReader(res.Body, 8192))
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 8192))
 		res.Body.Close()
+		classified := classifyEndpointError(status, body)
+		if classified.Kind == agent.ErrorContextOverflow {
+			return agent.Message{}, classified
+		}
 		if attempt >= 2 || (status != 429 && status < 500) {
-			return agent.Message{}, &HTTPError{Status: status}
+			return agent.Message{}, classified
 		}
 		timer := time.NewTimer(time.Duration(1<<attempt) * time.Second)
 		select {
@@ -169,16 +182,71 @@ func (p *Anthropic) Generate(ctx context.Context, messages []agent.Message, tool
 			Role    string        `json:"role"`
 			Content []agent.Block `json:"content"`
 			Stop    string        `json:"stop_reason"`
+			Usage   *agent.Usage  `json:"usage"`
 		}
 		if err = json.NewDecoder(io.LimitReader(res.Body, 32<<20)).Decode(&m); err != nil {
-			return agent.Message{}, err
+			kind := agent.ErrorProvider
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) {
+				kind = agent.ErrorTransport
+			}
+			return agent.Message{}, &agent.ModelError{Kind: kind, Err: errors.New("invalid or incomplete model response body")}
 		}
 		if m.Role != "assistant" || len(m.Content) == 0 || m.Stop == "" {
-			return agent.Message{}, errors.New("invalid model response")
+			return agent.Message{}, &agent.ModelError{Kind: agent.ErrorProvider, Err: errors.New("invalid model response")}
 		}
-		return agent.Message{Role: m.Role, Content: m.Content, StopReason: m.Stop}, nil
+		return agent.Message{Role: m.Role, Content: m.Content, StopReason: m.Stop, Usage: m.Usage}, nil
 	}
-	return consumeSSE(ctx, io.LimitReader(res.Body, 32<<20), emit)
+	message, streamErr := consumeSSE(ctx, io.LimitReader(res.Body, 32<<20), emit)
+	if streamErr != nil {
+		var modelErr *agent.ModelError
+		if !errors.As(streamErr, &modelErr) && !errors.Is(streamErr, context.Canceled) && !errors.Is(streamErr, context.DeadlineExceeded) {
+			streamErr = &agent.ModelError{Kind: agent.ErrorProvider, Err: streamErr}
+		}
+	}
+	return message, streamErr
+}
+
+func classifyEndpointError(status int, body []byte) *agent.ModelError {
+	var detail struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &detail)
+	kind := agent.ErrorProvider
+	if status == 429 {
+		kind = agent.ErrorRateLimit
+	} else if status >= 500 {
+		kind = agent.ErrorUnavailable
+	}
+	message := strings.ToLower(detail.Error.Message)
+	if detail.Error.Type == "context_length_exceeded" || detail.Error.Type == "context_window_exceeded" ||
+		((status == 400 || status == 413 || status == 422) && (strings.Contains(message, "prompt is too long") || strings.Contains(message, "context length") || strings.Contains(message, "maximum context") || strings.Contains(message, "context window"))) {
+		kind = agent.ErrorContextOverflow
+	}
+	return &agent.ModelError{Kind: kind, Err: &HTTPError{Status: status}}
+}
+
+func mergeUsage(dst **agent.Usage, src *agent.Usage) {
+	if src == nil {
+		return
+	}
+	if *dst == nil {
+		*dst = &agent.Usage{}
+	}
+	if src.InputTokens > 0 {
+		(*dst).InputTokens = src.InputTokens
+	}
+	if src.OutputTokens > 0 {
+		(*dst).OutputTokens = src.OutputTokens
+	}
+	if src.CacheReadTokens > 0 {
+		(*dst).CacheReadTokens = src.CacheReadTokens
+	}
+	if src.CacheWriteTokens > 0 {
+		(*dst).CacheWriteTokens = src.CacheWriteTokens
+	}
 }
 func consumeSSE(ctx context.Context, reader io.Reader, emit agent.Emit) (agent.Message, error) {
 	m := agent.Message{Role: "assistant", Content: []agent.Block{}}
@@ -198,9 +266,17 @@ func consumeSSE(ctx context.Context, reader io.Reader, emit agent.Emit) (agent.M
 			return nil
 		}
 		var e struct {
-			Type  string      `json:"type"`
-			Index int         `json:"index"`
-			Block agent.Block `json:"content_block"`
+			Type    string      `json:"type"`
+			Index   int         `json:"index"`
+			Block   agent.Block `json:"content_block"`
+			Message struct {
+				Usage *agent.Usage `json:"usage"`
+			} `json:"message"`
+			Usage *agent.Usage `json:"usage"`
+			Error struct {
+				Type    string `json:"type"`
+				Message string `json:"message"`
+			} `json:"error"`
 			Delta struct {
 				Type      string `json:"type"`
 				Text      string `json:"text"`
@@ -219,6 +295,7 @@ func consumeSSE(ctx context.Context, reader io.Reader, emit agent.Emit) (agent.M
 				return errors.New("duplicate message_start")
 			}
 			started = true
+			mergeUsage(&m.Usage, e.Message.Usage)
 		case "content_block_start":
 			if !started || e.Index != len(m.Content) || e.Index > 4096 {
 				return errors.New("invalid content block index")
@@ -258,13 +335,21 @@ func consumeSSE(ctx context.Context, reader io.Reader, emit agent.Emit) (agent.M
 				b.Signature += e.Delta.Signature
 			}
 		case "message_delta":
+			mergeUsage(&m.Usage, e.Usage)
 			if e.Delta.Stop != "" {
 				m.StopReason = e.Delta.Stop
 			}
 		case "message_stop":
 			stopped = true
 		case "error":
-			return errors.New("model stream reported an error")
+			status := 400
+			if e.Error.Type == "overloaded_error" || e.Error.Type == "api_error" {
+				status = 503
+			}
+			if e.Error.Type == "rate_limit_error" {
+				status = 429
+			}
+			return classifyEndpointError(status, []byte(data))
 		}
 		return nil
 	}
@@ -287,13 +372,13 @@ func consumeSSE(ctx context.Context, reader io.Reader, emit agent.Emit) (agent.M
 		}
 	}
 	if err := scan.Err(); err != nil {
-		return m, err
+		return m, &agent.ModelError{Kind: agent.ErrorTransport, Err: errors.New("model stream read failed")}
 	}
 	if err := consume(); err != nil {
 		return m, err
 	}
 	if !started || !stopped || len(m.Content) == 0 || m.StopReason == "" {
-		return m, errors.New("model stream ended before message_stop")
+		return m, &agent.ModelError{Kind: agent.ErrorTransport, Err: errors.New("model stream ended before message_stop")}
 	}
 	for i, part := range parts {
 		if part.Len() > 0 {

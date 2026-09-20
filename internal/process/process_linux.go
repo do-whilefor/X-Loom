@@ -77,6 +77,48 @@ func RegisterWorker(runDir string) error {
 	return saveIdentity(filepath.Join(runDir, "worker.pid"), os.Getpid())
 }
 
+// Docker supplies a per-launch token outside the immutable Job. A late exec
+// from an interrupted HTTP start must not claim the same run after recovery.
+func CheckLaunch(runDir string) error {
+	token := os.Getenv("XLOOM_LAUNCH_TOKEN")
+	if token == "" {
+		return nil
+	}
+	if len(token) != 32 {
+		return errors.New("invalid worker launch token")
+	}
+	if _, err := hex.DecodeString(token); err != nil {
+		return errors.New("invalid worker launch token")
+	}
+	raw, err := os.ReadFile(filepath.Join(runDir, "launch-token"))
+	if err != nil {
+		return fmt.Errorf("read worker launch token: %w", err)
+	}
+	if string(raw) != token {
+		return errors.New("worker launch was interrupted or superseded")
+	}
+	return nil
+}
+
+func invalidateLaunch(runDir string) error {
+	if err := os.MkdirAll(runDir, 0700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filepath.Join(runDir, "launch-token"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	err = errors.Join(f.Sync(), f.Close())
+	if err != nil {
+		return err
+	}
+	dir, err := os.Open(runDir)
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
+}
+
 // Lock is released by the kernel on a crash, allowing session recovery.
 func Lock(runDir string) (func(), error) {
 	f, err := os.OpenFile(filepath.Join(runDir, "worker.lock"), os.O_CREATE|os.O_RDWR, 0600)
@@ -243,4 +285,56 @@ func Cancel(runDir string, force bool) error {
 		err = nil
 	}
 	return errors.Join(err, groupErr)
+}
+
+// Interrupt stops an execution without marking it cancelled. Stop the worker
+// before its children so it cannot launch another tool while cleanup runs.
+// SIGKILL deliberately bypasses signal-context handlers that persist hard stop.
+func Interrupt(runDir string) error {
+	// Persist invalidation before testing PID/lock: an exec may not have begun
+	// yet, but its old launch token must be refused when it eventually starts.
+	if err := invalidateLaunch(runDir); err != nil {
+		return err
+	}
+	id, alive, err := readIdentity(filepath.Join(runDir, "worker.pid"))
+	if err != nil {
+		return err
+	}
+	if alive {
+		if id.PID == os.Getpid() {
+			return errors.New("cannot interrupt the helper itself")
+		}
+		if err = syscall.Kill(id.PID, syscall.SIGSTOP); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return err
+		}
+		groupErr := KillGroups(runDir)
+		if err = syscall.Kill(id.PID, syscall.SIGKILL); errors.Is(err, syscall.ESRCH) {
+			err = nil
+		}
+		if err = errors.Join(err, groupErr); err != nil {
+			return err
+		}
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		unlock, lockErr := Lock(runDir)
+		if lockErr == nil {
+			defer unlock()
+			return KillGroups(runDir)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("interrupted execution still holds its lock: %w", lockErr)
+		}
+		// The Worker may have acquired its lock just before publishing its PID.
+		if !alive {
+			id, alive, err = readIdentity(filepath.Join(runDir, "worker.pid"))
+			if err != nil {
+				return err
+			}
+			if alive {
+				return Interrupt(runDir)
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

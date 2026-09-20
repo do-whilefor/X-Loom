@@ -133,6 +133,14 @@ func Parse(output, kind string, conclude bool, openIntents, maxIntents int) (Res
 		if maxIntents <= 0 {
 			return Result{}, errors.New("max_intents must be positive")
 		}
+		if raw, exists := data["decided"]; exists {
+			if !wrapped || string(raw) != "true" || len(data) != 1 {
+				return Result{}, errors.New("decided requires accepted:true and data containing only decided:true")
+			}
+			// The Server additionally requires this execution's committed graph
+			// decisions. Valid JSON alone does not prove that a decision happened.
+			return Result{Kind: "decided"}, nil
+		}
 		complete := data["complete"]
 		intents := data["intents"]
 		if len(intents) == 0 || string(intents) == "null" {

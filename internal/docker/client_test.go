@@ -57,6 +57,7 @@ func frame(stream byte, data string) []byte {
 func TestRunArchivesJobAndDemultiplexesOutput(t *testing.T) {
 	var gotJob worker.Job
 	var gotCommand []string
+	var launchToken string
 	var created, started, archived bool
 	c := mockClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
@@ -95,6 +96,11 @@ func TestRunArchivesJobAndDemultiplexesOutput(t *testing.T) {
 					break
 				}
 				if h.Typeflag != tar.TypeDir {
+					if h.Name == ".xloom/runs/run-1/launch-token" {
+						raw, _ := io.ReadAll(tr)
+						launchToken = string(raw)
+						continue
+					}
 					if h.Name != ".xloom/runs/run-1/job.json" || h.Mode != 0600 {
 						t.Errorf("bad archive header: %+v", h)
 					}
@@ -108,7 +114,7 @@ func TestRunArchivesJobAndDemultiplexesOutput(t *testing.T) {
 			}
 			_ = json.NewDecoder(r.Body).Decode(&request)
 			gotCommand = request.Cmd
-			if request.Tty || len(request.Env) != 1 || request.Env[0] != "TEST=value" {
+			if request.Tty || len(request.Env) != 2 || request.Env[0] != "TEST=value" || request.Env[1] != "XLOOM_LAUNCH_TOKEN="+launchToken || len(launchToken) != 32 {
 				t.Errorf("bad exec request: %+v", request)
 			}
 			io.WriteString(w, `{"Id":"exec-1"}`)
@@ -123,7 +129,7 @@ func TestRunArchivesJobAndDemultiplexesOutput(t *testing.T) {
 			w.WriteHeader(500)
 		}
 	})
-	result, err := c.Run(context.Background(), config.Worker{Env: map[string]string{"TEST": "value"}}, worker.Job{RunID: "run-1", Kind: "reason", Graph: board.Graph{Project: board.Project{ID: "p"}}})
+	result, err := c.Run(context.Background(), config.Worker{Env: map[string]string{"TEST": "value", "XLOOM_LAUNCH_TOKEN": "untrusted-override"}}, worker.Job{RunID: "run-1", Kind: "reason", Graph: board.Graph{Project: board.Project{ID: "p"}}})
 	if err != nil || result.Text != "done" {
 		t.Fatalf("%+v %v", result, err)
 	}
