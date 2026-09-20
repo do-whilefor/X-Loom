@@ -1,0 +1,33 @@
+server: http://server:8000
+runtime:
+  interval: 2
+  max_workers: 4
+  max_running_projects: 2
+  max_project_workers: 3
+  healthcheck_timeout: 30
+  worker_healthcheck: startup_only
+tasks:
+  bootstrap:
+    timeout: 0
+    conclude_timeout: 60
+  reason:
+    timeout: 120
+    max_intents: 3
+  explore:
+    timeout: 0
+    conclude_timeout: 60
+container:
+  image: xloom:dev
+  network_mode: bridge
+  completed_action: stop
+  namespace: xloom
+common_env:
+  ANTHROPIC_BASE_URL: https://opencode.ai/zen/go
+  ANTHROPIC_DEFAULT_FABLE_MODEL: deepseek-v4.1-flash
+  ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN}
+workers:
+  - name: general
+    type: go
+    task_types: [bootstrap, reason, explore]
+    max_running: 4
+    priority: 0

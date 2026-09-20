@@ -33,6 +33,13 @@ build/
 logs/
 tmp/
 .cache/
+.xloom/
+/dispatch.yaml
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+.pytest_cache/
 
 # ---- 编辑器 / 系统 ----
 .idea/

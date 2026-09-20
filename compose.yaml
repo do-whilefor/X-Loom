@@ -1,0 +1,29 @@
+services:
+  server:
+    build: .
+    image: xloom:dev
+    command: ["serve", "--host", "0.0.0.0", "--db-path", "/data/xloom.db"]
+    ports:
+      - "127.0.0.1:${XLOOM_PORT:-8000}:8000"
+    volumes:
+      - xloom-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+  dispatcher:
+    image: xloom:dev
+    command: ["dispatch", "--config", "/etc/xloom/dispatch.yaml"]
+    environment:
+      ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./dispatch.yaml:/etc/xloom/dispatch.yaml:ro
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  xloom-data:

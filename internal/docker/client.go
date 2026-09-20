@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -88,16 +89,25 @@ func (c *Client) ensure(ctx context.Context, id string) (string, error) {
 	defer unlock()
 	name := c.name(id)
 	var info struct {
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
 		State struct {
 			Running bool `json:"Running"`
 		} `json:"State"`
 	}
 	err := c.json(ctx, "GET", "/containers/"+url.PathEscape(name)+"/json", nil, &info)
+	if err == nil && (info.Config.Labels["xloom.namespace"] != c.Config.Namespace || info.Config.Labels["xloom.project"] != id) {
+		return "", errors.New("container name belongs to a different project or dispatcher namespace")
+	}
 	if status(err, 404) {
 		input := map[string]any{"Image": c.Config.Image, "Entrypoint": []string{"/bin/sh", "-c"}, "Cmd": []string{"exec sleep infinity"}, "WorkingDir": "/workspace", "Labels": map[string]string{"xloom.namespace": c.Config.Namespace, "xloom.project": id}, "HostConfig": map[string]any{"NetworkMode": c.Config.Network, "CapAdd": c.Config.CapAdd, "Init": true}}
 		err = c.json(ctx, "POST", "/containers/create?name="+url.QueryEscape(name), input, nil)
 		if status(err, 409) {
-			err = nil
+			err = c.json(ctx, "GET", "/containers/"+url.PathEscape(name)+"/json", nil, &info)
+			if err == nil && (info.Config.Labels["xloom.namespace"] != c.Config.Namespace || info.Config.Labels["xloom.project"] != id) {
+				return "", errors.New("container creation raced with a different project or dispatcher namespace")
+			}
 		}
 	}
 	if err != nil {
@@ -149,6 +159,9 @@ func (c *Client) exec(ctx context.Context, name string, argv, env []string, out 
 	err := c.json(ctx, "POST", "/containers/"+url.PathEscape(name)+"/exec", map[string]any{"AttachStdout": true, "AttachStderr": true, "Tty": false, "Cmd": argv, "Env": env, "WorkingDir": "/workspace"}, &created)
 	if err != nil {
 		return "", err
+	}
+	if created.ID == "" {
+		return "", errors.New("Docker returned an empty exec ID")
 	}
 	data := strings.NewReader(`{"Detach":false,"Tty":false}`)
 	res, err := c.request(ctx, "POST", "/exec/"+created.ID+"/start", data, "application/json")
@@ -219,6 +232,9 @@ func (s *resultSink) Write(p []byte) (int, error) {
 		}
 		var result worker.Result
 		if json.Unmarshal(s.pending, &result) == nil && result.Type == "result" {
+			if s.found {
+				return 0, errors.New("worker emitted multiple results")
+			}
 			s.result = result
 			s.found = true
 		}
@@ -231,6 +247,14 @@ func (s *resultSink) Write(p []byte) (int, error) {
 	return n, nil
 }
 func (c *Client) Run(ctx context.Context, w config.Worker, j worker.Job) (worker.Result, error) {
+	if j.RunID == "" || strings.ContainsAny(j.RunID, "/\\.") {
+		return worker.Result{}, errors.New("invalid run ID")
+	}
+	for _, ch := range j.RunID {
+		if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '-' || ch == '_') {
+			return worker.Result{}, errors.New("invalid run ID")
+		}
+	}
 	name, err := c.ensure(ctx, j.Graph.Project.ID)
 	if err != nil {
 		return worker.Result{}, err
@@ -247,6 +271,7 @@ func (c *Client) Run(ctx context.Context, w config.Worker, j worker.Job) (worker
 	for k, v := range w.Env {
 		env = append(env, k+"="+v)
 	}
+	sort.Strings(env)
 	sink := &resultSink{}
 	_, err = c.exec(ctx, name, []string{"/usr/local/bin/xloom", "worker", "--job", target}, env, sink)
 	if err != nil || ctx.Err() != nil {
@@ -255,6 +280,11 @@ func (c *Client) Run(ctx context.Context, w config.Worker, j worker.Job) (worker
 			return worker.Result{}, ctx.Err()
 		}
 		return worker.Result{}, err
+	}
+	if len(sink.pending) > 0 {
+		if _, err = sink.Write([]byte{'\n'}); err != nil {
+			return worker.Result{}, err
+		}
 	}
 	if !sink.found {
 		return worker.Result{}, errors.New("worker exited without a result")
@@ -277,8 +307,28 @@ func (c *Client) cancel(name, runDir string) {
 func (c *Client) Cleanup(ctx context.Context, id, state string) error {
 	unlock := c.lock(id)
 	defer unlock()
-	route := "/containers/" + url.PathEscape(c.name(id))
-	var err error
+	var info struct {
+		ID     string `json:"Id"`
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
+	}
+	err := c.json(ctx, "GET", "/containers/"+url.PathEscape(c.name(id))+"/json", nil, &info)
+	if status(err, 404) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Config.Labels["xloom.namespace"] != c.Config.Namespace || info.Config.Labels["xloom.project"] != id {
+		return errors.New("refusing to clean up a container belonging to a different project or dispatcher namespace")
+	}
+	if info.ID == "" {
+		return errors.New("Docker returned an empty container ID during cleanup")
+	}
+	// Names can be reassigned after inspection. Target the verified, immutable
+	// container ID so a replacement with the same name is never stopped/removed.
+	route := "/containers/" + url.PathEscape(info.ID)
 	if state == "deleted" || (state == "completed" && c.Config.CompletedAction == "remove") {
 		err = c.json(ctx, "DELETE", route+"?force=true", nil, nil)
 	} else {
@@ -303,5 +353,6 @@ func (c *Client) Projects(ctx context.Context) ([]string, error) {
 			ids = append(ids, id)
 		}
 	}
+	sort.Strings(ids)
 	return ids, nil
 }

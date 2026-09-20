@@ -1,5 +1,3 @@
-//go:build linux
-
 package dispatcher
 
 import (
@@ -59,6 +57,8 @@ type Scheduler struct {
 	cleanupDone chan cleaned
 	wg          sync.WaitGroup
 	cursor      int
+	// CheckHealth overrides the model readiness probe in tests or embeddings.
+	CheckHealth func(context.Context, config.Worker) error
 }
 
 func New(c config.Config, r Runner) *Scheduler {
@@ -79,6 +79,9 @@ func (s *Scheduler) Health(ctx context.Context, force bool) error {
 	return result
 }
 func (s *Scheduler) health(ctx context.Context, w config.Worker) error {
+	if s.CheckHealth != nil {
+		return s.CheckHealth(ctx, w)
+	}
 	if w.Type == "mock" {
 		return nil
 	}
@@ -93,8 +96,12 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	if err := s.Client.Do(ctx, "GET", "/settings", nil, &settings, nil); err != nil {
 		return err
 	}
-	if s.Config.Runtime.Interval*2 >= min(settings.IntentTimeout, settings.ReasonTimeout) {
-		return errors.New("heartbeat interval must leave at least two ticks within each server lease timeout")
+	leaseTimeout := min(settings.IntentTimeout, settings.ReasonTimeout)
+	if s.Config.Runtime.Interval >= leaseTimeout {
+		return errors.New("heartbeat interval must be shorter than each server lease timeout")
+	}
+	if leaseTimeout < 2*s.Config.Runtime.Interval {
+		slog.Warn("server lease timeout leaves little heartbeat slack", "interval", s.Config.Runtime.Interval, "lease_timeout", leaseTimeout)
 	}
 	_ = s.Health(ctx, false)
 	// With one dispatcher, old managed executions cannot survive a restart and
@@ -168,6 +175,9 @@ cleanup:
 	}
 }
 func (s *Scheduler) Step(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.reap()
 	summaries, err := s.Client.List(ctx)
 	if err != nil {
@@ -306,9 +316,12 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		return false, nil
 	}
 	running := 0
+	localReason, localBootstrap := false, false
 	for _, t := range s.running {
 		if t.Job.Graph.Project.ID == id {
 			running++
+			localReason = localReason || t.Job.Kind == "reason"
+			localBootstrap = localBootstrap || t.Job.Kind == "bootstrap"
 		}
 	}
 	if running >= s.Config.Runtime.MaxProjectWorkers {
@@ -322,13 +335,14 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		return false, nil
 	}
 	if initial(g) {
-		if g.Project.Reason != nil {
+		if g.Project.Reason != nil || localReason || localBootstrap {
 			return false, nil
 		}
 		var boot *board.Intent
 		for n := range g.Intents {
-			if bootstrap(g.Intents[n]) && (boot == nil || g.Intents[n].Worker == nil) {
-				boot = &g.Intents[n]
+			i := &g.Intents[n]
+			if bootstrap(*i) && (boot == nil || bootstrapBefore(*i, *boot)) {
+				boot = i
 			}
 		}
 		supported := false
@@ -352,7 +366,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		}
 		return s.launch(ctx, g, "bootstrap", boot, "")
 	}
-	if g.Project.Reason == nil {
+	if g.Project.Reason == nil && !localReason {
 		if trigger := s.trigger(g); trigger != "" {
 			return s.launch(ctx, g, "reason", nil, trigger)
 		}
@@ -377,6 +391,16 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		return s.launch(ctx, g, "explore", newest, "")
 	}
 	return false, nil
+}
+
+func bootstrapBefore(a, b board.Intent) bool {
+	if (a.Worker == nil) != (b.Worker == nil) {
+		return a.Worker == nil
+	}
+	if a.CreatedAt != b.CreatedAt {
+		return a.CreatedAt < b.CreatedAt
+	}
+	return a.ID < b.ID
 }
 func (s *Scheduler) rejectKey(project, kind, name string) string {
 	return project + "\x00" + kind + "\x00" + name
@@ -431,14 +455,10 @@ func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, inte
 		return false, err
 	}
 	budget := s.Config.Task(kind)
-	total := budget.Timeout + budget.ConcludeTimeout + 30
-	var taskCtx context.Context
-	var cancel context.CancelFunc
-	if budget.Timeout > 0 {
-		taskCtx, cancel = context.WithTimeout(ctx, time.Duration(total)*time.Second)
-	} else {
-		taskCtx, cancel = context.WithCancel(ctx)
-	}
+	// Worker owns its execution budget and the separate conclusion deadline.
+	// A dispatcher deadline measured from container startup could abort before
+	// a long current turn reaches the boundary where soft conclusion begins.
+	taskCtx, cancel := context.WithCancel(ctx)
 	t := &task{Job: worker.Job{RunID: id, Kind: kind, WorkerType: w.Type, Graph: g, Intent: intent, Budget: budget, Workspace: "/workspace"}, Worker: *w, Lease: lease, Cancel: cancel}
 	s.running[id] = t
 	s.admitted[g.Project.ID] = true
@@ -473,8 +493,6 @@ func (s *Scheduler) runTask(ctx context.Context, t *task) (string, error) {
 		}
 	}
 	result, err := s.Runner.Run(ctx, t.Worker, t.Job)
-	stopLease()
-	<-heartbeatDone
 	if ctx.Err() != nil {
 		return "cancelled", ctx.Err()
 	}
@@ -490,6 +508,19 @@ func (s *Scheduler) runTask(ctx context.Context, t *task) (string, error) {
 	}
 	if r.Kind == "rejected" {
 		return "rejected", nil
+	}
+	// Renew ownership before any write, including a no-op reason. The Server
+	// checks the execution identity again atomically with each mutation.
+	if err := s.Client.Do(ctx, "POST", s.leasePath(t)+"/heartbeat", map[string]string{"worker": t.Lease.Run}, nil, &t.Lease); err != nil {
+		return "failed", err
+	}
+	// A bootstrap conclusion closes its intent before project completion. Stop
+	// heartbeat renewal here so that the closed intent cannot cancel completion.
+	// Subsequent writes remain fenced by the Server's atomic ownership check.
+	stopLease()
+	<-heartbeatDone
+	if err := ctx.Err(); err != nil {
+		return "cancelled", err
 	}
 	if err = s.apply(ctx, t, r); err != nil {
 		return "failed", err
@@ -541,7 +572,9 @@ func (s *Scheduler) apply(ctx context.Context, t *task, r contract.Result) error
 		case "noop":
 			return nil
 		case "complete":
-			err := post("/complete", map[string]any{"from": r.Complete.From, "description": r.Complete.Description, "worker": t.Lease.Run}, nil)
+			input := r.Complete.Input()
+			input["worker"] = t.Lease.Run
+			err := post("/complete", input, nil)
 			var pe *ProtocolError
 			if errors.As(err, &pe) && pe.Status == 403 {
 				return nil
@@ -551,7 +584,9 @@ func (s *Scheduler) apply(ctx context.Context, t *task, r contract.Result) error
 			created := 0
 			var lastErr error
 			for _, i := range r.Intents {
-				err := post("/intents", map[string]any{"from": i.From, "description": i.Description, "creator": t.Lease.Run}, nil)
+				input := i.Input()
+				input["creator"] = t.Lease.Run
+				err := post("/intents", input, nil)
 				if err != nil {
 					lastErr = err
 					var pe *ProtocolError

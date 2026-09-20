@@ -1,0 +1,15 @@
+.git
+refer
+AGENTS.md
+.env
+.env.*
+!.env.example
+.cache
+build
+bin
+dist
+logs
+tmp
+*.db
+*.db-shm
+*.db-wal
