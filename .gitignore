@@ -1,0 +1,42 @@
+# ============================================================
+# X-Loom
+# ============================================================
+
+# ---- 第三方参考源码（不纳入版本控制）----
+# Cairn-main / pi-main / 参考资料，仅作本地重写参考
+/refer/
+
+# ---- Go ----
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/vendor/
+bin/
+dist/
+build/
+
+# ---- 环境变量与密钥 ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# ---- 运行时生成 ----
+.webounty/
+*.log
+logs/
+tmp/
+.cache/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,20 @@
+# 项目只在 Docker(Linux) 中运行，统一以 LF 存入仓库并检出
+* text=auto eol=lf
+
+# 二进制文件不做换行处理
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+
+# Windows 专用脚本保留 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 语言统计修正
+/refer/** linguist-vendored
