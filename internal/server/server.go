@@ -1,13 +1,17 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	b "xloom/internal/board"
 	"xloom/web"
@@ -23,9 +27,20 @@ type action func(*b.Tx, *request, *http.Request) (int, any, error)
 func New(store *b.Store) http.Handler {
 	s := &Server{store}
 	m := http.NewServeMux()
-	m.Handle("GET /static/", http.StripPrefix("/static/", http.FileServerFS(web.Files)))
+	m.HandleFunc("GET /static", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/static/", http.StatusTemporaryRedirect)
+	})
+	m.HandleFunc("GET /static/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/static/")
+		data, err := fs.ReadFile(web.Files, name)
+		if err != nil {
+			writeError(w, b.Err(404, "Not Found"))
+			return
+		}
+		http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(data))
+	})
 	m.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-		data, err := web.Files.ReadFile("index.html")
+		data, err := fs.ReadFile(web.Files, "index.html")
 		if err != nil {
 			http.Error(w, "Web unavailable", 500)
 			return
@@ -38,15 +53,55 @@ func New(store *b.Store) http.Handler {
 		"GET /projects": s.projects, "POST /projects": s.projects,
 		"GET /projects/{pid}": s.project, "DELETE /projects/{pid}": s.project,
 		"PUT /projects/{pid}/title": s.title, "PUT /projects/{pid}/status": s.status,
-		"POST /projects/{pid}/reason/{op}": s.reason,
-		"POST /projects/{pid}/hints":       s.hint, "POST /projects/{pid}/intents": s.intent,
-		"POST /projects/{pid}/intents/{iid}/{op}": s.intentAction,
-		"POST /projects/{pid}/complete":           s.complete, "POST /projects/{pid}/reopen": s.reopen,
+		"POST /projects/{pid}/hints": s.hint, "POST /projects/{pid}/intents": s.intent,
+		"POST /projects/{pid}/complete": s.complete, "POST /projects/{pid}/reopen": s.reopen,
 		"GET /projects/{pid}/export": s.export,
 	} {
 		m.HandleFunc(pattern, s.wrap(fn))
 	}
-	return m
+	for _, op := range []string{"claim", "heartbeat", "release"} {
+		m.HandleFunc("POST /projects/{pid}/reason/"+op, func(w http.ResponseWriter, r *http.Request) {
+			r.SetPathValue("op", op)
+			s.wrap(s.reason)(w, r)
+		})
+	}
+	for _, op := range []string{"heartbeat", "release", "conclude"} {
+		m.HandleFunc("POST /projects/{pid}/intents/{iid}/"+op, func(w http.ResponseWriter, r *http.Request) {
+			r.SetPathValue("op", op)
+			s.wrap(s.intentAction)(w, r)
+		})
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, pattern := m.Handler(r)
+		if pattern == "" {
+			// Match Cairn's trailing-slash redirects and JSON routing errors.
+			if len(r.URL.Path) > 1 && strings.HasSuffix(r.URL.Path, "/") {
+				probe := r.Clone(r.Context())
+				probe.URL.Path = strings.TrimRight(r.URL.Path, "/")
+				probe.URL.RawPath = ""
+				if _, alternate := m.Handler(probe); alternate != "" {
+					http.Redirect(w, r, probe.URL.RequestURI(), http.StatusTemporaryRedirect)
+					return
+				}
+			}
+			allowed := []string{}
+			for _, method := range []string{"GET", "HEAD", "POST", "PUT", "DELETE"} {
+				probe := r.Clone(r.Context())
+				probe.Method = method
+				if _, other := m.Handler(probe); other != "" {
+					allowed = append(allowed, method)
+				}
+			}
+			if len(allowed) > 0 {
+				w.Header().Set("Allow", strings.Join(allowed, ", "))
+				writeError(w, b.Err(405, "Method Not Allowed"))
+			} else {
+				writeError(w, b.Err(404, "Not Found"))
+			}
+			return
+		}
+		m.ServeHTTP(w, r)
+	})
 }
 func (s *Server) wrap(fn action) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -158,11 +213,21 @@ func (r *request) integer(key string) int {
 	case json.Number:
 		str = string(v)
 	case string:
-		str = v
+		str = strings.TrimSpace(v)
+		if strings.ContainsAny(str, "eE/xXbBoO") {
+			r.invalid(key, "must be an integer")
+		}
 	default:
 		r.invalid(key, "must be an integer")
 	}
-	n, err := strconv.Atoi(str)
+	// Pydantic accepts integral JSON floats and decimal strings such as 15.0.
+	// Parse exactly so large inputs cannot silently round to another timeout.
+	number, ok := new(big.Rat).SetString(str)
+	if !ok || !number.IsInt() {
+		r.invalid(key, "must be an integer greater than or equal to 5")
+		return 0
+	}
+	n, err := strconv.Atoi(number.Num().String())
 	if err != nil || n < 5 {
 		r.invalid(key, "must be an integer greater than or equal to 5")
 	}
@@ -194,53 +259,13 @@ func (r *request) bootstrap() bool {
 	r.invalid("bootstrap_enabled", "must be a boolean")
 	return false
 }
-func active(g b.Graph) error {
-	if g.Project.Status != "active" {
-		return b.Err(403, "Project is "+g.Project.Status)
-	}
-	return nil
-}
-func sourceFacts(g b.Graph, from []string) error {
-	for _, id := range from {
-		found := false
-		for _, f := range g.Facts {
-			if f.ID == id {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return b.Err(404, "Fact "+id+" not found")
-		}
-	}
-	for _, id := range from {
-		if id == "goal" {
-			return b.Err(400, "goal cannot be used in from")
-		}
-	}
-	return nil
-}
 
-// Dispatcher-only conditional writes fence off expired/replaced runs without
-// changing the public Cairn API. Worker identity is unique to each execution.
-func guard(g b.Graph, r *http.Request) error {
-	run := r.Header.Get("X-Xloom-Run")
-	if run == "" {
-		return nil
-	}
-	if r.Header.Get("X-Xloom-Lease") == "reason" {
-		if g.Project.Reason == nil || g.Project.Reason.Worker != run {
-			return b.Err(409, "Reason execution no longer owns its lease")
-		}
-		return nil
-	}
-	id := r.Header.Get("X-Xloom-Intent")
-	for _, i := range g.Intents {
-		if i.ID == id && b.Value(i.Worker) == run {
-			return nil
-		}
-	}
-	return b.Err(409, "Intent execution no longer owns its lease")
+// Headers opt a dispatcher request into the board's transactional lease fence.
+func guard(t *b.Tx, g b.Graph, r *http.Request) error {
+	return t.CheckExecution(g, b.ExecutionFence{
+		Run: r.Header.Get("X-Xloom-Run"), Lease: r.Header.Get("X-Xloom-Lease"),
+		Intent: r.Header.Get("X-Xloom-Intent"), AllowConcluded: r.Header.Get("X-Xloom-Lease") == "bootstrap" && strings.HasSuffix(r.URL.Path, "/complete"),
+	})
 }
 func (s *Server) health(t *b.Tx, _ *request, _ *http.Request) (int, any, error) {
 	_, err := t.Settings()
@@ -331,7 +356,7 @@ func (s *Server) title(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 	return 200, g.Project, t.Save(g)
 }
 func (s *Server) status(t *b.Tx, q *request, r *http.Request) (int, any, error) {
-	status := q.text("status")
+	status, _ := q.fields["status"].(string)
 	if status != "active" && status != "stopped" {
 		q.invalid("status", "must be active or stopped")
 	}
@@ -339,19 +364,8 @@ func (s *Server) status(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 	if err != nil {
 		return 0, nil, err
 	}
-	if g.Project.Status == "completed" {
-		return 0, nil, b.Err(409, "Completed projects cannot change status")
-	}
-	if g.Project.Status != status {
-		g.Project.Status = status
-		if status == "stopped" {
-			g.Project.Reason = nil
-			for n := range g.Intents {
-				if g.Intents[n].To == nil {
-					g.Intents[n].Worker = nil
-				}
-			}
-		}
+	if err := t.SetStatus(&g, status); err != nil {
+		return 0, nil, err
 	}
 	return 200, g.Project, t.Save(g)
 }
@@ -369,7 +383,7 @@ func (s *Server) reason(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 	if err != nil {
 		return 0, nil, err
 	}
-	if err = active(g); err != nil {
+	if err = g.RequireActive(); err != nil {
 		return 0, nil, err
 	}
 	lease := g.Project.Reason
@@ -397,6 +411,9 @@ func (s *Server) hint(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+	if g.Project.Status != "active" && g.Project.Status != "stopped" && g.Project.Status != "completed" {
+		return 0, nil, b.Err(403, "Project is "+g.Project.Status)
+	}
 	id, err := t.Next(g.Project.ID, "hint")
 	if err != nil {
 		return 0, nil, err
@@ -411,13 +428,13 @@ func (s *Server) intent(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 	if err != nil {
 		return 0, nil, err
 	}
-	if err = active(g); err != nil {
+	if err = g.RequireActive(); err != nil {
 		return 0, nil, err
 	}
-	if err = guard(g, r); err != nil {
+	if err = guard(t, g, r); err != nil {
 		return 0, nil, err
 	}
-	if err = sourceFacts(g, from); err != nil {
+	if err = g.ValidateSources(from); err != nil {
 		return 0, nil, err
 	}
 	if worker != nil && *worker != creator {
@@ -448,10 +465,10 @@ func (s *Server) intentAction(t *b.Tx, q *request, r *http.Request) (int, any, e
 	if err != nil {
 		return 0, nil, err
 	}
-	if err = active(g); err != nil {
+	if err = g.RequireActive(); err != nil {
 		return 0, nil, err
 	}
-	if err = guard(g, r); err != nil {
+	if err = guard(t, g, r); err != nil {
 		return 0, nil, err
 	}
 	for n := range g.Intents {
@@ -492,13 +509,13 @@ func (s *Server) complete(t *b.Tx, q *request, r *http.Request) (int, any, error
 	if err != nil {
 		return 0, nil, err
 	}
-	if err = active(g); err != nil {
+	if err = g.RequireActive(); err != nil {
 		return 0, nil, err
 	}
-	if err = guard(g, r); err != nil {
+	if err = guard(t, g, r); err != nil {
 		return 0, nil, err
 	}
-	if err = sourceFacts(g, from); err != nil {
+	if err = g.ValidateSources(from); err != nil {
 		return 0, nil, err
 	}
 	id, err := t.Next(g.Project.ID, "intent")
@@ -535,6 +552,9 @@ func (s *Server) reopen(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 	old := g.Intents[index]
 	if len(old.From) == 0 {
 		return 0, nil, b.Err(409, "Completion intent is missing its source facts")
+	}
+	if err := t.RevokeRuns(g.Project.ID); err != nil {
+		return 0, nil, err
 	}
 	fid, err := t.Next(g.Project.ID, "fact")
 	if err != nil {

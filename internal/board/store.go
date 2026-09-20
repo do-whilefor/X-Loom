@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -23,11 +23,11 @@ CREATE TABLE IF NOT EXISTS intent_sources(intent_id TEXT NOT NULL,project_id TEX
 CREATE TABLE IF NOT EXISTS hints(id TEXT NOT NULL,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,content TEXT NOT NULL,creator TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(id,project_id));
 CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY,value INTEGER NOT NULL DEFAULT 0);
 INSERT OR IGNORE INTO counters(name,value) VALUES('project',0);
-CREATE TABLE IF NOT EXISTS scoped_counters(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,kind TEXT NOT NULL,value INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(project_id,kind));`
+CREATE TABLE IF NOT EXISTS scoped_counters(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,kind TEXT NOT NULL,value INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(project_id,kind));
+CREATE TABLE IF NOT EXISTS xloom_revoked_runs(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,worker TEXT NOT NULL,PRIMARY KEY(project_id,worker));`
 
 type Store struct {
 	db  *sql.DB
-	mu  sync.Mutex
 	Now func() time.Time
 }
 type Tx struct {
@@ -41,20 +41,40 @@ func Open(path string) (*Store, error) {
 			return nil, err
 		}
 	}
-	db, err := sql.Open("sqlite", path)
+	// Acquire the write reservation at BEGIN, including when a second process
+	// opens this database. This keeps check-and-claim atomic across connections.
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	db, err := sql.Open("sqlite", path+separator+"_txlock=immediate&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db, Now: time.Now}
-	for _, q := range []string{"PRAGMA foreign_keys=ON", "PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=5000", schema} {
+	for _, q := range []string{"PRAGMA foreign_keys=ON", "PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=5000"} {
 		if _, err = db.Exec(q); err != nil {
 			db.Close()
 			return nil, err
 		}
 	}
-	rows, err := db.Query("PRAGMA table_info(projects)")
+	// Migrate atomically: a crash cannot add bootstrap_enabled without mapping
+	// a legacy disabled bootstrap_mode, or leave only some counters repaired.
+	migration, err := db.Begin()
 	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	defer migration.Rollback()
+	if _, err = migration.Exec(schema); err != nil {
+		migration.Rollback()
+		db.Close()
+		return nil, err
+	}
+	rows, err := migration.Query("PRAGMA table_info(projects)")
+	if err != nil {
+		migration.Rollback()
 		db.Close()
 		return nil, err
 	}
@@ -65,6 +85,7 @@ func Open(path string) (*Store, error) {
 		var def any
 		if err = rows.Scan(&cid, &name, &typ, &nn, &def, &pk); err != nil {
 			rows.Close()
+			migration.Rollback()
 			db.Close()
 			return nil, err
 		}
@@ -73,27 +94,47 @@ func Open(path string) (*Store, error) {
 	err = rows.Err()
 	rows.Close()
 	if err != nil {
+		migration.Rollback()
 		db.Close()
 		return nil, err
 	}
 	if !columns["bootstrap_enabled"] {
-		_, err = db.Exec("ALTER TABLE projects ADD COLUMN bootstrap_enabled INTEGER NOT NULL DEFAULT 1")
+		_, err = migration.Exec("ALTER TABLE projects ADD COLUMN bootstrap_enabled INTEGER NOT NULL DEFAULT 1")
 		if err == nil && columns["bootstrap_mode"] {
-			_, err = db.Exec("UPDATE projects SET bootstrap_enabled=CASE WHEN bootstrap_mode='disabled' THEN 0 ELSE 1 END")
+			_, err = migration.Exec("UPDATE projects SET bootstrap_enabled=CASE WHEN bootstrap_mode='disabled' THEN 0 ELSE 1 END")
 		}
 		if err != nil {
+			migration.Rollback()
 			db.Close()
 			return nil, err
 		}
+	}
+	// Older or partially restored Cairn databases may omit their counters. Never
+	// let a newly allocated ID overwrite a project or reference an old Fact.
+	if _, err = migration.Exec(`UPDATE counters SET value=MAX(value,COALESCE((SELECT MAX(CAST(SUBSTR(id,6) AS INTEGER)) FROM projects WHERE id GLOB 'proj_[0-9]*'),0)) WHERE name='project'`); err != nil {
+		migration.Rollback()
+		db.Close()
+		return nil, err
+	}
+	for _, item := range []struct{ table, kind, prefix string }{{"facts", "fact", "f"}, {"intents", "intent", "i"}, {"hints", "hint", "h"}} {
+		query := fmt.Sprintf(`INSERT INTO scoped_counters(project_id,kind,value) SELECT project_id,?,MAX(CAST(SUBSTR(id,2) AS INTEGER)) FROM %s WHERE id GLOB ? GROUP BY project_id ON CONFLICT(project_id,kind) DO UPDATE SET value=MAX(value,excluded.value)`, item.table)
+		if _, err = migration.Exec(query, item.kind, item.prefix+"[0-9]*"); err != nil {
+			migration.Rollback()
+			db.Close()
+			return nil, err
+		}
+	}
+	if err = migration.Commit(); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return s, nil
 }
 func (s *Store) Close() error { return s.db.Close() }
 
-// Serialize graph transactions. SQLite remains the final transaction boundary.
+// The one-connection pool serializes transactions with context-aware waiting.
+// SQLite's immediate transactions also serialize other Store instances.
 func (s *Store) Do(ctx context.Context, fn func(*Tx) error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	t, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -110,6 +151,22 @@ func (t *Tx) Settings() (Settings, error) {
 	err := t.QueryRow("SELECT intent_timeout,reason_timeout FROM settings WHERE rowid=1").Scan(&s.IntentTimeout, &s.ReasonTimeout)
 	return s, err
 }
+
+// RevokeRuns invalidates execution identities without changing Cairn's retained
+// worker and heartbeat metadata on concluded intents. In particular, a stopped
+// and then resumed project must reject a delayed bootstrap completion.
+func (t *Tx) RevokeRuns(project string) error {
+	_, err := t.Exec(`INSERT OR IGNORE INTO xloom_revoked_runs(project_id,worker)
+SELECT project_id,worker FROM intents WHERE project_id=? AND worker IS NOT NULL
+UNION SELECT id,reason_worker FROM projects WHERE id=? AND reason_worker IS NOT NULL`, project, project)
+	return err
+}
+
+func (t *Tx) RunRevoked(project, worker string) (bool, error) {
+	var revoked bool
+	err := t.QueryRow("SELECT EXISTS(SELECT 1 FROM xloom_revoked_runs WHERE project_id=? AND worker=?)", project, worker).Scan(&revoked)
+	return revoked, err
+}
 func (t *Tx) Expire() error {
 	s, err := t.Settings()
 	if err != nil {
@@ -123,6 +180,9 @@ func (t *Tx) Expire() error {
 	return err
 }
 func (t *Tx) Next(project, kind string) (string, error) {
+	if kind != "project" && kind != "fact" && kind != "intent" && kind != "hint" {
+		return "", fmt.Errorf("unknown ID kind %q", kind)
+	}
 	var n int
 	var err error
 	if kind == "project" {

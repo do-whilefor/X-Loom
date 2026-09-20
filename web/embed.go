@@ -1,8 +1,13 @@
+// Package web serves the unmodified Cairn browser interface.
 package web
 
-import "embed"
+import (
+	"embed"
+	"io/fs"
+)
 
-// Files are copied unchanged from Cairn's static directory.
-//
-//go:embed index.html favicon.svg vendor/*
-var Files embed.FS
+//go:embed static
+var assets embed.FS
+
+// Files is rooted at Cairn's static directory, preserving its original URLs.
+var Files, _ = fs.Sub(assets, "static")

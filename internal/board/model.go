@@ -83,7 +83,7 @@ func (g Graph) OpenCount() int {
 func (g Graph) Summarize() Summary {
 	s := Summary{Project: g.Project, FactCount: len(g.Facts), IntentCount: len(g.Intents), HintCount: len(g.Hints)}
 	for _, i := range g.Intents {
-		if i.To == nil {
+		if i.ConcludedAt == nil {
 			if i.Worker == nil {
 				s.Unclaimed++
 			} else {
