@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"slices"
@@ -67,6 +68,10 @@ func Load(path string) (Config, error) {
 	if err = d.Decode(&c); err != nil {
 		return c, err
 	}
+	var extra any
+	if err = d.Decode(&extra); err != io.EOF {
+		return c, fmt.Errorf("configuration must contain exactly one YAML document")
+	}
 	return c, c.Validate()
 }
 func (c *Config) Validate() error {
@@ -101,7 +106,7 @@ func (c *Config) Validate() error {
 	if !slices.Contains([]string{"disabled", "startup_only", "startup_and_task"}, c.Runtime.HealthMode) {
 		return fmt.Errorf("unknown worker_healthcheck mode")
 	}
-	if c.Runtime.Interval <= 0 || c.Runtime.MaxWorkers <= 0 || c.Runtime.MaxProjects <= 0 || c.Runtime.MaxProjectWorkers <= 0 || c.Runtime.HealthTimeout <= 0 || c.Runtime.MaxProjectWorkers > c.Runtime.MaxWorkers {
+	if c.Runtime.Interval <= 0 || c.Runtime.MaxWorkers <= 0 || c.Runtime.MaxProjects <= 0 || c.Runtime.MaxProjectWorkers <= 0 || c.Runtime.HealthTimeout <= 0 {
 		return fmt.Errorf("invalid runtime limits")
 	}
 	for _, t := range []Task{c.Tasks.Bootstrap, c.Tasks.Reason, c.Tasks.Explore} {
@@ -126,7 +131,7 @@ func (c *Config) Validate() error {
 	seen := map[string]bool{}
 	for n := range c.Workers {
 		w := &c.Workers[n]
-		if w.Name == "" || seen[w.Name] || w.MaxRunning <= 0 || w.Priority < 0 {
+		if strings.TrimSpace(w.Name) == "" || seen[w.Name] || w.MaxRunning <= 0 || w.Priority < 0 {
 			return fmt.Errorf("invalid or duplicate worker %q", w.Name)
 		}
 		seen[w.Name] = true

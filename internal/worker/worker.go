@@ -13,151 +13,349 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
 	"xloom/internal/agent"
-	"xloom/internal/board"
-	"xloom/internal/config"
 	"xloom/internal/contract"
 	"xloom/internal/process"
 	"xloom/internal/provider"
 	"xloom/internal/tools"
 )
 
-type Job struct {
-	RunID      string        `json:"run_id"`
-	Kind       string        `json:"kind"`
-	WorkerType string        `json:"worker_type"`
-	Graph      board.Graph   `json:"graph"`
-	Intent     *board.Intent `json:"intent,omitempty"`
-	Budget     config.Task   `json:"budget"`
-	Workspace  string        `json:"workspace"`
+type Options struct {
+	Provider     agent.Provider
+	Tools        []agent.Tool
+	RunDir       string
+	Output       io.Writer
+	Now          func() time.Time
+	SoftStop     <-chan struct{}
+	ContextBytes int
 }
-type Result struct {
-	Type     string `json:"type"`
-	Text     string `json:"text"`
-	Conclude bool   `json:"conclude"`
-	Status   string `json:"status"`
-	Error    string `json:"error,omitempty"`
+type session struct {
+	RunID             string          `json:"run_id"`
+	Kind              string          `json:"kind"`
+	StartedAt         time.Time       `json:"started_at"`
+	ConcludeStartedAt time.Time       `json:"conclude_started_at,omitempty"`
+	Concluding        bool            `json:"concluding"`
+	History           []agent.Message `json:"history"`
+	Result            *Result         `json:"result,omitempty"`
+	TaskPrompt        string          `json:"task_prompt,omitempty"`
+	ConclusionPrompt  string          `json:"conclusion_prompt,omitempty"`
 }
 
 func Execute(ctx context.Context, jobPath string, output io.Writer) error {
-	data, err := os.ReadFile(jobPath)
+	raw, err := os.ReadFile(jobPath)
 	if err != nil {
 		return err
 	}
 	var j Job
-	if err = json.Unmarshal(data, &j); err != nil {
+	if err = json.Unmarshal(raw, &j); err != nil {
 		return err
 	}
-	if j.Kind != "reason" && j.Kind != "bootstrap" && j.Kind != "explore" {
-		return errors.New("invalid job kind")
+	_, err = Run(ctx, j, Options{RunDir: filepath.Dir(jobPath), Output: output})
+	return err
+}
+
+// Run persists tool calls before executing their side effects. A task budget
+// requests conclusion only at a settled turn; cancellation never restarts it.
+func Run(parent context.Context, j Job, o Options) (Result, error) {
+	if err := parent.Err(); err != nil {
+		return Result{}, err
+	}
+	if j.RunID == "" {
+		return Result{}, errors.New("job requires run_id")
+	}
+	if j.Kind != "bootstrap" && j.Kind != "reason" && j.Kind != "explore" {
+		return Result{}, errors.New("invalid job kind")
 	}
 	if j.Kind != "reason" && j.Intent == nil {
-		return errors.New("job requires an intent")
+		return Result{}, errors.New("job requires an intent")
 	}
-	runDir := filepath.Dir(jobPath)
-	if err = os.MkdirAll(runDir, 0700); err != nil {
-		return err
+	if j.Budget.Timeout < 0 || j.Budget.ConcludeTimeout < 0 {
+		return Result{}, errors.New("task budgets must not be negative")
 	}
-	if err = os.WriteFile(filepath.Join(runDir, "worker.pid"), []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
-		return err
+	if j.Kind != "reason" && j.Budget.ConcludeTimeout <= 0 {
+		return Result{}, errors.New("conclude timeout must be positive")
 	}
-	defer os.Remove(filepath.Join(runDir, "worker.pid"))
+	if o.RunDir == "" || j.Workspace == "" {
+		return Result{}, errors.New("job requires workspace and execution directory")
+	}
+	var err error
+	o.RunDir, err = filepath.Abs(o.RunDir)
+	if err != nil {
+		return Result{}, err
+	}
+	j.Workspace, err = filepath.Abs(j.Workspace)
+	if err != nil {
+		return Result{}, err
+	}
+	if err = os.MkdirAll(o.RunDir, 0700); err != nil {
+		return Result{}, err
+	}
+	unlock, err := process.Lock(o.RunDir)
+	if err != nil {
+		return Result{}, err
+	}
+	defer unlock()
+	if process.Cancelled(o.RunDir) {
+		return Result{}, context.Canceled
+	}
+	if err = process.RegisterWorker(o.RunDir); err != nil {
+		return Result{}, err
+	}
+	defer os.Remove(filepath.Join(o.RunDir, "worker.pid"))
+	defer process.KillGroups(o.RunDir)
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
 	defer func() {
 		if ctx.Err() != nil {
-			process.KillGroups(runDir)
+			_ = os.WriteFile(filepath.Join(o.RunDir, "cancelled"), []byte("hard stop\n"), 0600)
 		}
 	}()
-	log, err := os.OpenFile(filepath.Join(runDir, "events.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	// The marker also covers cancel arriving before a container exec starts.
+	go func() {
+		tick := time.NewTicker(50 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if process.Cancelled(o.RunDir) {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	if process.Cancelled(o.RunDir) {
+		return Result{}, context.Canceled
+	}
+	if o.Now == nil {
+		o.Now = time.Now
+	}
+	if o.Output == nil {
+		o.Output = io.Discard
+	}
+	log, err := os.OpenFile(filepath.Join(o.RunDir, "events.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
-		return err
+		return Result{}, err
 	}
 	defer log.Close()
-	enc := json.NewEncoder(io.MultiWriter(log, output))
+	enc := json.NewEncoder(io.MultiWriter(log, o.Output))
 	var logErr error
-	if j.WorkerType == "mock" {
-		result := mock(j)
-		return enc.Encode(result)
-	}
-	p := &provider.Anthropic{BaseURL: os.Getenv("ANTHROPIC_BASE_URL"), Token: os.Getenv("ANTHROPIC_AUTH_TOKEN"), Model: os.Getenv("ANTHROPIC_MODEL"), MaxTokens: envInt("XLOOM_MAX_OUTPUT_TOKENS", 8192), Timeout: time.Duration(envInt("XLOOM_REQUEST_TIMEOUT", 180)) * time.Second}
-	if p.Model == "" {
-		p.Model = os.Getenv("ANTHROPIC_DEFAULT_FABLE_MODEL")
-	}
-	if p.BaseURL == "" || p.Token == "" || p.Model == "" {
-		return errors.New("missing model configuration")
-	}
-	set := tools.Set{Dir: j.Workspace, RunDir: runDir}
-	session := filepath.Join(runDir, "session.json")
-	l := &agent.Loop{Provider: p, Tools: set.All(), ContextBytes: envInt("XLOOM_CONTEXT_BYTES", 240000), Emit: func(e agent.Event) {
-		if err := enc.Encode(e); err != nil && logErr == nil {
-			logErr = err
+	emit := func(e agent.Event) {
+		if logErr == nil {
+			logErr = enc.Encode(e)
 		}
-	}, Save: func(messages []agent.Message) error {
+	}
+	state := session{RunID: j.RunID, Kind: j.Kind, StartedAt: o.Now()}
+	statePath := filepath.Join(o.RunDir, "session.json")
+	if previous, readErr := os.ReadFile(statePath); readErr == nil {
+		if err = json.Unmarshal(previous, &state); err != nil {
+			return Result{}, fmt.Errorf("invalid saved session: %w", err)
+		}
+		if state.RunID != j.RunID || state.Kind != j.Kind || state.StartedAt.IsZero() {
+			return Result{}, errors.New("session belongs to another execution or is invalid")
+		}
+	} else if !os.IsNotExist(readErr) {
+		return Result{}, readErr
+	}
+	var l *agent.Loop
+	save := func(history []agent.Message) error {
 		if logErr != nil {
 			return logErr
 		}
-		data, err := json.Marshal(messages)
+		state.History = history
+		if l != nil {
+			state.TaskPrompt = l.TaskPrompt
+			state.ConclusionPrompt = l.ConclusionPrompt
+		}
+		raw, err := json.Marshal(state)
 		if err != nil {
 			return err
 		}
-		tmp := session + ".tmp"
-		if err = os.WriteFile(tmp, data, 0600); err != nil {
+		tmp, err := os.CreateTemp(o.RunDir, "session-*.tmp")
+		if err != nil {
 			return err
 		}
-		return os.Rename(tmp, session)
-	}}
-	// Explicit restart resumes the transcript of this execution, never another run.
-	if previous, err := os.ReadFile(session); err == nil {
-		if err = json.Unmarshal(previous, &l.History); err != nil {
+		name := tmp.Name()
+		defer os.Remove(name)
+		if _, err = tmp.Write(raw); err == nil {
+			err = tmp.Sync()
+		}
+		err = errors.Join(err, tmp.Close())
+		if err != nil {
 			return err
 		}
-	} else if !os.IsNotExist(err) {
-		return err
+		return os.Rename(name, statePath)
 	}
-	prompt, err := Prompt(j, false, runDir)
-	if err != nil {
-		return err
+	finish := func(r Result) (Result, error) {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+		if process.Cancelled(o.RunDir) {
+			return Result{}, context.Canceled
+		}
+		state.Result = &r
+		if err := save(state.History); err != nil {
+			return r, err
+		}
+		return r, enc.Encode(r)
 	}
-	runCtx, cancel := deadline(ctx, j.Budget.Timeout)
-	text, runErr := l.Run(runCtx, prompt)
-	timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded)
-	cancel()
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if state.Result != nil {
+		return finish(*state.Result)
 	}
-	result := Result{Type: "result", Text: text, Status: "success"}
-	_, parseErr := contract.Parse(text, j.Kind, false, j.Graph.OpenCount(), j.Budget.MaxIntents)
-	if j.Kind != "reason" && (timedOut || (runErr == nil && parseErr != nil)) {
-		process.KillGroups(runDir)
+	if j.WorkerType == "mock" {
+		return finish(mock(j))
+	}
+	if o.Provider == nil {
+		p := &provider.Anthropic{BaseURL: os.Getenv("ANTHROPIC_BASE_URL"), Token: os.Getenv("ANTHROPIC_AUTH_TOKEN"), Model: os.Getenv("ANTHROPIC_MODEL"), MaxTokens: envInt("XLOOM_MAX_OUTPUT_TOKENS", 8192), Timeout: time.Duration(envInt("XLOOM_REQUEST_TIMEOUT", 180)) * time.Second}
+		p.SessionID = j.RunID
+		if p.Model == "" {
+			p.Model = os.Getenv("ANTHROPIC_DEFAULT_FABLE_MODEL")
+		}
+		if strings.TrimSpace(p.Token) == "" {
+			return Result{}, errors.New("ANTHROPIC_AUTH_TOKEN is required")
+		}
+		o.Provider = p
+	}
+	if o.Tools == nil {
+		set := tools.Set{Dir: j.Workspace, RunDir: o.RunDir}
+		o.Tools = set.All()
+	}
+	if o.ContextBytes <= 0 {
+		o.ContextBytes = envInt("XLOOM_CONTEXT_BYTES", 240000)
+	}
+	l = &agent.Loop{Provider: o.Provider, Tools: o.Tools, History: state.History, Concluding: state.Concluding, Emit: emit, Save: save, ContextBytes: o.ContextBytes, TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt}
+	var endCancel context.CancelFunc = func() {}
+	defer func() { endCancel() }()
+	runCtx := ctx
+	startConclusion := func() (context.Context, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		state.Concluding = true
 		l.Concluding = true
-		prompt, err = Prompt(j, true, runDir)
-		if err != nil {
-			return err
+		if state.ConcludeStartedAt.IsZero() {
+			state.ConcludeStartedAt = o.Now()
 		}
-		endCtx, endCancel := deadline(ctx, j.Budget.ConcludeTimeout)
-		text, runErr = l.Run(endCtx, prompt)
-		endCancel()
-		result.Text = text
-		result.Conclude = true
+		remaining := time.Duration(j.Budget.ConcludeTimeout)*time.Second - o.Now().Sub(state.ConcludeStartedAt)
+		if remaining <= 0 {
+			return nil, context.DeadlineExceeded
+		}
+		next, cancel := context.WithTimeout(ctx, remaining)
+		endCancel = cancel
+		return next, nil
 	}
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if state.Concluding {
+		runCtx, err = startConclusion()
+		if err != nil {
+			return finish(Result{Type: "result", Status: "failed", Conclude: true, Error: err.Error()})
+		}
+	}
+	if j.Kind == "reason" && j.Budget.Timeout > 0 {
+		remaining := time.Duration(j.Budget.Timeout)*time.Second - o.Now().Sub(state.StartedAt)
+		reasonCtx, reasonCancel := context.WithTimeout(ctx, remaining)
+		defer reasonCancel()
+		runCtx = reasonCtx
+	}
+	shouldConclude := func() bool {
+		if j.Kind == "reason" || l.Concluding {
+			return false
+		}
+		select {
+		case <-o.SoftStop:
+			return true
+		default:
+		}
+		return j.Budget.Timeout > 0 && o.Now().Sub(state.StartedAt) >= time.Duration(j.Budget.Timeout)*time.Second
+	}
+	l.OnTurnEnd = func(turnCtx context.Context, l *agent.Loop, m agent.Message) (context.Context, string, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
+		hasCalls := false
+		for _, b := range m.Content {
+			if b.Type == "tool_use" {
+				hasCalls = true
+			}
+		}
+		_, parseErr := contract.Parse(m.Text(), j.Kind, l.Concluding, j.Graph.OpenCount(), j.Budget.MaxIntents)
+		if !l.Concluding && j.Kind != "reason" && (shouldConclude() || (!hasCalls && parseErr != nil)) {
+			next, err := startConclusion()
+			if err != nil {
+				return nil, "", err
+			}
+			prompt, err := Prompt(j, true, o.RunDir)
+			return next, prompt, err
+		}
+		return turnCtx, "", nil
+	}
+	prompt := ""
+	if len(l.History) == 0 {
+		if shouldConclude() {
+			runCtx, err = startConclusion()
+			if err != nil {
+				return Result{}, err
+			}
+		}
+		prompt, err = Prompt(j, l.Concluding, o.RunDir)
+		if err != nil {
+			return Result{}, err
+		}
+	} else if last := l.History[len(l.History)-1]; last.Role == "assistant" {
+		calls := false
+		for _, b := range last.Content {
+			if b.Type == "tool_use" {
+				calls = true
+			}
+		}
+		if !calls {
+			// A model turn may have been saved immediately before the worker crashed.
+			if _, parseErr := contract.Parse(last.Text(), j.Kind, l.Concluding, j.Graph.OpenCount(), j.Budget.MaxIntents); parseErr == nil {
+				return finish(Result{Type: "result", Status: "success", Text: last.Text(), Conclude: l.Concluding})
+			} else if j.Kind == "reason" || l.Concluding {
+				return finish(Result{Type: "result", Status: "failed", Text: last.Text(), Conclude: l.Concluding, Error: parseErr.Error()})
+			}
+			if j.Kind != "reason" && !l.Concluding {
+				runCtx, err = startConclusion()
+				if err == nil {
+					prompt, err = Prompt(j, true, o.RunDir)
+				}
+				if err != nil {
+					return Result{}, err
+				}
+			}
+		}
+	}
+	// Resuming a transcript is itself a boundary. An expired exploration
+	// budget must not buy another unrestricted model/tool turn after restart.
+	if len(l.History) > 0 && shouldConclude() {
+		runCtx, err = startConclusion()
+		if err == nil {
+			prompt, err = Prompt(j, true, o.RunDir)
+		}
+		if err != nil {
+			return Result{}, err
+		}
+	}
+	text, runErr := l.Run(runCtx, prompt)
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	r := Result{Type: "result", Status: "success", Text: text, Conclude: l.Concluding}
+	if runErr == nil {
+		_, runErr = contract.Parse(text, j.Kind, l.Concluding, j.Graph.OpenCount(), j.Budget.MaxIntents)
 	}
 	if runErr != nil {
-		result.Status = "failed"
-		result.Error = runErr.Error()
+		r.Status = "failed"
+		r.Error = runErr.Error()
 	}
 	if logErr != nil {
-		return logErr
+		return r, logErr
 	}
-	return enc.Encode(result)
+	return finish(r)
 }
-func deadline(ctx context.Context, seconds int) (context.Context, context.CancelFunc) {
-	if seconds <= 0 {
-		return context.WithCancel(ctx)
-	}
-	return context.WithTimeout(ctx, time.Duration(seconds)*time.Second)
-}
+
 func envInt(key string, fallback int) int {
 	n, err := strconv.Atoi(os.Getenv(key))
 	if err != nil || n <= 0 {
@@ -165,45 +363,11 @@ func envInt(key string, fallback int) int {
 	}
 	return n
 }
-func Prompt(j Job, conclude bool, runDir string) (string, error) {
-	graph, err := board.Export(j.Graph, "yaml")
-	if err != nil {
-		return "", err
-	}
-	path := filepath.Join(runDir, "graph.yaml")
-	if err = os.WriteFile(path, []byte(graph), 0600); err != nil {
-		return "", err
-	}
-	context := "Read the complete task graph from " + path + ". Long evidence belongs in files; cite its path in the result. Distinguish confirmed findings from hypotheses.\n"
-	if conclude {
-		if j.Kind == "bootstrap" {
-			return context + `Stop exploration and waiting. Summarize only confirmed findings so far. Return a JSON object {"accepted":true,"data":{"fact":{"description":"..."}}}. Do not declare completion in this phase. If no factual conclusion can be submitted, return {"accepted":false,"reason":"..."}.`, nil
-		}
-		return context + `Stop exploration and waiting. Summarize confirmed incremental findings for the current intent. Return {"accepted":true,"data":{"description":"..."}}, or {"accepted":false,"reason":"..."} if there is no factual conclusion.` + intentContext(j), nil
-	}
-	switch j.Kind {
-	case "bootstrap":
-		return context + `Work directly from origin toward goal. Continue until the goal is confirmed or a conclude instruction arrives. On success return {"accepted":true,"data":{"fact":{"description":"confirmed evidence"},"complete":{"description":"why goal is met"}}}. If unable to accept the task return {"accepted":false,"reason":"..."}.`, nil
-	case "explore":
-		return context + `Explore only the assigned intent. Report confirmed incremental findings, including a substantiated negative result when appropriate. Return {"accepted":true,"data":{"description":"..."}}. If unable to accept the task return {"accepted":false,"reason":"..."}.` + intentContext(j), nil
-	case "reason":
-		return context + fmt.Sprintf(`Determine whether confirmed facts satisfy goal. If so return {"accepted":true,"data":{"complete":{"from":["fact id"],"description":"proof of completion"}}}. Otherwise propose at most %d independent valuable directions with {"accepted":true,"data":{"intents":[{"from":["fact id"],"description":"direction"}]}}. Sources must exist and cannot be goal. If open intents exist and cover the useful directions, {"accepted":true,"data":{}} is allowed. If there are no open intents, propose an intent. If unable to accept the task return {"accepted":false,"reason":"..."}.`, j.Budget.MaxIntents), nil
-	}
-	return "", errors.New("unknown task")
-}
-func intentContext(j Job) string {
-	if j.Intent == nil {
-		return ""
-	}
-	return "\nCurrent intent " + j.Intent.ID + ": " + j.Intent.Description
-}
 func mock(j Job) Result {
 	if configured := os.Getenv("XLOOM_MOCK_" + strings.ToUpper(j.Kind)); configured != "" {
 		return Result{Type: "result", Status: "success", Text: configured}
 	}
-	result := map[string]any{"accepted": true}
 	data := map[string]any{}
-	result["data"] = data
 	switch j.Kind {
 	case "bootstrap":
 		data["fact"] = map[string]string{"description": "Mock confirmed result"}
@@ -217,6 +381,6 @@ func mock(j Job) Result {
 			data["intents"] = []any{map[string]any{"from": []string{"origin"}, "description": "Mock exploration"}}
 		}
 	}
-	raw, _ := json.Marshal(result)
+	raw, _ := json.Marshal(map[string]any{"accepted": true, "data": data})
 	return Result{Type: "result", Status: "success", Text: string(raw)}
 }

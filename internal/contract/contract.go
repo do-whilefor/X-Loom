@@ -11,7 +11,19 @@ import (
 type Direction struct {
 	From        []string `json:"from"`
 	Description string   `json:"description"`
+	payload     map[string]json.RawMessage
 }
+
+// Input preserves Cairn's contract boundary: reason verifies the two required
+// keys, while the Server validates field types, sources and graph state. This
+// lets a bad direction fail independently of valid siblings in the same batch.
+func (d Direction) Input() map[string]any {
+	if d.payload != nil {
+		return map[string]any{"from": d.payload["from"], "description": d.payload["description"]}
+	}
+	return map[string]any{"from": d.From, "description": d.Description}
+}
+
 type Result struct {
 	Kind     string
 	Intents  []Direction
@@ -55,21 +67,26 @@ func text(raw json.RawMessage) (string, error) {
 }
 func direction(raw json.RawMessage) (Direction, error) {
 	var d Direction
-	err := json.Unmarshal(raw, &d)
+	m, err := object(raw)
 	if err != nil {
 		return d, err
 	}
-	d.Description = strings.TrimSpace(d.Description)
-	if d.Description == "" || len(d.From) == 0 {
-		return d, errors.New("direction requires from and description")
+	if _, ok := m["from"]; !ok {
+		return d, errors.New("direction requires from")
 	}
-	for n, id := range d.From {
-		d.From[n] = strings.TrimSpace(id)
-		if d.From[n] == "" {
-			return d, errors.New("empty fact id")
-		}
+	if _, ok := m["description"]; !ok {
+		return d, errors.New("direction requires description")
 	}
+	_ = json.Unmarshal(m["from"], &d.From)
+	_ = json.Unmarshal(m["description"], &d.Description)
+	d.payload = m
 	return d, nil
+}
+
+func isObject(raw json.RawMessage) bool { _, err := object(raw); return err == nil }
+func isArray(raw json.RawMessage) bool {
+	var a []json.RawMessage
+	return json.Unmarshal(raw, &a) == nil && a != nil
 }
 func Parse(output, kind string, conclude bool, openIntents, maxIntents int) (Result, error) {
 	m, err := Extract(output)
@@ -93,17 +110,19 @@ func Parse(output, kind string, conclude bool, openIntents, maxIntents int) (Res
 		valid := false
 		switch kind {
 		case "reason":
-			_, a := data["complete"]
-			_, b := data["intents"]
-			_, c := data["intent"]
+			_, completeErr := direction(data["complete"])
+			_, intentErr := direction(data["intent"])
+			a := completeErr == nil
+			b := isArray(data["intents"])
+			c := intentErr == nil
 			valid = len(data) == 1 && (a || b || c)
 		case "explore":
 			_, ok := data["description"]
 			valid = len(data) == 1 && ok
 		case "bootstrap":
-			_, f := data["fact"]
+			f := isObject(data["fact"])
 			_, c := data["complete"]
-			valid = f && ((len(data) == 2 && c) || (conclude && len(data) == 1))
+			valid = f && ((len(data) == 2 && c && (conclude || isObject(data["complete"]))) || (conclude && len(data) == 1))
 		}
 		if !valid {
 			return Result{}, errors.New("accepted must be true or false")
@@ -111,10 +130,13 @@ func Parse(output, kind string, conclude bool, openIntents, maxIntents int) (Res
 	}
 	switch kind {
 	case "reason":
+		if maxIntents <= 0 {
+			return Result{}, errors.New("max_intents must be positive")
+		}
 		complete := data["complete"]
 		intents := data["intents"]
 		if len(intents) == 0 || string(intents) == "null" {
-			if singular := data["intent"]; len(singular) > 0 && string(singular) != "null" {
+			if singular := data["intent"]; isObject(singular) {
 				intents = append(append(json.RawMessage{'['}, singular...), ']')
 			}
 		}

@@ -17,6 +17,12 @@ type Loop struct {
 	Steering   <-chan string
 	FollowUp   <-chan string
 	Concluding bool
+	// Task and conclusion instructions remain verbatim across every compaction.
+	TaskPrompt       string
+	ConclusionPrompt string
+	// OnTurnEnd runs at a settled model/tool boundary. A returned prompt keeps
+	// the same session running; a replacement context bounds subsequent turns.
+	OnTurnEnd func(context.Context, *Loop, Message) (context.Context, string, error)
 	// A byte budget is an approximation, not a provider token count.
 	ContextBytes int
 	mu           sync.Mutex
@@ -49,6 +55,22 @@ func queued(ch <-chan string) (string, bool) {
 	}
 }
 func (l *Loop) Run(ctx context.Context, prompt string) (string, error) {
+	if l.Provider == nil {
+		return "", errors.New("missing model provider")
+	}
+	if l.TaskPrompt == "" {
+		if len(l.History) > 0 {
+			l.TaskPrompt = l.History[0].Text()
+		} else {
+			l.TaskPrompt = prompt
+		}
+	}
+	if l.Concluding && l.ConclusionPrompt == "" && prompt != "" {
+		l.ConclusionPrompt = prompt
+	}
+	if err := l.RepairHistory(); err != nil {
+		return "", err
+	}
 	if prompt != "" {
 		if err := l.append(Text("user", prompt)); err != nil {
 			return "", err
@@ -87,6 +109,18 @@ func (l *Loop) Run(ctx context.Context, prompt string) (string, error) {
 			if m.Role != "assistant" {
 				return last, errors.New("provider returned a non-assistant message")
 			}
+			if err := validateCalls(m); err != nil {
+				return last, err
+			}
+			// A truncated argument fragment cannot be marshaled into a valid
+			// session. Preserve the call identity but never execute any of its calls.
+			if m.StopReason == "max_tokens" || m.StopReason == "length" {
+				for n := range m.Content {
+					if m.Content[n].Type == "tool_use" && !json.Valid(m.Content[n].Input) {
+						m.Content[n].Input = json.RawMessage(`{}`)
+					}
+				}
+			}
 			if err = l.append(m); err != nil {
 				return last, err
 			}
@@ -103,13 +137,32 @@ func (l *Loop) Run(ctx context.Context, prompt string) (string, error) {
 				if err = l.append(Message{Role: "user", Content: results}); err != nil {
 					return last, err
 				}
-				l.emit(Event{Type: "turn_end"})
-				if err = ctx.Err(); err != nil {
-					return last, err
-				}
-				continue
 			}
 			l.emit(Event{Type: "turn_end"})
+			if err = ctx.Err(); err != nil {
+				return last, err
+			}
+			if l.OnTurnEnd != nil {
+				next, instruction, hookErr := l.OnTurnEnd(ctx, l, m)
+				if hookErr != nil {
+					return last, hookErr
+				}
+				if next != nil {
+					ctx = next
+				}
+				if instruction != "" {
+					if l.Concluding {
+						l.ConclusionPrompt = instruction
+					}
+					if err = l.append(Text("user", instruction)); err != nil {
+						return last, err
+					}
+					continue
+				}
+			}
+			if len(calls) > 0 {
+				continue
+			}
 			if s, ok := queued(l.Steering); ok {
 				if err = l.append(Text("user", s)); err != nil {
 					return last, err
@@ -157,10 +210,10 @@ func (l *Loop) execute(ctx context.Context, calls []Block, truncated bool) []Blo
 			err = fmt.Errorf("unknown tool %q", c.Name)
 		case l.Concluding && !t.Conclude:
 			err = errors.New("exploration is disabled during conclusion; summarize existing evidence")
-		case !json.Valid(c.Input):
-			err = errors.New("tool arguments must be valid JSON")
 		default:
-			text, err = t.Execute(ctx, c.Input)
+			if err = ValidateArguments(t.Schema, c.Input); err == nil {
+				text, err = invoke(ctx, t, c.Input)
+			}
 		}
 		e := Event{Type: "tool_end", ToolID: c.ID, ToolName: c.Name}
 		if err != nil {
@@ -187,6 +240,82 @@ func (l *Loop) execute(ctx context.Context, calls []Block, truncated bool) []Blo
 		}
 	}
 	return out
+}
+
+func invoke(ctx context.Context, t *Tool, raw json.RawMessage) (text string, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = fmt.Errorf("tool panicked: %v", v)
+		}
+	}()
+	if t.Execute == nil {
+		return "", errors.New("tool has no executor")
+	}
+	return t.Execute(ctx, raw)
+}
+
+func validateCalls(m Message) error {
+	seen := map[string]bool{}
+	for _, b := range m.Content {
+		if b.Type != "tool_use" {
+			continue
+		}
+		if b.ID == "" || b.Name == "" {
+			return errors.New("tool call missing id or name")
+		}
+		if seen[b.ID] {
+			return fmt.Errorf("duplicate tool call id %q", b.ID)
+		}
+		seen[b.ID] = true
+	}
+	return nil
+}
+
+// RepairHistory settles interrupted tool batches with errors. Replaying them
+// could repeat a side effect that completed before the session was saved.
+func (l *Loop) RepairHistory() error {
+	var pending []Block
+	for i, m := range l.History {
+		if len(pending) > 0 {
+			if m.Role != "user" || len(m.Content) < len(pending) {
+				return errors.New("session has orphaned tool calls")
+			}
+			for n, c := range pending {
+				if m.Content[n].Type != "tool_result" || m.Content[n].ToolUseID != c.ID {
+					return errors.New("session tool result order or id mismatch")
+				}
+			}
+			for _, b := range m.Content[len(pending):] {
+				if b.Type == "tool_result" {
+					return errors.New("session has extra tool results")
+				}
+			}
+			pending = nil
+		} else if hasResults(m) {
+			return errors.New("session has orphaned tool results")
+		}
+		if m.Role == "assistant" {
+			if err := validateCalls(m); err != nil {
+				return err
+			}
+			for _, b := range m.Content {
+				if b.Type == "tool_use" {
+					pending = append(pending, b)
+				}
+			}
+		}
+		if m.Role != "user" && m.Role != "assistant" {
+			return fmt.Errorf("invalid session role at message %d", i)
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	results := make([]Block, len(pending))
+	for n, c := range pending {
+		results[n] = Block{Type: "tool_result", ToolUseID: c.ID, IsError: true, Content: json.RawMessage(`"Execution was interrupted; do not assume this action completed. Inspect existing evidence before deciding to retry."`)}
+	}
+	return l.append(Message{Role: "user", Content: results})
 }
 func (l *Loop) compact(ctx context.Context) error {
 	if l.ContextBytes <= 0 || len(l.History) < 8 {
@@ -215,11 +344,36 @@ func (l *Loop) compact(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("context summary: %w", err)
 	}
+	if m.Role != "assistant" || m.StopReason == "max_tokens" || m.StopReason == "length" {
+		return errors.New("context summary was invalid or truncated")
+	}
+	for _, b := range m.Content {
+		if b.Type == "tool_use" {
+			return errors.New("context summary attempted to call a tool")
+		}
+	}
 	if m.Text() == "" {
 		return errors.New("context summary was empty")
 	}
 	// Original turns remain in the session event log; this is the request view.
-	l.History = append([]Message{Text("user", "Earlier execution summary:\n"+m.Text())}, l.History[cut:]...)
+	if l.TaskPrompt == "" {
+		l.TaskPrompt = l.History[0].Text()
+	}
+	retained := []Message{}
+	if l.TaskPrompt != "" {
+		retained = append(retained, Text("user", l.TaskPrompt))
+	}
+	retained = append(retained, Text("user", "Earlier execution summary:\n"+m.Text()))
+	if l.ConclusionPrompt != "" {
+		retained = append(retained, Text("user", l.ConclusionPrompt))
+	}
+	for _, old := range l.History[cut:] {
+		if old.Role == "user" && len(old.Content) == 1 && old.Content[0].Type == "text" && (old.Text() == l.TaskPrompt || old.Text() == l.ConclusionPrompt) {
+			continue
+		}
+		retained = append(retained, old)
+	}
+	l.History = retained
 	l.emit(Event{Type: "context_compacted"})
 	if l.Save != nil {
 		return l.Save(l.History)

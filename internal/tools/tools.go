@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package tools exposes exactly the seven initial X-Loom tools.
 package tools
 
@@ -9,8 +11,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"xloom/internal/agent"
@@ -21,11 +26,17 @@ type Set struct {
 	Dir         string
 	RunDir      string
 	OutputBytes int
+	ToolTimeout time.Duration
 }
 
 func (s *Set) All() []agent.Tool {
 	def := func(name, desc, schema string, parallel, conclude bool, fn func(context.Context, json.RawMessage) (string, error)) agent.Tool {
-		return agent.Tool{Definition: agent.Definition{Name: name, Description: desc, Schema: json.RawMessage(schema)}, Parallel: parallel, Conclude: conclude, Execute: fn}
+		return agent.Tool{Definition: agent.Definition{Name: name, Description: desc, Schema: json.RawMessage(schema)}, Parallel: parallel, Conclude: conclude, Execute: func(ctx context.Context, raw json.RawMessage) (string, error) {
+			if err := agent.ValidateArguments(json.RawMessage(schema), raw); err != nil {
+				return "", err
+			}
+			return fn(ctx, raw)
+		}}
 	}
 	return []agent.Tool{
 		def("read", "Read a text file with optional 1-based offset and line limit.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}`, true, true, s.read),
@@ -44,6 +55,11 @@ func decode(raw json.RawMessage, dst any, required ...string) error {
 	}
 	if fields == nil {
 		return errors.New("arguments must be an object")
+	}
+	for k, v := range fields {
+		if string(v) == "null" {
+			return fmt.Errorf("argument %s cannot be null", k)
+		}
 	}
 	for _, k := range required {
 		v, ok := fields[k]
@@ -82,6 +98,13 @@ func (s *Set) output(f *os.File, err error) (string, error) {
 	return strings.ToValidUTF8(text, "�"), errors.Join(err, readErr)
 }
 func (s *Set) run(ctx context.Context, timeout time.Duration, name string, args ...string) (string, error) {
+	ceiling := s.ToolTimeout
+	if ceiling <= 0 {
+		ceiling = 2 * time.Minute
+	}
+	if timeout <= 0 || timeout > ceiling {
+		timeout = ceiling
+	}
 	if err := os.MkdirAll(s.RunDir, 0700); err != nil {
 		return "", err
 	}
@@ -93,6 +116,21 @@ func (s *Set) run(ctx context.Context, timeout time.Duration, name string, args 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	err = process.Run(ctx, s.Dir, s.RunDir, f, name, args...)
+	return s.output(f, err)
+}
+func (s *Set) capture(ctx context.Context, write func(io.Writer) error) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(s.RunDir, 0700); err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(s.RunDir, "output-*.txt")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	err = write(f)
 	return s.output(f, err)
 }
 func (s *Set) read(ctx context.Context, raw json.RawMessage) (string, error) {
@@ -116,56 +154,53 @@ func (s *Set) read(ctx context.Context, raw json.RawMessage) (string, error) {
 	if a.Limit == 0 {
 		a.Limit = 2000
 	}
-	f, err := os.Open(s.path(a.Path))
+	f, err := openRegular(s.path(a.Path))
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	reader := bufio.NewReader(f)
-	var out strings.Builder
-	line := 1
-	read := 0
-	truncated := false
-	for {
-		if err := ctx.Err(); err != nil {
-			return out.String(), err
-		}
-		piece, prefix, err := reader.ReadLine()
-		if err != nil && err != io.EOF {
-			return "", err
-		}
-		if err == io.EOF {
-			break
-		}
-		if line >= a.Offset {
-			if out.Len()+len(piece)+1 > s.limit() {
-				remaining := s.limit() - out.Len()
-				if remaining > 0 {
-					out.Write(piece[:min(remaining, len(piece))])
-				}
-				truncated = true
+	return s.capture(ctx, func(out io.Writer) error {
+		reader := bufio.NewReader(f)
+		line := 1
+		read := 0
+		truncated := false
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			piece, prefix, err := reader.ReadLine()
+			if err != nil && err != io.EOF {
+				return err
+			}
+			if err == io.EOF {
 				break
 			}
-			out.Write(piece)
-			if !prefix {
-				out.WriteByte('\n')
-			}
-		}
-		if !prefix {
 			if line >= a.Offset {
-				read++
-				if read >= a.Limit {
-					truncated = true
-					break
+				if _, err := out.Write(piece); err != nil {
+					return err
+				}
+				if !prefix {
+					if _, err := io.WriteString(out, "\n"); err != nil {
+						return err
+					}
 				}
 			}
-			line++
+			if !prefix {
+				if line >= a.Offset {
+					read++
+					if read >= a.Limit {
+						truncated = true
+						break
+					}
+				}
+				line++
+			}
 		}
-	}
-	if truncated {
-		fmt.Fprintf(&out, "\n[Read limited; continue reading %s with offset/limit.]", a.Path)
-	}
-	return strings.ToValidUTF8(out.String(), "�"), nil
+		if truncated {
+			_, err = fmt.Fprintf(out, "\n[Read limited; continue reading %s with offset/limit.]", a.Path)
+		}
+		return err
+	})
 }
 func (s *Set) bash(ctx context.Context, raw json.RawMessage) (string, error) {
 	var a struct {
@@ -183,6 +218,9 @@ func (s *Set) bash(ctx context.Context, raw json.RawMessage) (string, error) {
 	}
 	if a.Timeout == 0 {
 		a.Timeout = 120
+	}
+	if a.Timeout > 86400 {
+		return "", errors.New("timeout must not exceed 86400 seconds")
 	}
 	return s.run(ctx, time.Duration(a.Timeout)*time.Second, "bash", "-lc", a.Command)
 }
@@ -202,7 +240,7 @@ func (s *Set) edit(ctx context.Context, raw json.RawMessage) (string, error) {
 		return "", err
 	}
 	path := s.path(a.Path)
-	f, err := os.Open(path)
+	f, err := openRegular(path)
 	if err != nil {
 		return "", err
 	}
@@ -224,7 +262,7 @@ func (s *Set) edit(ctx context.Context, raw json.RawMessage) (string, error) {
 	if err = ctx.Err(); err != nil {
 		return "", err
 	}
-	err = os.WriteFile(path, []byte(strings.Replace(string(data), a.Old, a.New, 1)), info.Mode().Perm())
+	err = writeRegular(path, []byte(strings.Replace(string(data), a.Old, a.New, 1)), info.Mode().Perm())
 	return "Edited " + a.Path, err
 }
 func (s *Set) write(ctx context.Context, raw json.RawMessage) (string, error) {
@@ -245,8 +283,45 @@ func (s *Set) write(ctx context.Context, raw json.RawMessage) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return "", err
 	}
-	err := os.WriteFile(path, []byte(a.Content), 0644)
+	err := writeRegular(path, []byte(a.Content), 0644)
 	return "Wrote " + a.Path, err
+}
+
+// Nonblocking open followed by fstat avoids hanging on FIFOs/devices, including
+// symlinks that resolve to them. Reads and edits are text-file operations.
+func openRegular(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("path must be a regular file")
+	}
+	return f, nil
+}
+func writeRegular(path string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|syscall.O_NONBLOCK, mode)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("path must be a regular file")
+	}
+	if err = f.Truncate(0); err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	return err
 }
 func (s *Set) grep(ctx context.Context, raw json.RawMessage) (string, error) {
 	var a struct {
@@ -271,7 +346,8 @@ func (s *Set) grep(ctx context.Context, raw json.RawMessage) (string, error) {
 	}
 	args = append(args, "--", a.Pattern, s.path(a.Path))
 	out, err := s.run(ctx, 30*time.Second, "rg", args...)
-	if err != nil && out == "" && err.Error() == "exit status 1" {
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 && out == "" {
 		return "No matches", nil
 	}
 	return out, err
@@ -284,7 +360,12 @@ func (s *Set) find(ctx context.Context, raw json.RawMessage) (string, error) {
 	if err := decode(raw, &a, "pattern"); err != nil {
 		return "", err
 	}
-	return s.run(ctx, 30*time.Second, "rg", "--files", "--hidden", "--glob", a.Pattern, "--", s.path(a.Path))
+	out, err := s.run(ctx, 30*time.Second, "rg", "--files", "--hidden", "--glob", a.Pattern, "--", s.path(a.Path))
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 && out == "" {
+		return "No matches", nil
+	}
+	return out, err
 }
 func (s *Set) ls(ctx context.Context, raw json.RawMessage) (string, error) {
 	var a struct {
@@ -296,24 +377,29 @@ func (s *Set) ls(ctx context.Context, raw json.RawMessage) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	entries, err := os.ReadDir(s.path(a.Path))
+	dir, err := os.OpenFile(s.path(a.Path), os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_DIRECTORY, 0)
 	if err != nil {
 		return "", err
 	}
-	var out strings.Builder
-	for _, e := range entries {
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
-		out.WriteString(e.Name())
-		if e.IsDir() {
-			out.WriteByte('/')
-		}
-		out.WriteByte('\n')
-		if out.Len() >= s.limit() {
-			out.WriteString("[Listing truncated; use find to narrow results.]\n")
-			break
-		}
+	defer dir.Close()
+	entries, err := dir.ReadDir(-1)
+	if err != nil {
+		return "", err
 	}
-	return out.String(), nil
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	return s.capture(ctx, func(out io.Writer) error {
+		for _, e := range entries {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			name := e.Name()
+			if e.IsDir() {
+				name += "/"
+			}
+			if _, err := io.WriteString(out, name+"\n"); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }

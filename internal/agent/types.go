@@ -19,10 +19,38 @@ type Block struct {
 	Signature string          `json:"signature,omitempty"`
 	Data      string          `json:"data,omitempty"`
 }
+
+// Anthropic block schemas require these fields even when the provider emits
+// an empty value. In particular, a signature-only thinking block must replay
+// with thinking:""; omitting it causes a validation error on the next turn.
+func (b Block) MarshalJSON() ([]byte, error) {
+	switch b.Type {
+	case "text":
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}{b.Type, b.Text})
+	case "thinking":
+		return json.Marshal(struct {
+			Type      string `json:"type"`
+			Thinking  string `json:"thinking"`
+			Signature string `json:"signature"`
+		}{b.Type, b.Thinking, b.Signature})
+	case "redacted_thinking":
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			Data string `json:"data"`
+		}{b.Type, b.Data})
+	default:
+		type plain Block
+		return json.Marshal(plain(b))
+	}
+}
+
 type Message struct {
 	Role       string  `json:"role"`
 	Content    []Block `json:"content"`
-	StopReason string  `json:"-"`
+	StopReason string  `json:"stop_reason,omitempty"`
 }
 type Definition struct {
 	Name        string          `json:"name"`
