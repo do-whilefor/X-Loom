@@ -1,4 +1,11 @@
 services:
+  worker-image:
+    profiles: [images]
+    build:
+      context: .
+      dockerfile: container/Dockerfile
+    image: xloom-worker:dev
+    entrypoint: ["/bin/true"]
   server:
     build: .
     image: xloom:dev

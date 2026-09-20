@@ -64,7 +64,7 @@ func TestEveryConcludeToolIsRejectedEvenWithLegacyPermission(t *testing.T) {
 		if turns == 1 {
 			return agent.Message{Role: "assistant", Content: calls, StopReason: "tool_use"}, nil
 		}
-		results := m[len(m)-1].Content
+		results := lastToolResults(m)
 		if len(results) != len(calls) {
 			t.Fatal("lost tool results")
 		}

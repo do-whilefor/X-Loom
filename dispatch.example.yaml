@@ -1,9 +1,10 @@
 server: http://server:8000
 runtime:
   interval: 2
-  max_workers: 4
-  max_running_projects: 2
-  max_project_workers: 3
+  # Limits count all active tasks, including reason, bootstrap and conclude.
+  max_workers: 16
+  max_running_projects: 4
+  max_project_workers: 4
   healthcheck_timeout: 30
   worker_healthcheck: startup_only
 tasks:
@@ -17,7 +18,7 @@ tasks:
     timeout: 0
     conclude_timeout: 60
 container:
-  image: xloom:dev
+  image: xloom-worker:dev
   network_mode: bridge
   completed_action: stop
   namespace: xloom
@@ -25,9 +26,12 @@ common_env:
   ANTHROPIC_BASE_URL: https://opencode.ai/zen/go
   ANTHROPIC_DEFAULT_FABLE_MODEL: deepseek-v4.1-flash
   ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN}
+  XLOOM_REASONING_EFFORT: max
+  XLOOM_MAX_OUTPUT_TOKENS: '32768'
 workers:
   - name: general
     type: go
     task_types: [bootstrap, reason, explore]
-    max_running: 4
+    # Per-backend limit shared across all projects; still bounded by runtime limits.
+    max_running: 16
     priority: 0

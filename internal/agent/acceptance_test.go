@@ -177,3 +177,39 @@ func TestRepeatedCompactionPinsTaskAndConclusionVerbatim(t *testing.T) {
 		}
 	}
 }
+
+func TestCompactionKeepsCurrentRuntimeInstructionAfterOldAssistant(t *testing.T) {
+	for _, repair := range []bool{false, true} {
+		t.Run(map[bool]string{false: "conclusion", true: "repair"}[repair], func(t *testing.T) {
+			instruction := "Stop exploration and summarize existing evidence"
+			l := Loop{TaskPrompt: "original task", ConclusionPrompt: instruction, Concluding: true, ContextBytes: 1}
+			if repair {
+				instruction = "Rewrite the invalid result as complete JSON"
+				l.Repairing = true
+				l.RepairPrompt = instruction
+			}
+			l.History = []Message{Text("user", "original task")}
+			for range 5 {
+				l.History = append(l.History, Text("assistant", "old evidence"), Text("user", "next"))
+			}
+			l.History = append(l.History, Text("assistant", `{"invalid":`), Text("user", instruction))
+			calls := 0
+			l.Provider = providerFunc(func(_ context.Context, m []Message, d []Definition, _ Emit) (Message, error) {
+				calls++
+				if calls == 1 {
+					return Text("assistant", "summary"), nil
+				}
+				if d != nil || m[len(m)-1].Role != "user" || m[len(m)-1].Text() != instruction {
+					t.Fatal("compaction moved runtime instruction before old assistant response")
+				}
+				return Text("assistant", "complete rewritten result"), nil
+			})
+			if _, err := l.Run(context.Background(), ""); err != nil {
+				t.Fatal(err)
+			}
+			if calls != 2 {
+				t.Fatal("unexpected calls", calls)
+			}
+		})
+	}
+}

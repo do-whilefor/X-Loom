@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 	"xloom/internal/agent"
-	"xloom/internal/contract"
 	"xloom/internal/process"
 	"xloom/internal/provider"
 	"xloom/internal/tools"
@@ -33,6 +32,7 @@ type session struct {
 	RunID                  string          `json:"run_id"`
 	Kind                   string          `json:"kind"`
 	StartedAt              time.Time       `json:"started_at"`
+	ReasonDeadline         time.Time       `json:"reason_deadline,omitempty"`
 	ConcludeStartedAt      time.Time       `json:"conclude_started_at,omitempty"`
 	ConcludeDeadline       time.Time       `json:"conclude_deadline,omitempty"`
 	Concluding             bool            `json:"concluding"`
@@ -41,6 +41,11 @@ type session struct {
 	TaskPrompt             string          `json:"task_prompt,omitempty"`
 	ConclusionPrompt       string          `json:"conclusion_prompt,omitempty"`
 	ConclusionInputVersion int             `json:"conclusion_input_version,omitempty"`
+	Repairing              bool            `json:"repairing,omitempty"`
+	RepairCount            int             `json:"repair_count,omitempty"`
+	RepairReason           string          `json:"repair_reason,omitempty"`
+	RepairPrompt           string          `json:"repair_prompt,omitempty"`
+	RepairPending          bool            `json:"repair_pending,omitempty"`
 }
 
 func Execute(ctx context.Context, jobPath string, output io.Writer) error {
@@ -144,12 +149,17 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	defer log.Close()
 	enc := json.NewEncoder(io.MultiWriter(log, o.Output))
 	var logErr error
+	state := session{RunID: j.RunID, Kind: j.Kind, StartedAt: o.Now()}
 	emit := func(e agent.Event) {
+		// The following Save persists the response and its repair phase
+		// together. A crash before that save conservatively consumes a retry.
+		if state.Repairing && e.Type == "message_end" && e.Message != nil && e.Message.Role == "assistant" {
+			state.RepairPending = false
+		}
 		if logErr == nil {
 			logErr = enc.Encode(e)
 		}
 	}
-	state := session{RunID: j.RunID, Kind: j.Kind, StartedAt: o.Now()}
 	statePath := filepath.Join(o.RunDir, "session.json")
 	if previous, readErr := os.ReadFile(statePath); readErr == nil {
 		if err = json.Unmarshal(previous, &state); err != nil {
@@ -157,6 +167,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		}
 		if state.RunID != j.RunID || state.Kind != j.Kind || state.StartedAt.IsZero() {
 			return Result{}, errors.New("session belongs to another execution or is invalid")
+		}
+		if state.RepairCount < 0 || state.RepairCount > maxOutputRepairs || (state.RepairCount > 0 && !state.Repairing) || (state.Repairing && (state.RepairCount == 0 || state.RepairPrompt == "")) {
+			return Result{}, errors.New("invalid saved result-repair state")
 		}
 	} else if !os.IsNotExist(readErr) {
 		return Result{}, readErr
@@ -170,6 +183,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		if l != nil {
 			state.TaskPrompt = l.TaskPrompt
 			state.ConclusionPrompt = l.ConclusionPrompt
+			state.RepairPrompt = l.RepairPrompt
 		}
 		raw, err := json.Marshal(state)
 		if err != nil {
@@ -204,13 +218,19 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		return r, enc.Encode(r)
 	}
 	if state.Result != nil {
-		return finish(*state.Result)
+		// Older versions could cache a parseable but truncated prefix. Never
+		// submit it as success; restore its transcript into bounded repair.
+		last, ok := lastAssistant(state.History)
+		if state.Result.Status != "success" || !ok || !truncated(last) {
+			return finish(*state.Result)
+		}
+		state.Result = nil
 	}
 	if j.WorkerType == "mock" {
 		return finish(mock(j))
 	}
 	if o.Provider == nil {
-		p := &provider.Anthropic{BaseURL: os.Getenv("ANTHROPIC_BASE_URL"), Token: os.Getenv("ANTHROPIC_AUTH_TOKEN"), Model: os.Getenv("ANTHROPIC_MODEL"), MaxTokens: envInt("XLOOM_MAX_OUTPUT_TOKENS", 8192), Timeout: time.Duration(envInt("XLOOM_REQUEST_TIMEOUT", 180)) * time.Second}
+		p := &provider.Anthropic{BaseURL: os.Getenv("ANTHROPIC_BASE_URL"), Token: os.Getenv("ANTHROPIC_AUTH_TOKEN"), Model: os.Getenv("ANTHROPIC_MODEL"), MaxTokens: envInt("XLOOM_MAX_OUTPUT_TOKENS", provider.DefaultMaxTokens), ReasoningEffort: os.Getenv("XLOOM_REASONING_EFFORT"), Timeout: time.Duration(envInt("XLOOM_REQUEST_TIMEOUT", 180)) * time.Second}
 		p.SessionID = j.RunID
 		if p.Model == "" {
 			p.Model = os.Getenv("ANTHROPIC_DEFAULT_FABLE_MODEL")
@@ -227,7 +247,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	if o.ContextBytes <= 0 {
 		o.ContextBytes = envInt("XLOOM_CONTEXT_BYTES", 240000)
 	}
-	l = &agent.Loop{Provider: o.Provider, Tools: o.Tools, History: state.History, Concluding: state.Concluding, Emit: emit, Save: save, ContextBytes: o.ContextBytes, TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt}
+	l = &agent.Loop{Provider: o.Provider, Tools: o.Tools, History: state.History, Concluding: state.Concluding, Repairing: state.Repairing, RepairPrompt: state.RepairPrompt, Emit: emit, Save: save, ContextBytes: o.ContextBytes, TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt}
 	var endCancel context.CancelFunc = func() {}
 	defer func() { endCancel() }()
 	runCtx := ctx
@@ -287,8 +307,11 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 			prompt = l.ConclusionPrompt
 		}
 	}
-	if j.Kind == "reason" && j.Budget.Timeout > 0 {
-		remaining := time.Duration(j.Budget.Timeout)*time.Second - o.Now().Sub(state.StartedAt)
+	if j.Kind == "reason" && (j.Budget.Timeout > 0 || !state.ReasonDeadline.IsZero()) {
+		if state.ReasonDeadline.IsZero() {
+			state.ReasonDeadline = state.StartedAt.Add(time.Duration(j.Budget.Timeout) * time.Second)
+		}
+		remaining := state.ReasonDeadline.Sub(o.Now())
 		reasonCtx, reasonCancel := context.WithTimeout(ctx, remaining)
 		defer reasonCancel()
 		runCtx = reasonCtx
@@ -304,25 +327,77 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		}
 		return j.Budget.Timeout > 0 && o.Now().Sub(state.StartedAt) >= time.Duration(j.Budget.Timeout)*time.Second
 	}
+	prepareRepairHistory := func() error {
+		if err := l.RepairHistory(); err != nil {
+			return err
+		}
+		if l.Concluding && !containsInstruction(l.History, l.ConclusionPrompt) {
+			return l.AppendInstruction(l.ConclusionPrompt)
+		}
+		return nil
+	}
+	startRepair := func(turnCtx context.Context, problem *outputFailure) (string, error) {
+		if err := turnCtx.Err(); err != nil {
+			return "", err
+		}
+		if state.RepairCount >= maxOutputRepairs {
+			return "", fmt.Errorf("result-format repair exhausted after %d attempts: %w", maxOutputRepairs, problem)
+		}
+		state.RepairCount++
+		state.Repairing = true
+		l.Repairing = true
+		state.RepairReason = problem.Reason
+		instruction, err := repairInstruction(j, l.Concluding, state.RepairCount, problem)
+		if err != nil {
+			return "", err
+		}
+		l.RepairPrompt = instruction
+		state.RepairPending = true
+		// Consume the attempt before adding its prompt or making a request.
+		if err = save(l.History); err != nil {
+			return "", err
+		}
+		if err = prepareRepairHistory(); err != nil {
+			return "", err
+		}
+		return instruction, nil
+	}
 	l.OnTurnEnd = func(turnCtx context.Context, l *agent.Loop, m agent.Message) (context.Context, string, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
 		}
-		hasCalls := false
-		for _, b := range m.Content {
-			if b.Type == "tool_use" {
-				hasCalls = true
-			}
-		}
-		_, parseErr := contract.Parse(m.Text(), j.Kind, l.Concluding, j.Graph.OpenCount(), j.Budget.MaxIntents)
-		if !l.Concluding && j.Kind != "reason" && (shouldConclude() || (!hasCalls && parseErr != nil)) {
+		hasCalls := hasToolCalls(m)
+		problem := outputProblem(j, l.Concluding, m)
+		needsResult := !hasCalls || truncated(m) || l.Concluding || l.Repairing
+		if !l.Concluding && j.Kind != "reason" && (shouldConclude() || (needsResult && problem != nil)) {
 			next, err := startConclusion()
 			if err != nil {
 				return nil, "", err
 			}
+			if needsResult && problem != nil {
+				instruction, err := startRepair(next, problem)
+				return next, instruction, err
+			}
 			return next, l.ConclusionPrompt, nil
 		}
+		if needsResult && problem != nil {
+			instruction, err := startRepair(turnCtx, problem)
+			return turnCtx, instruction, err
+		}
 		return turnCtx, "", nil
+	}
+	if state.Repairing && state.RepairPending {
+		if containsInstruction(l.History, l.RepairPrompt) {
+			// The request may have been sent before a crash. Do not reset or
+			// replay that attempt for free; use only a remaining repair slot.
+			prompt, err = startRepair(runCtx, &outputFailure{Reason: "interrupted_repair", Detail: "the previous repair request has no durable response"})
+		} else {
+			err = prepareRepairHistory()
+			prompt = l.RepairPrompt
+		}
+		if err != nil {
+			return finish(Result{Type: "result", Status: "failed", Conclude: l.Concluding, Error: err.Error()})
+		}
 	}
 	if len(l.History) == 0 {
 		if shouldConclude() {
@@ -339,28 +414,15 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
-	} else if last := l.History[len(l.History)-1]; last.Role == "assistant" && prompt == "" {
-		calls := false
-		for _, b := range last.Content {
-			if b.Type == "tool_use" {
-				calls = true
-			}
-		}
-		if !calls {
+	} else if last, ok := lastAssistant(l.History); ok && prompt == "" && !awaitingInstructionResponse(l.History) {
+		if !hasToolCalls(last) || truncated(last) || state.Repairing {
 			// A model turn may have been saved immediately before the worker crashed.
-			if _, parseErr := contract.Parse(last.Text(), j.Kind, l.Concluding, j.Graph.OpenCount(), j.Budget.MaxIntents); parseErr == nil {
+			if problem := outputProblem(j, l.Concluding, last); problem == nil {
 				return finish(Result{Type: "result", Status: "success", Text: last.Text(), Conclude: l.Concluding})
-			} else if j.Kind == "reason" || l.Concluding {
-				return finish(Result{Type: "result", Status: "failed", Text: last.Text(), Conclude: l.Concluding, Error: parseErr.Error()})
 			}
-			if j.Kind != "reason" && !l.Concluding {
-				runCtx, err = startConclusion()
-				if err == nil {
-					prompt = l.ConclusionPrompt
-				}
-				if err != nil {
-					return Result{}, err
-				}
+			runCtx, prompt, err = l.OnTurnEnd(runCtx, l, last)
+			if err != nil {
+				return finish(Result{Type: "result", Status: "failed", Text: last.Text(), Conclude: l.Concluding, Error: err.Error()})
 			}
 		}
 	}
@@ -381,7 +443,13 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	}
 	r := Result{Type: "result", Status: "success", Text: text, Conclude: l.Concluding}
 	if runErr == nil {
-		_, runErr = contract.Parse(text, j.Kind, l.Concluding, j.Graph.OpenCount(), j.Budget.MaxIntents)
+		if last, ok := lastAssistant(l.History); ok {
+			if problem := outputProblem(j, l.Concluding, last); problem != nil {
+				runErr = problem
+			}
+		} else {
+			runErr = errors.New("model returned no final message")
+		}
 	}
 	if runErr != nil {
 		r.Status = "failed"

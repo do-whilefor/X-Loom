@@ -58,6 +58,9 @@ func TestEndpointAndWireRequest(t *testing.T) {
 				if string(body["model"]) != `"deepseek-v4.1-flash"` || string(body["stream"]) != "true" {
 					t.Error("wrong defaults")
 				}
+				if string(body["thinking"]) != `{"type":"enabled"}` || string(body["output_config"]) != `{"effort":"max"}` || string(body["max_tokens"]) != "32768" {
+					t.Error("highest reasoning effort and output allowance must be explicit request controls")
+				}
 				w.Header().Set("Content-Type", "application/json")
 				fmt.Fprint(w, `{"role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`)
 			}))
@@ -68,6 +71,39 @@ func TestEndpointAndWireRequest(t *testing.T) {
 				t.Fatal(m, err)
 			}
 		})
+	}
+}
+
+func TestReasoningEffortOverridesAndValidation(t *testing.T) {
+	for _, effort := range []string{"low", "high", "max"} {
+		t.Run(effort, func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					MaxTokens    int `json:"max_tokens"`
+					OutputConfig struct {
+						Effort string `json:"effort"`
+					} `json:"output_config"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				if body.OutputConfig.Effort != effort || body.MaxTokens != 16384 {
+					t.Error("explicit reasoning/output settings were lost")
+				}
+				fmt.Fprint(w, `{"role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`)
+			}))
+			defer s.Close()
+			p := Anthropic{BaseURL: s.URL, Token: "test", ReasoningEffort: effort, MaxTokens: 16384}
+			if _, err := p.Generate(context.Background(), []agent.Message{agent.Text("user", "task")}, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Error("invalid effort was sent to the network") }))
+	defer s.Close()
+	p := Anthropic{BaseURL: s.URL, Token: "test", ReasoningEffort: "xhigh"}
+	if _, err := p.Generate(context.Background(), []agent.Message{agent.Text("user", "task")}, nil, nil); err == nil {
+		t.Fatal("unsupported effort was silently accepted")
 	}
 }
 

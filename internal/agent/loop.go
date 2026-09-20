@@ -17,9 +17,11 @@ type Loop struct {
 	Steering   <-chan string
 	FollowUp   <-chan string
 	Concluding bool
+	Repairing  bool
 	// Task and conclusion instructions remain verbatim across every compaction.
 	TaskPrompt       string
 	ConclusionPrompt string
+	RepairPrompt     string
 	// OnTurnEnd runs at a settled model/tool boundary. A returned prompt keeps
 	// the same session running; a replacement context bounds subsequent turns.
 	OnTurnEnd func(context.Context, *Loop, Message) (context.Context, string, error)
@@ -43,6 +45,10 @@ func (l *Loop) append(m Message) error {
 	}
 	return nil
 }
+
+// AppendInstruction adds a runtime instruction at a settled turn boundary.
+// The caller must first settle any interrupted tool group with RepairHistory.
+func (l *Loop) AppendInstruction(prompt string) error { return l.append(Text("user", prompt)) }
 func queued(ch <-chan string) (string, bool) {
 	if ch == nil {
 		return "", false
@@ -97,7 +103,7 @@ func (l *Loop) Run(ctx context.Context, prompt string) (string, error) {
 			}
 			var defs []Definition
 			for _, t := range l.Tools {
-				if !l.Concluding {
+				if !l.Concluding && !l.Repairing {
 					defs = append(defs, t.Definition)
 				}
 			}
@@ -151,7 +157,9 @@ func (l *Loop) Run(ctx context.Context, prompt string) (string, error) {
 					ctx = next
 				}
 				if instruction != "" {
-					if l.Concluding {
+					if l.Repairing {
+						l.RepairPrompt = instruction
+					} else if l.Concluding {
 						l.ConclusionPrompt = instruction
 					}
 					if err = l.append(Text("user", instruction)); err != nil {
@@ -208,6 +216,8 @@ func (l *Loop) execute(ctx context.Context, calls []Block, truncated bool) []Blo
 			err = ctx.Err()
 		case l.Concluding:
 			err = errors.New("all tools are disabled during conclusion; use the supplied snapshot and session evidence")
+		case l.Repairing:
+			err = errors.New("all tools are disabled during result-format repair; use existing session evidence")
 		case t == nil:
 			err = fmt.Errorf("unknown tool %q", c.Name)
 		default:
@@ -364,14 +374,20 @@ func (l *Loop) compact(ctx context.Context) error {
 		retained = append(retained, Text("user", l.TaskPrompt))
 	}
 	retained = append(retained, Text("user", "Earlier execution summary:\n"+m.Text()))
-	if l.ConclusionPrompt != "" {
-		retained = append(retained, Text("user", l.ConclusionPrompt))
-	}
 	for _, old := range l.History[cut:] {
-		if old.Role == "user" && len(old.Content) == 1 && old.Content[0].Type == "text" && (old.Text() == l.TaskPrompt || old.Text() == l.ConclusionPrompt) {
+		if old.Role == "user" && len(old.Content) == 1 && old.Content[0].Type == "text" && (old.Text() == l.TaskPrompt || old.Text() == l.ConclusionPrompt || old.Text() == l.RepairPrompt) {
 			continue
 		}
 		retained = append(retained, old)
+	}
+	// Runtime instructions must remain after the retained old responses. An
+	// assistant tail would otherwise become a provider prefill of the invalid
+	// or truncated answer that the next turn is supposed to replace.
+	if l.ConclusionPrompt != "" {
+		retained = append(retained, Text("user", l.ConclusionPrompt))
+	}
+	if l.RepairPrompt != "" {
+		retained = append(retained, Text("user", l.RepairPrompt))
 	}
 	l.History = retained
 	l.emit(Event{Type: "context_compacted"})

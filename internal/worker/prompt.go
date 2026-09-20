@@ -34,6 +34,17 @@ func Prompt(j Job, conclude bool, runDir string) (string, error) {
 		}
 		context = "Read the complete task graph from " + path + ". Long evidence belongs in files; cite its path in the result. Distinguish confirmed findings from hypotheses.\n"
 	}
+	body, err := taskTemplate(j, conclude)
+	if err != nil {
+		return "", err
+	}
+	if j.Kind == "explore" || conclude {
+		return context + body + intentContext(j), nil
+	}
+	return context + body, nil
+}
+
+func taskTemplate(j Job, conclude bool) (string, error) {
 	name := j.Kind
 	if conclude {
 		name += "_conclude"
@@ -46,10 +57,7 @@ func Prompt(j Job, conclude bool, runDir string) (string, error) {
 	if err = t.Execute(&body, j.Budget); err != nil {
 		return "", err
 	}
-	if j.Kind == "explore" || conclude {
-		return context + body.String() + intentContext(j), nil
-	}
-	return context + body.String(), nil
+	return body.String(), nil
 }
 func intentContext(j Job) string {
 	if j.Intent == nil {

@@ -22,18 +22,21 @@ import (
 const System = "Work toward the assigned task using available tools. Distinguish confirmed facts from guesses. Follow the task's result contract."
 const DefaultBaseURL = "https://opencode.ai/zen/go"
 const DefaultModel = "deepseek-v4.1-flash"
+const DefaultReasoningEffort = "max"
+const DefaultMaxTokens = 32768
 
 type Anthropic struct {
-	BaseURL     string
-	Token       string
-	Model       string
-	MaxTokens   int
-	Timeout     time.Duration
-	Client      *http.Client
-	SessionID   string
-	sessionOnce sync.Once
-	sessionID   string
-	sessionErr  error
+	BaseURL         string
+	Token           string
+	Model           string
+	MaxTokens       int
+	ReasoningEffort string
+	Timeout         time.Duration
+	Client          *http.Client
+	SessionID       string
+	sessionOnce     sync.Once
+	sessionID       string
+	sessionErr      error
 }
 type HTTPError struct{ Status int }
 
@@ -81,7 +84,16 @@ func (p *Anthropic) Generate(ctx context.Context, messages []agent.Message, tool
 	}
 	limit := p.MaxTokens
 	if limit <= 0 {
-		limit = 8192
+		limit = DefaultMaxTokens
+	}
+	effort := p.ReasoningEffort
+	if effort == "" {
+		effort = DefaultReasoningEffort
+	}
+	switch effort {
+	case "low", "high", "max":
+	default:
+		return agent.Message{}, errors.New("reasoning effort must be low, high, or max")
 	}
 	timeout := p.Timeout
 	if timeout <= 0 {
@@ -96,7 +108,18 @@ func (p *Anthropic) Generate(ctx context.Context, messages []agent.Message, tool
 		Messages  []wireMessage      `json:"messages"`
 		Tools     []agent.Definition `json:"tools,omitempty"`
 		Stream    bool               `json:"stream"`
-	}{model, limit, System, wire, tools, true}
+		Thinking  struct {
+			Type string `json:"type"`
+		} `json:"thinking"`
+		OutputConfig struct {
+			Effort string `json:"effort"`
+		} `json:"output_config"`
+	}{Model: model, MaxTokens: limit, System: System, Messages: wire, Tools: tools, Stream: true}
+	// DeepSeek's Anthropic format uses output_config.effort for reasoning
+	// strength; budget_tokens is ignored. A returned thinking:"" block is
+	// transcript data and is unrelated to these request controls.
+	payload.Thinking.Type = "enabled"
+	payload.OutputConfig.Effort = effort
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return agent.Message{}, err

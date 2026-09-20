@@ -60,7 +60,8 @@ func TestConclusionRejectsReadWithoutOpeningFIFO(t *testing.T) {
 			v.Content[0].Input = json.RawMessage(`{"path":"pipe"}`)
 			return v, nil
 		}
-		if !m[len(m)-1].Content[0].IsError || !strings.Contains(string(m[len(m)-1].Content[0].Content), "all tools are disabled") {
+		results := lastToolResults(m)
+		if len(results) != 1 || !results[0].IsError || !strings.Contains(string(results[0].Content), "all tools are disabled") {
 			t.Fatal("conclusion tried to read a FIFO instead of refusing the tool")
 		}
 		return agent.Text("assistant", declined), nil
@@ -130,7 +131,8 @@ func TestInvalidOutputRequestsConclusionAndBlocksNewExploration(t *testing.T) {
 		case 2:
 			return toolCall("bash"), nil
 		default:
-			if !m[len(m)-1].Content[0].IsError {
+			results := lastToolResults(m)
+			if len(results) != 1 || !results[0].IsError {
 				t.Fatal("late exploration not rejected")
 			}
 			return agent.Text("assistant", declined), nil

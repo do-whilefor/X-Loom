@@ -89,6 +89,7 @@ func (c *Client) ensure(ctx context.Context, id string) (string, error) {
 	defer unlock()
 	name := c.name(id)
 	var info struct {
+		Image  string `json:"Image"`
 		Config struct {
 			Labels map[string]string `json:"Labels"`
 		} `json:"Config"`
@@ -100,10 +101,26 @@ func (c *Client) ensure(ctx context.Context, id string) (string, error) {
 	if err == nil && (info.Config.Labels["xloom.namespace"] != c.Config.Namespace || info.Config.Labels["xloom.project"] != id) {
 		return "", errors.New("container name belongs to a different project or dispatcher namespace")
 	}
-	if status(err, 404) {
-		input := map[string]any{"Image": c.Config.Image, "Entrypoint": []string{"/bin/sh", "-c"}, "Cmd": []string{"exec sleep infinity"}, "WorkingDir": "/workspace", "Labels": map[string]string{"xloom.namespace": c.Config.Namespace, "xloom.project": id}, "HostConfig": map[string]any{"NetworkMode": c.Config.Network, "CapAdd": c.Config.CapAdd, "Init": true}}
+	missing := status(err, 404)
+	if err != nil && !missing {
+		return "", err
+	}
+	// A mutable tag may now name a different binary or runtime. Resolve it on
+	// every launch and compare immutable IDs before touching a saved workspace.
+	var desired struct {
+		ID string `json:"Id"`
+	}
+	if err = c.json(ctx, "GET", "/images/"+url.PathEscape(c.Config.Image)+"/json", nil, &desired); err != nil {
+		return "", fmt.Errorf("resolve configured worker image %q locally: %w", c.Config.Image, err)
+	}
+	if desired.ID == "" {
+		return "", errors.New("Docker returned an empty ID for the configured worker image")
+	}
+	if missing {
+		input := map[string]any{"Image": desired.ID, "Entrypoint": []string{"/bin/sh", "-c"}, "Cmd": []string{"exec sleep infinity"}, "WorkingDir": "/workspace", "Labels": map[string]string{"xloom.namespace": c.Config.Namespace, "xloom.project": id}, "HostConfig": map[string]any{"NetworkMode": c.Config.Network, "CapAdd": c.Config.CapAdd, "Init": true}}
 		err = c.json(ctx, "POST", "/containers/create?name="+url.QueryEscape(name), input, nil)
 		if status(err, 409) {
+			missing = false
 			err = c.json(ctx, "GET", "/containers/"+url.PathEscape(name)+"/json", nil, &info)
 			if err == nil && (info.Config.Labels["xloom.namespace"] != c.Config.Namespace || info.Config.Labels["xloom.project"] != id) {
 				return "", errors.New("container creation raced with a different project or dispatcher namespace")
@@ -112,6 +129,9 @@ func (c *Client) ensure(ctx context.Context, id string) (string, error) {
 	}
 	if err != nil {
 		return "", err
+	}
+	if !missing && info.Image != desired.ID {
+		return "", fmt.Errorf("project %s container uses image %q but configured worker image %q resolves to %q; preserve and migrate its workspace before recreating the container", id, info.Image, c.Config.Image, desired.ID)
 	}
 	if !info.State.Running {
 		err = c.json(ctx, "POST", "/containers/"+url.PathEscape(name)+"/start", nil, nil)

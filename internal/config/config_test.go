@@ -65,3 +65,23 @@ func TestLoadRejectsUnknownFieldsAndMultipleDocuments(t *testing.T) {
 		}
 	}
 }
+
+func TestExampleConfiguration(t *testing.T) {
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "example-test-token")
+	c, err := Load(filepath.Join("..", "..", "dispatch.example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Runtime.MaxWorkers != 16 || c.Runtime.MaxProjectWorkers != 4 || c.Runtime.MaxProjects != 4 {
+		t.Fatalf("example concurrency limits: %+v", c.Runtime)
+	}
+	if len(c.Workers) != 1 || c.Workers[0].MaxRunning != 16 {
+		t.Fatalf("default backend cannot use the configured global capacity: %+v", c.Workers)
+	}
+	if c.Container.Image != "xloom-worker:dev" {
+		t.Fatalf("worker image = %q", c.Container.Image)
+	}
+	if c.Workers[0].Env["XLOOM_REASONING_EFFORT"] != "max" || c.Workers[0].Env["XLOOM_MAX_OUTPUT_TOKENS"] != "32768" {
+		t.Fatal("example is missing maximum reasoning or its output budget")
+	}
+}

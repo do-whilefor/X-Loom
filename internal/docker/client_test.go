@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -59,6 +60,8 @@ func TestRunArchivesJobAndDemultiplexesOutput(t *testing.T) {
 	var created, started, archived bool
 	c := mockClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
+		case "GET /images/xloom-test/json":
+			io.WriteString(w, `{"Id":"sha256:configured-image"}`)
 		case "GET /containers/test-dispatch-p/json":
 			w.WriteHeader(404)
 		case "POST /containers/create":
@@ -68,7 +71,7 @@ func TestRunArchivesJobAndDemultiplexesOutput(t *testing.T) {
 				Labels            map[string]string
 			}
 			_ = json.NewDecoder(r.Body).Decode(&request)
-			if request.Image != "xloom-test" || request.WorkingDir != "/workspace" || request.Labels["xloom.project"] != "p" {
+			if request.Image != "sha256:configured-image" || request.WorkingDir != "/workspace" || request.Labels["xloom.project"] != "p" {
 				t.Errorf("bad create request: %+v", request)
 			}
 			w.WriteHeader(201)
@@ -136,12 +139,14 @@ func TestConcurrentEnsureCreatesOneContainer(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		switch {
+		case r.URL.Path == "/images/xloom-test/json":
+			io.WriteString(w, `{"Id":"sha256:configured-image"}`)
 		case r.Method == "GET":
 			if !created {
 				w.WriteHeader(404)
 				return
 			}
-			io.WriteString(w, `{"State":{"Running":true},"Config":{"Labels":{"xloom.namespace":"test","xloom.project":"p"}}}`)
+			io.WriteString(w, `{"Image":"sha256:configured-image","State":{"Running":true},"Config":{"Labels":{"xloom.namespace":"test","xloom.project":"p"}}}`)
 		case strings.HasSuffix(r.URL.Path, "/create"):
 			if created {
 				t.Error("created twice")
@@ -354,6 +359,10 @@ func TestCancelUsesOnlyTheRequestedExecutionHelper(t *testing.T) {
 func TestEnsureRechecksOwnershipAfterCreateConflict(t *testing.T) {
 	gets := 0
 	c := mockClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/images/xloom-test/json" {
+			io.WriteString(w, `{"Id":"sha256:configured-image"}`)
+			return
+		}
 		if r.Method == "GET" {
 			gets++
 			if gets == 1 {
@@ -371,5 +380,112 @@ func TestEnsureRechecksOwnershipAfterCreateConflict(t *testing.T) {
 	})
 	if _, err := c.ensure(context.Background(), "p"); err == nil {
 		t.Fatal("accepted conflict without ownership verification")
+	}
+}
+
+func TestRunRejectsSavedContainerFromPreviousImage(t *testing.T) {
+	for _, running := range []bool{false, true} {
+		t.Run(fmt.Sprintf("running=%t", running), func(t *testing.T) {
+			c := mockClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != "GET" {
+					t.Errorf("image mismatch caused a mutation: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(500)
+					return
+				}
+				switch r.URL.Path {
+				case "/containers/test-dispatch-p/json":
+					// Config.Image deliberately remains the same after a :dev rebuild.
+					fmt.Fprintf(w, `{"Image":"sha256:old","State":{"Running":%t},"Config":{"Image":"xloom-test","Labels":{"xloom.namespace":"test","xloom.project":"p"}}}`, running)
+				case "/images/xloom-test/json":
+					io.WriteString(w, `{"Id":"sha256:new"}`)
+				default:
+					t.Errorf("unexpected image mismatch request: %s", r.URL.Path)
+					w.WriteHeader(500)
+				}
+			})
+			_, err := c.Run(context.Background(), config.Worker{}, worker.Job{RunID: "new-run", Graph: board.Graph{Project: board.Project{ID: "p"}}})
+			if err == nil || !strings.Contains(err.Error(), "sha256:old") || !strings.Contains(err.Error(), "sha256:new") || !strings.Contains(err.Error(), "migrate") {
+				t.Fatalf("expected actionable image mismatch: %v", err)
+			}
+		})
+	}
+}
+
+func TestEnsureAllowsDifferentReferencesToSameImage(t *testing.T) {
+	for _, running := range []bool{false, true} {
+		t.Run(fmt.Sprintf("running=%t", running), func(t *testing.T) {
+			starts := 0
+			c := mockClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method + " " + r.URL.Path {
+				case "GET /containers/test-dispatch-p/json":
+					fmt.Fprintf(w, `{"Image":"sha256:same","State":{"Running":%t},"Config":{"Image":"previous-alias","Labels":{"xloom.namespace":"test","xloom.project":"p"}}}`, running)
+				case "GET /images/xloom-test/json":
+					io.WriteString(w, `{"Id":"sha256:same"}`)
+				case "POST /containers/test-dispatch-p/start":
+					starts++
+					w.WriteHeader(204)
+				default:
+					t.Errorf("unexpected compatible container request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(500)
+				}
+			})
+			if _, err := c.ensure(context.Background(), "p"); err != nil {
+				t.Fatal(err)
+			}
+			if running && starts != 0 || !running && starts != 1 {
+				t.Fatalf("running=%t starts=%d", running, starts)
+			}
+		})
+	}
+}
+
+func TestEnsureRequiresLocallyResolvedImage(t *testing.T) {
+	for _, code := range []int{200, 404, 500} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			c := mockClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != "GET" {
+					t.Errorf("unresolved image caused a mutation: %s %s", r.Method, r.URL.Path)
+					return
+				}
+				if r.URL.Path == "/images/xloom-test/json" {
+					w.WriteHeader(code)
+					io.WriteString(w, `{}`)
+					return
+				}
+				io.WriteString(w, `{"Image":"sha256:old","State":{"Running":false},"Config":{"Labels":{"xloom.namespace":"test","xloom.project":"p"}}}`)
+			})
+			if _, err := c.ensure(context.Background(), "p"); err == nil || !strings.Contains(err.Error(), "configured worker image") {
+				t.Fatalf("expected a configured-image error: %v", err)
+			}
+		})
+	}
+}
+
+func TestEnsureRechecksImageAfterCreateConflict(t *testing.T) {
+	gets := 0
+	c := mockClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /images/xloom-test/json":
+			io.WriteString(w, `{"Id":"sha256:new"}`)
+		case "GET /containers/test-dispatch-p/json":
+			gets++
+			if gets == 1 {
+				w.WriteHeader(404)
+			} else {
+				io.WriteString(w, `{"Image":"sha256:old","Config":{"Labels":{"xloom.namespace":"test","xloom.project":"p"}}}`)
+			}
+		case "POST /containers/create":
+			var input struct{ Image string }
+			if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input.Image != "sha256:new" {
+				t.Errorf("create must pin the resolved image: %+v %v", input, err)
+			}
+			w.WriteHeader(409)
+		default:
+			t.Errorf("image conflict caused an unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(500)
+		}
+	})
+	if _, err := c.ensure(context.Background(), "p"); err == nil || !strings.Contains(err.Error(), "migrate") {
+		t.Fatalf("expected conflicting image rejection: %v", err)
 	}
 }

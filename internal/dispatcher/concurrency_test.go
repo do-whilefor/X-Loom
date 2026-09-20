@@ -133,6 +133,109 @@ func TestAllConcurrencyLimits(t *testing.T) {
 	}
 }
 
+func TestGlobalSixteenProjectFourAndBackendLimits(t *testing.T) {
+	// Keep the Runner blocked until explicitly finishing one task. The real HTTP
+	// API and SQLite leases then expose whether dispatch oversubscribes any cap.
+	finish := make(chan struct{})
+	r := &controlledRunner{run: func(ctx context.Context, _ config.Worker, _ worker.Job) (worker.Result, error) {
+		select {
+		case <-finish:
+			return worker.Result{Status: "success", Text: `{"description":"confirmed evidence"}`}, nil
+		case <-ctx.Done():
+			return worker.Result{}, ctx.Err()
+		}
+	}}
+	s, ctx := scenario(t, r)
+	s.Config.Runtime.MaxWorkers = 16
+	s.Config.Runtime.MaxProjectWorkers = 4
+	s.Config.Runtime.MaxProjects = 4
+	// New normally sizes this channel from the final config. This fixture updates
+	// config after construction, so its channel needs the same production size.
+	s.done = make(chan finished, s.Config.Runtime.MaxWorkers)
+	s.Config.Workers = []config.Worker{
+		{Name: "limited", Type: "mock", TaskTypes: []string{"explore", "reason"}, MaxRunning: 3, Priority: 0},
+		{Name: "second", Type: "mock", TaskTypes: []string{"explore", "reason"}, MaxRunning: 5, Priority: 1},
+		{Name: "remaining", Type: "mock", TaskTypes: []string{"explore", "reason"}, MaxRunning: 12, Priority: 2},
+	}
+	for p := 0; p < 5; p++ {
+		g := createProject(t, s, ctx, false)
+		for n := 0; n < 8; n++ {
+			createIntent(t, s, ctx, g.Project.ID, "independent direction")
+		}
+	}
+	assertSaturated := func() {
+		t.Helper()
+		if len(s.running) != 16 || len(s.admitted) != 4 {
+			t.Fatalf("running=%d admitted=%d; want 16 and 4", len(s.running), len(s.admitted))
+		}
+		byProject, byWorker := map[string]int{}, map[string]int{}
+		for _, task := range s.running {
+			byProject[task.Job.Graph.Project.ID]++
+			byWorker[task.Worker.Name]++
+		}
+		if len(byProject) != 4 {
+			t.Fatalf("running projects = %v", byProject)
+		}
+		for id, n := range byProject {
+			if n != 4 {
+				t.Fatalf("project %s running=%d; want 4", id, n)
+			}
+			g, err := s.Client.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claimed := 0
+			for _, intent := range g.Intents {
+				if intent.To == nil && intent.Worker != nil {
+					claimed++
+				}
+			}
+			if g.Project.Reason != nil {
+				claimed++
+			}
+			if claimed != 4 {
+				t.Fatalf("project %s has %d real leases; want 4", id, claimed)
+			}
+		}
+		if byWorker["limited"] != 3 || byWorker["second"] != 5 || byWorker["remaining"] != 8 {
+			t.Fatalf("backend quotas not respected across projects: %v", byWorker)
+		}
+	}
+	if err := s.Step(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertSaturated()
+	for n := 0; n < 3; n++ {
+		if err := s.Step(ctx); err != nil {
+			t.Fatal(err)
+		}
+		assertSaturated()
+	}
+	select {
+	case finish <- struct{}{}:
+	case <-time.After(4 * time.Second):
+		t.Fatal("no running task accepted completion")
+	}
+	var f finished
+	select {
+	case f = <-s.done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("completed task did not release its lease")
+	}
+	if f.Outcome != "success" {
+		t.Fatalf("task completion: %s %v", f.Outcome, f.Err)
+	}
+	// Let Step consume the genuine completion and use the newly available slot.
+	s.done <- f
+	if err := s.Step(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := s.running[f.Task.Job.RunID]; exists {
+		t.Fatal("finished execution still occupies a slot")
+	}
+	assertSaturated()
+}
+
 func TestReasonCanOverlapExploreButNotAnotherReason(t *testing.T) {
 	s, ctx := scenario(t, &controlledRunner{})
 	g := createProject(t, s, ctx, false)
