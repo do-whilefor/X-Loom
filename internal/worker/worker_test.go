@@ -33,10 +33,8 @@ func TestExpiredExplorationBudgetConcludesBeforeResumedRequest(t *testing.T) {
 		if !strings.Contains(m[len(m)-1].Text(), "Stop exploration") {
 			t.Fatal("resumed without conclusion")
 		}
-		for _, def := range d {
-			if def.Name == "bash" || def.Name == "write" || def.Name == "edit" {
-				t.Fatal("resumed exploration after budget expired")
-			}
+		if d != nil {
+			t.Fatal("resumed conclusion exposed tools", d)
 		}
 		return agent.Text("assistant", declined), nil
 	})})
@@ -45,7 +43,7 @@ func TestExpiredExplorationBudgetConcludesBeforeResumedRequest(t *testing.T) {
 	}
 }
 
-func TestConclusionReadFIFOReportsErrorWithoutHanging(t *testing.T) {
+func TestConclusionRejectsReadWithoutOpeningFIFO(t *testing.T) {
 	j := job(t, "explore")
 	runDir := t.TempDir()
 	if err := syscall.Mkfifo(filepath.Join(j.Workspace, "pipe"), 0600); err != nil {
@@ -62,8 +60,8 @@ func TestConclusionReadFIFOReportsErrorWithoutHanging(t *testing.T) {
 			v.Content[0].Input = json.RawMessage(`{"path":"pipe"}`)
 			return v, nil
 		}
-		if !m[len(m)-1].Content[0].IsError {
-			t.Fatal("FIFO read did not fail")
+		if !m[len(m)-1].Content[0].IsError || !strings.Contains(string(m[len(m)-1].Content[0].Content), "all tools are disabled") {
+			t.Fatal("conclusion tried to read a FIFO instead of refusing the tool")
 		}
 		return agent.Text("assistant", declined), nil
 	})})
@@ -101,8 +99,8 @@ func TestBudgetConcludesAtSettledBoundaryInSameSession(t *testing.T) {
 		if end, ok := ctx.Deadline(); !ok || time.Until(end) > time.Second {
 			t.Fatal("missing independent conclusion deadline")
 		}
-		if len(defs) != 1 || defs[0].Name != "read" {
-			t.Fatal("exploration tools remained exposed", defs)
+		if defs != nil {
+			t.Fatal("conclusion exposed tools", defs)
 		}
 		return agent.Text("assistant", conclusion), nil
 	})

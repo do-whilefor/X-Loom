@@ -60,7 +60,7 @@ type Definition struct {
 type Tool struct {
 	Definition
 	Parallel bool
-	Conclude bool
+	Conclude bool // Legacy tool hint; Loop.Concluding disables every tool.
 	Execute  func(context.Context, json.RawMessage) (string, error)
 }
 type Event struct {

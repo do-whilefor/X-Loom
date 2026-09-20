@@ -5,6 +5,9 @@ AGENTS.md
 .env.*
 !.env.example
 .cache
+.xloom
+dispatch.yaml
+__pycache__
 build
 bin
 dist

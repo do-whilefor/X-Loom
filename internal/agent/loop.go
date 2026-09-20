@@ -95,9 +95,9 @@ func (l *Loop) Run(ctx context.Context, prompt string) (string, error) {
 			if err := l.compact(ctx); err != nil {
 				return last, err
 			}
-			defs := []Definition{}
+			var defs []Definition
 			for _, t := range l.Tools {
-				if !l.Concluding || t.Conclude {
+				if !l.Concluding {
 					defs = append(defs, t.Definition)
 				}
 			}
@@ -206,10 +206,10 @@ func (l *Loop) execute(ctx context.Context, calls []Block, truncated bool) []Blo
 			err = errors.New("response was truncated; reissue this tool call with complete arguments")
 		case ctx.Err() != nil:
 			err = ctx.Err()
+		case l.Concluding:
+			err = errors.New("all tools are disabled during conclusion; use the supplied snapshot and session evidence")
 		case t == nil:
 			err = fmt.Errorf("unknown tool %q", c.Name)
-		case l.Concluding && !t.Conclude:
-			err = errors.New("exploration is disabled during conclusion; summarize existing evidence")
 		default:
 			if err = ValidateArguments(t.Schema, c.Input); err == nil {
 				text, err = invoke(ctx, t, c.Input)

@@ -30,15 +30,17 @@ type Options struct {
 	ContextBytes int
 }
 type session struct {
-	RunID             string          `json:"run_id"`
-	Kind              string          `json:"kind"`
-	StartedAt         time.Time       `json:"started_at"`
-	ConcludeStartedAt time.Time       `json:"conclude_started_at,omitempty"`
-	Concluding        bool            `json:"concluding"`
-	History           []agent.Message `json:"history"`
-	Result            *Result         `json:"result,omitempty"`
-	TaskPrompt        string          `json:"task_prompt,omitempty"`
-	ConclusionPrompt  string          `json:"conclusion_prompt,omitempty"`
+	RunID                  string          `json:"run_id"`
+	Kind                   string          `json:"kind"`
+	StartedAt              time.Time       `json:"started_at"`
+	ConcludeStartedAt      time.Time       `json:"conclude_started_at,omitempty"`
+	ConcludeDeadline       time.Time       `json:"conclude_deadline,omitempty"`
+	Concluding             bool            `json:"concluding"`
+	History                []agent.Message `json:"history"`
+	Result                 *Result         `json:"result,omitempty"`
+	TaskPrompt             string          `json:"task_prompt,omitempty"`
+	ConclusionPrompt       string          `json:"conclusion_prompt,omitempty"`
+	ConclusionInputVersion int             `json:"conclusion_input_version,omitempty"`
 }
 
 func Execute(ctx context.Context, jobPath string, output io.Writer) error {
@@ -229,27 +231,60 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	var endCancel context.CancelFunc = func() {}
 	defer func() { endCancel() }()
 	runCtx := ctx
+	prompt := ""
 	startConclusion := func() (context.Context, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		wasConcluding := state.Concluding
 		state.Concluding = true
 		l.Concluding = true
 		if state.ConcludeStartedAt.IsZero() {
+			if wasConcluding {
+				return nil, errors.New("saved conclusion has no start time; cannot refresh its deadline")
+			}
 			state.ConcludeStartedAt = o.Now()
 		}
-		remaining := time.Duration(j.Budget.ConcludeTimeout)*time.Second - o.Now().Sub(state.ConcludeStartedAt)
+		if state.ConcludeDeadline.IsZero() {
+			// Older sessions only persisted the start time; use their original
+			// job budget once. New sessions retain an absolute deadline.
+			state.ConcludeDeadline = state.ConcludeStartedAt.Add(time.Duration(j.Budget.ConcludeTimeout) * time.Second)
+		}
+		remaining := state.ConcludeDeadline.Sub(o.Now())
 		if remaining <= 0 {
 			return nil, context.DeadlineExceeded
 		}
 		next, cancel := context.WithTimeout(ctx, remaining)
 		endCancel = cancel
+		if !wasConcluding {
+			// Freeze the boundary before reading any artifact. A crash during
+			// preparation resumes conservatively without reading new outputs.
+			if err := save(l.History); err != nil {
+				return nil, err
+			}
+		}
+		if state.ConclusionInputVersion != conclusionInputVersion || l.ConclusionPrompt == "" {
+			input, err := conclusionInput(next, j, o.RunDir, !wasConcluding)
+			if err != nil {
+				return nil, err
+			}
+			l.ConclusionPrompt = input
+			state.ConclusionInputVersion = conclusionInputVersion
+			// Persist the frozen input before another model request. Recovery
+			// reuses it even if files have changed or disappeared since then.
+			if err = save(l.History); err != nil {
+				return nil, err
+			}
+		}
 		return next, nil
 	}
 	if state.Concluding {
 		runCtx, err = startConclusion()
 		if err != nil {
 			return finish(Result{Type: "result", Status: "failed", Conclude: true, Error: err.Error()})
+		}
+		if !containsInstruction(l.History, l.ConclusionPrompt) {
+			prompt = l.ConclusionPrompt
 		}
 	}
 	if j.Kind == "reason" && j.Budget.Timeout > 0 {
@@ -285,12 +320,10 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 			if err != nil {
 				return nil, "", err
 			}
-			prompt, err := Prompt(j, true, o.RunDir)
-			return next, prompt, err
+			return next, l.ConclusionPrompt, nil
 		}
 		return turnCtx, "", nil
 	}
-	prompt := ""
 	if len(l.History) == 0 {
 		if shouldConclude() {
 			runCtx, err = startConclusion()
@@ -298,11 +331,15 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 				return Result{}, err
 			}
 		}
-		prompt, err = Prompt(j, l.Concluding, o.RunDir)
+		if l.Concluding {
+			prompt = l.ConclusionPrompt
+		} else {
+			prompt, err = Prompt(j, false, o.RunDir)
+		}
 		if err != nil {
 			return Result{}, err
 		}
-	} else if last := l.History[len(l.History)-1]; last.Role == "assistant" {
+	} else if last := l.History[len(l.History)-1]; last.Role == "assistant" && prompt == "" {
 		calls := false
 		for _, b := range last.Content {
 			if b.Type == "tool_use" {
@@ -319,7 +356,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 			if j.Kind != "reason" && !l.Concluding {
 				runCtx, err = startConclusion()
 				if err == nil {
-					prompt, err = Prompt(j, true, o.RunDir)
+					prompt = l.ConclusionPrompt
 				}
 				if err != nil {
 					return Result{}, err
@@ -332,7 +369,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	if len(l.History) > 0 && shouldConclude() {
 		runCtx, err = startConclusion()
 		if err == nil {
-			prompt, err = Prompt(j, true, o.RunDir)
+			prompt = l.ConclusionPrompt
 		}
 		if err != nil {
 			return Result{}, err
