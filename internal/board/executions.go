@@ -14,7 +14,11 @@ const executionSchema = `CREATE TABLE IF NOT EXISTS xloom_executions(
  id TEXT NOT NULL,namespace TEXT NOT NULL,backend TEXT NOT NULL,kind TEXT NOT NULL,intent TEXT NOT NULL,
  lease TEXT NOT NULL,job BLOB NOT NULL,retry_key TEXT NOT NULL,status TEXT NOT NULL,result BLOB,
  resumes INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
- PRIMARY KEY(project_id,id));`
+ PRIMARY KEY(project_id,id));
+CREATE TABLE IF NOT EXISTS xloom_paused_executions(
+ project_id TEXT NOT NULL,execution_id TEXT NOT NULL,
+ PRIMARY KEY(project_id,execution_id),
+ FOREIGN KEY(project_id,execution_id) REFERENCES xloom_executions(project_id,id) ON DELETE CASCADE);`
 
 // Execution contains no backend environment or model credentials. Job is the
 // immutable input supplied to the Worker, not a newly loaded project snapshot.
@@ -83,6 +87,21 @@ func (t *Tx) RegisterExecution(e Execution) error {
 	}
 	if err = g.RequireActive(); err != nil {
 		return err
+	}
+	// A new lease can race a restart after the dispatcher read its input. Check
+	// the immutable job's round, even if that newly claimed lease is valid.
+	var round struct {
+		Graph struct {
+			Project struct {
+				Generation int64 `json:"generation"`
+			} `json:"project"`
+		} `json:"graph"`
+	}
+	if json.Unmarshal(e.Job, &round) != nil {
+		return Err(422, "invalid execution job")
+	}
+	if round.Graph.Project.Generation != g.Project.Generation {
+		return Err(409, "Execution input belongs to a previous project round")
 	}
 	if err = t.CheckExecution(g, e.Fence()); err != nil {
 		return err

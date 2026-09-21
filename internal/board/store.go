@@ -67,7 +67,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	defer migration.Rollback()
-	if _, err = migration.Exec(schema + stateSchema + executionSchema + projectMetadataSchema); err != nil {
+	if _, err = migration.Exec(schema + stateSchema + executionSchema + projectMetadataSchema + restartSchema); err != nil {
 		migration.Rollback()
 		db.Close()
 		return nil, err
@@ -216,7 +216,7 @@ func (t *Tx) IDs() ([]string, error) {
 func (t *Tx) Load(id string) (Graph, error) {
 	g := Graph{Facts: []Fact{}, Intents: []Intent{}, Hints: []Hint{}}
 	var rw, rt, rs, rh *string
-	err := t.QueryRow(`SELECT p.id,p.title,p.status,p.bootstrap_enabled,p.created_at,p.reason_worker,p.reason_trigger,p.reason_started_at,p.reason_last_heartbeat_at,COALESCE(m.scenario,'') FROM projects p LEFT JOIN xloom_project_metadata m ON m.project_id=p.id WHERE p.id=?`, id).Scan(&g.Project.ID, &g.Project.Title, &g.Project.Status, &g.Project.Bootstrap, &g.Project.CreatedAt, &rw, &rt, &rs, &rh, &g.Project.Scenario)
+	err := t.QueryRow(`SELECT p.id,p.title,p.status,p.bootstrap_enabled,p.created_at,p.reason_worker,p.reason_trigger,p.reason_started_at,p.reason_last_heartbeat_at,COALESCE(m.scenario,''),COALESCE(round.generation,0),COALESCE(round.restarted_at,'') FROM projects p LEFT JOIN xloom_project_metadata m ON m.project_id=p.id LEFT JOIN xloom_project_rounds round ON round.project_id=p.id WHERE p.id=?`, id).Scan(&g.Project.ID, &g.Project.Title, &g.Project.Status, &g.Project.Bootstrap, &g.Project.CreatedAt, &rw, &rt, &rs, &rh, &g.Project.Scenario, &g.Project.Generation, &g.Project.RestartedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return g, Err(404, "Project not found")
 	}

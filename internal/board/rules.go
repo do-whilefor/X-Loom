@@ -75,6 +75,9 @@ func (t *Tx) SetStatus(g *Graph, status string) error {
 		return nil
 	}
 	if status == "stopped" {
+		if err := t.markPausedExecutions(*g); err != nil {
+			return err
+		}
 		if err := t.RevokeRuns(g.Project.ID); err != nil {
 			return err
 		}
@@ -84,6 +87,8 @@ func (t *Tx) SetStatus(g *Graph, status string) error {
 				g.Intents[n].Worker = nil
 			}
 		}
+	} else if err := t.continuePausedExecutions(*g); err != nil {
+		return err
 	}
 	g.Project.Status = status
 	return nil

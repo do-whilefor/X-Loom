@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
 const data = require('../static/data.js');
 
 function fixture() {
@@ -262,4 +263,195 @@ test('legacy graph alone still yields input, intents and fact logs', () => {
   assert(logs.some(log => log.node?.type === 'step' && log.node.id === 's1'));
   assert(logs.some(log => log.node?.type === 'fact' && log.node.id === 'f1'));
   assert(!logs.some(log => log.kind === 'model'));
+});
+
+test('timestamps always show Shanghai year month day and full time without fabricating missing dates', () => {
+  assert.equal(data.formatTime('2026-09-21T01:02:03Z'),'2026-09-21 09:02:03');
+  assert.equal(data.formatTime('2026-09-21T01:02:03Z',{date:true}),'2026-09-21 09:02:03');
+  assert.equal(data.formatTime('2026-09-20T16:00:00Z'),'2026-09-21 00:00:00');
+  for (const missing of [null,undefined,'','invalid','09:42:01',{}]) assert.equal(data.formatTime(missing),'未记录时间');
+  const script = 'const data=require(' + JSON.stringify(require.resolve('../static/data.js')) + ');process.stdout.write(data.formatTime("2026-09-20T16:00:00Z"));';
+  for (const timezone of ['UTC','America/Los_Angeles']) {
+    assert.equal(execFileSync(process.execPath,['-e',script],{env:{...process.env,TZ:timezone},encoding:'utf8'}),'2026-09-21 00:00:00');
+  }
+});
+
+test('status phase and node display names are Chinese while log phase enums stay compatible', () => {
+  assert.equal(data.statusName('active'),'进行中');
+  assert.equal(data.statusName('running'),'进行中');
+  assert.equal(data.statusName('stopped'),'已暂停');
+  assert.deepEqual(['Bootstrap','Decide','Execute','Model','System'].map(data.phaseName),['启动引导','决策','执行','模型结论','系统']);
+  assert.deepEqual(['start','step','fact','finding','goal'].map(data.nodeTypeName),['起点','任务','事实','发现','目标']);
+  assert.equal(data.phaseName('unknown'),'unknown');
+  assert.equal(data.nodeTypeName('custom'),'custom');
+  assert(data.buildLogs(fixture()).some(log => log.phase === 'Decide'));
+});
+
+test('task progress counts actual steps rather than deduplicating shared worker configurations', () => {
+  const state = fixture();
+  state.steps = [
+    {id:'a',status:'running',worker:'general'},
+    {id:'b',status:'running',worker:'general'},
+    {id:'c',status:'completed',worker:'general'},
+    {id:'d',status:'failed'},
+    {id:'e',status:'abandoned'},
+    {id:'f',status:'open'}
+  ];
+  const snapshot = structuredClone(state);
+  assert.deepEqual(data.taskProgress(state),{completed:1,total:6,running:2});
+  assert.deepEqual(state,snapshot);
+  state.graph.project.status = 'stopped';
+  assert.deepEqual(data.taskProgress(state),{completed:1,total:6,running:0});
+  state.graph.project.status = 'completed';
+  assert.equal(data.taskProgress(state).running,0);
+});
+
+test('task progress supports legacy graph intents but does not count abandoned or concluded leases as running', () => {
+  const state = {graph:{project:{status:'active'},intents:[
+    {id:'a',worker:'shared'}, {id:'b',worker:'shared'}, {id:'c',worker:'shared',to:'result'},
+    {id:'d',worker:'shared',concluded_at:'2026-09-21T01:00:00Z'}, {id:'e'}, {id:'e'}, null
+  ]}};
+  assert.deepEqual(data.taskProgress(state),{completed:1,total:5,running:2});
+  assert.deepEqual(data.taskProgress({...state,steps:[]}),{completed:1,total:5,running:2});
+  assert.deepEqual(data.taskProgress({}),{completed:0,total:0,running:0});
+  assert.deepEqual(data.taskProgress(null),{completed:0,total:0,running:0});
+});
+
+test('project timing takes the earliest actual execution or explicit start time and never project creation', () => {
+  const state = fixture();
+  state.graph.project.reason = {started_at:'2026-09-21T01:03:00Z'};
+  state.graph.intents.push({id:'queued',created_at:'2026-09-21T00:00:00Z'});
+  const executions = [
+    {id:'a',project_id:'project-a',status:'running',created_at:'2026-09-21T01:02:00Z'},
+    {id:'b',project_id:'other',status:'succeeded',created_at:'2025-01-01T00:00:00Z'},
+    {id:'c',project_id:'project-a',status:'prepared',created_at:'2026-09-21T00:30:00Z'}
+  ];
+  const snapshot = structuredClone({state,executions});
+  assert.deepEqual(data.projectTiming(state,executions),{startedAt:'2026-09-21T01:02:00.000Z',endedAt:null});
+  assert.deepEqual({state,executions},snapshot);
+  state.graph.intents[0].started_at = '2026-09-21T01:01:30Z';
+  assert.equal(data.projectTiming(state,executions).startedAt,'2026-09-21T01:01:30.000Z');
+});
+
+test('legacy creation heartbeat and conclusion records do not invent a missing execution start', () => {
+  const state = fixture();
+  state.graph.intents[0].last_heartbeat_at = '2026-09-21T01:01:30Z';
+  assert.deepEqual(data.projectTiming(state),{startedAt:null,endedAt:null});
+  assert.deepEqual(data.projectTiming(state,[{id:'queued',status:'prepared',created_at:'2026-09-21T01:01:00Z'}]),{startedAt:null,endedAt:null});
+  assert.deepEqual(data.projectTiming(null),{startedAt:null,endedAt:null});
+});
+
+test('project end time requires completed root goal conclusion, never pause or last task end', () => {
+  const state = fixture();
+  const executions = [{id:'a',status:'succeeded',created_at:'2026-09-21T01:01:00Z'}];
+  state.graph.intents.push({id:'completion',to:'goal',concluded_at:'2026-09-21T01:05:00Z'});
+  state.graph.project.status = 'stopped';
+  assert.equal(data.projectTiming(state,executions).endedAt,null);
+  state.graph.project.status = 'completed';
+  assert.equal(data.projectTiming(state,executions).endedAt,null,'open root goal cannot imply completion');
+  state.goals[0].status = 'achieved';
+  assert.deepEqual(data.projectTiming(state,executions),{startedAt:'2026-09-21T01:01:00.000Z',endedAt:'2026-09-21T01:05:00.000Z'});
+  assert.deepEqual(data.projectTiming(state),{startedAt:null,endedAt:'2026-09-21T01:05:00.000Z'},'missing start stays unknown even with a recorded end');
+  state.graph.intents.pop();
+  assert.equal(data.projectTiming(state,executions).endedAt,null,'a task conclusion is not a project conclusion');
+});
+
+test('restart timing excludes old generations and earlier records without treating restart as execution', () => {
+  const state = fixture();
+  Object.assign(state.graph.project,{generation:2,restarted_at:'2026-09-21T02:00:00Z',reason:{started_at:'2026-09-21T01:10:00Z'}});
+  const executions = [
+    {id:'old',status:'succeeded',generation:1,created_at:'2026-09-21T01:01:00Z'},
+    {id:'late-old',status:'running',generation:1,created_at:'2026-09-21T02:01:00Z'},
+    {id:'queued',status:'prepared',generation:2,created_at:'2026-09-21T02:00:01Z'}
+  ];
+  assert.deepEqual(data.projectTiming(state,executions),{startedAt:null,endedAt:null});
+  executions.push({id:'new',status:'running',generation:2,created_at:'2026-09-21T02:01:00Z'});
+  assert.equal(data.projectTiming(state,executions).startedAt,'2026-09-21T02:01:00.000Z');
+  state.graph.project.status = 'completed';
+  state.goals[0].status = 'achieved';
+  state.graph.intents.push({id:'old-end',to:'goal',concluded_at:'2026-09-21T01:30:00Z'});
+  assert.equal(data.projectTiming(state,executions).endedAt,null);
+  state.graph.intents.push({id:'new-end',to:'goal',concluded_at:'2026-09-21T02:05:00Z'});
+  assert.equal(data.projectTiming(state,executions).endedAt,'2026-09-21T02:05:00.000Z');
+});
+
+test('invalid timing candidates and end-before-start records remain unknown', () => {
+  const state = fixture();
+  state.graph.project.reason = {started_at:'invalid'};
+  state.graph.project.status = 'completed';
+  state.goals[0].status = 'achieved';
+  state.graph.intents.push(null,{id:'end',to:'goal',concluded_at:'2026-09-21T01:00:00Z'});
+  assert.deepEqual(data.projectTiming(state,[null,{status:'running',created_at:'invalid'},{status:'running',created_at:'2026-09-21T01:01:00Z'}]),{
+    startedAt:'2026-09-21T01:01:00.000Z',endedAt:null
+  });
+});
+
+test('late execution responses cannot show a previous round successful answer in the restarted project', () => {
+  const state = fixture();
+  Object.assign(state.graph.project,{generation:2,restarted_at:'2026-09-21T02:00:00Z'});
+  const result = {text:JSON.stringify({accepted:true,data:{description:'旧轮结果不应出现'}})};
+  const executions = [
+    {id:'old',project_id:'project-a',generation:1,kind:'explore',status:'succeeded',created_at:'2026-09-21T01:00:00Z',result},
+    {id:'old-late',project_id:'project-a',generation:1,kind:'explore',status:'succeeded',created_at:'2026-09-21T02:01:00Z',result},
+    {id:'legacy-old',project_id:'project-a',kind:'explore',status:'succeeded',created_at:'2026-09-21T01:00:00Z',result},
+    {id:'legacy-unknown',project_id:'project-a',kind:'explore',status:'succeeded',result},
+    {id:'current',project_id:'project-a',generation:2,kind:'explore',status:'succeeded',created_at:'2026-09-21T02:01:00Z',
+      result:{text:JSON.stringify({accepted:true,data:{description:'本轮执行结果'}})}}
+  ];
+  const snapshot = structuredClone({state,executions});
+  const logs = data.buildLogs(state,[],executions).filter(log => log.source === 'execution');
+  assert.deepEqual(logs.map(log => log.id),['execution:current','execution:current:conclusion:0']);
+  assert.equal(logs[1].body,'本轮执行结果');
+  assert.doesNotMatch(JSON.stringify(logs),/旧轮结果不应出现/);
+  assert.deepEqual({state,executions},snapshot);
+});
+
+test('initial generation defaults to zero while legacy current-round execution summaries remain readable', () => {
+  const state = fixture();
+  assert.equal(state.graph.project.generation,undefined);
+  const run = {id:'same-id',project_id:'project-a',kind:'explore',status:'running',created_at:'2026-09-21T01:01:00Z'};
+  assert.equal(data.buildLogs(state,[],[{...run,generation:1}]).some(log => log.source === 'execution'),false);
+  assert.equal(data.buildLogs(state,[],[{...run,generation:0}]).filter(log => log.source === 'execution').length,1);
+  assert.equal(data.buildLogs(state,[],[run]).filter(log => log.source === 'execution').length,1);
+  Object.assign(state.graph.project,{generation:1,restarted_at:'2026-09-21T01:00:30Z'});
+  assert.equal(data.buildLogs(state,[],[run]).filter(log => log.source === 'execution').length,1);
+});
+
+test('execution titles show Chinese phase names while preserving filter enums', () => {
+  const executions = ['reason','explore','bootstrap'].map((kind,index) => ({id:'phase-' + index,kind,status:'running'}));
+  const logs = data.buildLogs({},[],executions);
+  assert.deepEqual(logs.map(log => log.title),['决策 · 进行中','执行 · 进行中','启动引导 · 进行中']);
+  assert.deepEqual(logs.map(log => log.phase),['Decide','Execute','Bootstrap']);
+  assert.equal(data.filterLogs(logs,{phase:'Decide'}).length,1);
+});
+
+test('restart system log uses the actual persisted round timestamp without inventing execution results', () => {
+  const state = fixture();
+  Object.assign(state.graph.project,{generation:3,restarted_at:'2026-09-21T03:06:09Z'});
+  const original = structuredClone(state);
+  const logs = data.buildLogs(state);
+  const restart = logs.filter(log => log.title === '项目已重启');
+  assert.equal(restart.length,1);
+  assert.equal(restart[0].id,'project:project-a:restart:3');
+  assert.equal(restart[0].time,'2026-09-21T03:06:09Z');
+  assert.equal(data.formatTime(restart[0].time),'2026-09-21 11:06:09');
+  assert.equal(restart[0].phase,'System');
+  assert.equal(restart[0].source,'state');
+  assert.equal(restart[0].kind,undefined);
+  assert.match(restart[0].body,/清空本轮/);
+  assert.match(restart[0].body,/保留原始输入、目标和补充提示/);
+  assert.deepEqual(state,original);
+  assert.deepEqual(data.buildLogs(state),logs,'repeated projection must not substitute the current time');
+});
+
+test('missing invalid or initial-round restart metadata cannot fabricate a restart event', () => {
+  for (const metadata of [
+    {}, {generation:0,restarted_at:'2026-09-21T03:06:09Z'},
+    {generation:1}, {generation:1,restarted_at:null}, {generation:1,restarted_at:''},
+    {generation:1,restarted_at:'invalid'}, {generation:1,restarted_at:'11:06:09'}
+  ]) {
+    const state = fixture();
+    Object.assign(state.graph.project,metadata);
+    assert.equal(data.buildLogs(state).some(log => log.title === '项目已重启'),false);
+  }
 });

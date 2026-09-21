@@ -191,10 +191,15 @@ func TestStoppedPendingExecutionCannotCommitEvenAfterProjectReactivation(t *test
 	call(t, h, "PUT", "/projects/proj_001/status", `{"status":"stopped"}`, 200)
 	call(t, h, "PUT", "/projects/proj_001/status", `{"status":"active"}`, 200)
 	executionOp(t, h, e, "apply", `{}`, 409)
-	executionOp(t, h, e, "status", `{"status":"cancelled","result":{"status":"failed","error":"hard cancelled"}}`, 200)
+	executionOp(t, h, e, "status", `{"status":"cancelled","result":{"status":"failed","error":"hard cancelled"}}`, 409)
 	s := readState(t, h)
-	if len(s.Graph.Facts) != 2 || s.Steps[0].Status != "failed" || s.Steps[0].Reason != "hard cancelled" {
+	if len(s.Graph.Facts) != 2 || s.Steps[0].Status != "open" {
 		t.Fatal("revoked pending result became a fact")
+	}
+	var executions []b.Execution
+	getUIJSON(t, h, "/executions?namespace=test", &executions)
+	if len(executions) != 1 || executions[0].Status != "retry_requested" || string(executions[0].Result) != `{"conclude":false,"status":"success","text":"{\"description\":\"late\"}"}` {
+		t.Fatalf("continue lost the immutable pending result or retry grant: %+v", executions)
 	}
 }
 
@@ -269,13 +274,14 @@ func TestExecuteFailureBecomesVisibleStateAndOneDecisionTrigger(t *testing.T) {
 	}
 }
 
-func TestCancelledExecutionAllowsExplicitNewAttemptButNeverOldResume(t *testing.T) {
+func TestContinueAllowsExplicitNewAttemptButNeverOldResume(t *testing.T) {
 	h, e := executionFixture(t, "explore")
 	call(t, h, "PUT", "/projects/proj_001/status", `{"status":"stopped"}`, 200)
 	executionOp(t, h, e, "status", `{"status":"cancelled","result":{"status":"failed","error":"project stopped"}}`, 200)
 	call(t, h, "POST", "/projects/proj_001/executions/first/retry", `{}`, 403)
 	call(t, h, "PUT", "/projects/proj_001/status", `{"status":"active"}`, 200)
-	call(t, h, "POST", "/projects/proj_001/executions/first/retry", `{}`, 200)
+	// Continue already granted exactly one retry for this paused execution.
+	call(t, h, "POST", "/projects/proj_001/executions/first/retry", `{}`, 409)
 	executionOp(t, h, e, "resume", `{}`, 409)
 	next := makeExecution(t, h, "explore", "explicit-new-run", "first")
 	registerExecutionCall(t, h, next, 201)

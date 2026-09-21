@@ -123,6 +123,9 @@ func (s *Scheduler) loadExecutions(ctx context.Context) error {
 		if json.Unmarshal(e.Job, &j) != nil {
 			continue
 		}
+		if j.Graph.Project.Generation != s.generations[e.ProjectID] {
+			continue
+		}
 		s.checkpoints[e.ProjectID] = checkpoint{len(j.Graph.Facts), len(j.Graph.Hints), j.Graph.OpenCount()}
 		s.decisionRevisions[e.ProjectID] = j.DecisionRevision
 	}
@@ -194,8 +197,11 @@ func (s *Scheduler) recoverExecutions(ctx context.Context, states map[string]str
 			return fmt.Errorf("execution %s has invalid job: %w", e.ID, err)
 		}
 		t := &task{Job: j, Execution: e, Lease: Lease{Run: e.Lease, Kind: e.Kind, Intent: e.Intent}}
-		if states[e.ProjectID] != "active" {
+		if states[e.ProjectID] != "active" || j.Graph.Project.Generation != s.generations[e.ProjectID] {
 			s.terminal(t, "cancelled", worker.Result{Status: "failed", FailureKind: "hard_cancelled", Error: "project is not active"})
+			continue
+		}
+		if !s.restartReady(ctx, j.Graph.Project) {
 			continue
 		}
 		if len(s.running) >= s.Config.Runtime.MaxWorkers {
@@ -205,15 +211,17 @@ func (s *Scheduler) recoverExecutions(ctx context.Context, states map[string]str
 			continue
 		}
 		projectCount, backendCount := 0, 0
+		staleRound := false
 		for _, running := range s.running {
 			if running.Job.Graph.Project.ID == e.ProjectID {
 				projectCount++
+				staleRound = staleRound || running.Job.Graph.Project.Generation != j.Graph.Project.Generation
 			}
 			if running.Worker.Name == e.Backend {
 				backendCount++
 			}
 		}
-		if projectCount >= s.Config.Runtime.MaxProjectWorkers {
+		if staleRound || projectCount >= s.Config.Runtime.MaxProjectWorkers {
 			continue
 		}
 		found := false

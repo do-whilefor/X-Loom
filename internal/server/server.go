@@ -55,7 +55,8 @@ func New(store *b.Store) http.Handler {
 		"PUT /projects/{pid}/title": s.title, "PUT /projects/{pid}/status": s.status,
 		"POST /projects/{pid}/hints": s.hint, "POST /projects/{pid}/intents": s.intent,
 		"POST /projects/{pid}/complete": s.complete, "POST /projects/{pid}/reopen": s.reopen,
-		"GET /projects/{pid}/export": s.export,
+		"POST /projects/{pid}/restart": s.restart,
+		"GET /projects/{pid}/export":   s.export,
 	} {
 		m.HandleFunc(pattern, s.wrap(fn))
 	}
@@ -280,7 +281,11 @@ func guardClaim(t *b.Tx, project, worker string, r *http.Request) error {
 		if err := t.QueryRow("SELECT EXISTS(SELECT 1 FROM xloom_executions WHERE project_id=? AND lease=?)", project, worker).Scan(&registered); err != nil {
 			return err
 		}
-		if !registered {
+		var restarted bool
+		if err := t.QueryRow("SELECT EXISTS(SELECT 1 FROM xloom_project_rounds WHERE project_id=?)", project).Scan(&restarted); err != nil {
+			return err
+		}
+		if !registered && !restarted {
 			return nil
 		}
 	}

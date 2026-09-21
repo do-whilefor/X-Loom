@@ -11,7 +11,7 @@
     Object.freeze({id:'audit', name:'代码审计', description:'从代码到可追溯的结论', icon:'code'})
   ]);
   const NAMES = Object.freeze({
-    active:'运行中', running:'运行中', paused:'已暂停', stopped:'已停止', completed:'已完成',
+    active:'进行中', running:'进行中', paused:'已暂停', stopped:'已暂停', completed:'已完成',
     open:'待执行', achieved:'已达成', withdrawn:'已撤回', abandoned:'已放弃',
     valid:'有效', input:'项目输入', superseded:'已被替代', refuted:'已反驳', narrowed:'范围已收窄',
     candidate:'待验证', verified:'已验证', failed:'执行失败', rejected:'结果被拒绝', cancelled:'已取消',
@@ -19,6 +19,12 @@
     retry_requested:'等待重试'
   });
   const PHASES = {bootstrap:'Bootstrap', reason:'Decide', explore:'Execute', intent:'Execute'};
+  const PHASE_NAMES = Object.freeze({bootstrap:'启动引导',reason:'决策',decide:'决策',explore:'执行',intent:'执行',execute:'执行',system:'系统',model:'模型结论'});
+  const NODE_TYPE_NAMES = Object.freeze({start:'起点',origin:'起点',step:'任务',intent:'任务',fact:'事实',finding:'发现',goal:'目标'});
+  const TIME_FORMATTER = new Intl.DateTimeFormat('en-CA', {
+    timeZone:'Asia/Shanghai',calendar:'gregory',numberingSystem:'latn',
+    year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'
+  });
   const array = value => Array.isArray(value) ? value : [];
   const string = value => typeof value === 'string' ? value : '';
   const object = value => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
@@ -27,6 +33,8 @@
   const refs = ids => [...new Set(array(ids).filter(id => typeof id === 'string' && id))].map(id => ({type:'fact', id}));
   const statusName = value => NAMES[value] || string(value) || '未知状态';
   const scenarioName = value => (SCENARIOS.find(scenario => scenario.id === value) || {name:'未分类'}).name;
+  const phaseName = value => PHASE_NAMES[string(value).toLowerCase()] || string(value) || '系统';
+  const nodeTypeName = value => NODE_TYPE_NAMES[string(value).toLowerCase()] || string(value) || '节点';
 
   function validateProject(input) {
     input = object(input);
@@ -44,13 +52,89 @@
     return payload;
   }
 
-  function formatTime(value, options = {}) {
+  function formatTime(value) {
     if (!string(value)) return '未记录时间';
     const date = new Date(value);
     if (!Number.isFinite(date.getTime())) return '未记录时间';
-    return date.toLocaleString('zh-CN', options.date
-      ? {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}
-      : {hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
+    const parts = Object.fromEntries(TIME_FORMATTER.formatToParts(date).map(part => [part.type,part.value]));
+    return parts.year.padStart(4,'0') + '-' + parts.month + '-' + parts.day + ' ' + parts.hour + ':' + parts.minute + ':' + parts.second;
+  }
+
+  function timestamp(value) {
+    const time = string(value) ? Date.parse(value) : NaN;
+    return Number.isFinite(time) ? time : null;
+  }
+
+  function belongsToCurrentRound(execution, project) {
+    if (project.id && execution.project_id && execution.project_id !== project.id) return false;
+    const generation = Number.isInteger(project.generation) ? project.generation : 0;
+    if (Number.isInteger(execution.generation) && execution.generation !== generation) return false;
+    const restarted = timestamp(project.restarted_at);
+    if (restarted !== null) {
+      const created = timestamp(execution.created_at);
+      if (created !== null && created < restarted) return false;
+      // Legacy execution summaries have no generation. After a restart they
+      // need a current-round timestamp before their conclusions can be shown.
+      if (!Number.isInteger(execution.generation) && created === null) return false;
+    }
+    return true;
+  }
+
+  function projectTiming(state, executions = []) {
+    state = object(state);
+    const graph = object(state.graph), project = object(graph.project);
+    const restarted = timestamp(project.restarted_at);
+    const currentTime = value => {
+      const time = timestamp(value);
+      return time !== null && (restarted === null || time >= restarted) ? time : null;
+    };
+    const starts = [];
+    const addStart = value => { const time = currentTime(value); if (time !== null) starts.push(time); };
+    addStart(object(project.reason).started_at);
+    for (const intent of array(graph.intents)) addStart(object(intent).started_at);
+    for (const item of array(executions)) {
+      const execution = object(item);
+      if (!belongsToCurrentRound(execution,project)) continue;
+      // A prepared record is still waiting for execution. Neither project/intent
+      // creation nor a later heartbeat can supply a missing execution start.
+      if (!['running','retryable','result_pending','succeeded','failed','rejected','cancelled','retry_requested'].includes(execution.status)) continue;
+      addStart(execution.started_at || execution.created_at);
+    }
+    const started = starts.length ? Math.min(...starts) : null;
+    const rootGoal = array(state.goals).find(goal => goal && goal.id === 'goal');
+    const ends = [];
+    if (project.status === 'completed' && (!rootGoal || rootGoal.status === 'achieved')) {
+      for (const item of array(graph.intents)) {
+        const intent = object(item);
+        if (intent.to !== 'goal') continue;
+        const time = currentTime(intent.concluded_at);
+        if (time !== null && (started === null || time >= started)) ends.push(time);
+      }
+    }
+    return {
+      startedAt:started === null ? null : new Date(started).toISOString(),
+      endedAt:ends.length ? new Date(Math.max(...ends)).toISOString() : null
+    };
+  }
+
+  function taskProgress(state) {
+    state = object(state);
+    const graph = object(state.graph), project = object(graph.project);
+    const records = array(state.steps).length ? array(state.steps) : array(graph.intents).map(item => {
+      const intent = object(item);
+      return {...intent,status:string(intent.to) ? 'completed' : intent.concluded_at ? 'abandoned' : string(intent.worker) ? 'running' : 'open'};
+    });
+    const tasks = new Map();
+    for (const item of records) {
+      const step = object(item);
+      if (string(step.id)) tasks.set(step.id,step);
+    }
+    let completed = 0, running = 0;
+    for (const step of tasks.values()) {
+      if (step.status === 'completed') completed++;
+      if (project.status === 'active' && step.status === 'running') running++;
+    }
+    return {completed,total:tasks.size,running};
   }
 
   function recordBody(record, type) {
@@ -181,6 +265,10 @@
     const base = (id,time,source,worker = '') => ({id,time:string(time),source,worker:string(worker)});
 
     if (string(project.id)) add({...base('project:' + project.id,project.created_at,'state'),title:'项目已创建',body:string(project.title)});
+    if (Number.isInteger(project.generation) && project.generation > 0 && timestamp(project.restarted_at) !== null) {
+      add({...base('project:' + string(project.id) + ':restart:' + project.generation,project.restarted_at,'state'),
+        title:'项目已重启',body:'已清空本轮任务图、发现、执行记录和日志，保留原始输入、目标和补充提示，等待重新执行。'});
+    }
     for (const [key,event] of orderedEvents) {
       const payload = object(event.payload), result = object(event.result);
       const common = {...base('event:' + key,event.created_at,'event',event.run_id),revision:event.revision};
@@ -244,7 +332,7 @@
 
     const uniqueExecutions = new Map();
     for (const execution of array(executions)) {
-      if (!execution || !string(execution.id) || (project.id && execution.project_id && execution.project_id !== project.id)) continue;
+      if (!execution || !string(execution.id) || !belongsToCurrentRound(execution,project)) continue;
       const old = uniqueExecutions.get(execution.id);
       if (!old || string(execution.updated_at) >= string(old.updated_at)) uniqueExecutions.set(execution.id,execution);
     }
@@ -272,7 +360,7 @@
       if (output && !conclusions.length) body += (body ? '\n\n' : '') + output.slice(0,10000);
       if (!body) body = execution.resumes > 0 ? '已恢复 ' + execution.resumes + ' 次。' : '';
       if (truncated) body += (body ? '\n\n' : '') + '输出已截断';
-      add({...common,level:failed ? 'error' : 'info',title:(phase === 'System' ? '执行' : phase) + ' · ' + statusName(execution.status),body,truncated});
+      add({...common,level:failed ? 'error' : 'info',title:(phase === 'System' ? '执行' : phaseName(phase)) + ' · ' + statusName(execution.status),body,truncated});
       conclusions.forEach((conclusion,index) => add({...common,id:common.id + ':conclusion:' + index,kind:'model',phase:'Model',
         title:'关键结论 · 执行结果',body:conclusion.text,level:'info',evidence:conclusion.evidence || [],truncated,
         statusLabel:'执行结果',supportValid:undefined}));
@@ -293,5 +381,5 @@
         .filter(Boolean).join(' ').toLocaleLowerCase().includes(query)));
   }
 
-  return {SCENARIOS,validateProject,scenarioName,statusName,formatTime,buildLogs,filterLogs};
+  return {SCENARIOS,validateProject,scenarioName,statusName,phaseName,nodeTypeName,formatTime,projectTiming,taskProgress,buildLogs,filterLogs};
 }));

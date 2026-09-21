@@ -15,16 +15,17 @@ func ValidScenario(scenario string) bool {
 // ExecutionView is a read-only projection. It deliberately cannot serialize
 // dispatch inputs, lease identities, retry authorization, or environment data.
 type ExecutionView struct {
-	ID        string               `json:"id"`
-	ProjectID string               `json:"project_id"`
-	Kind      string               `json:"kind"`
-	Backend   string               `json:"backend"`
-	Intent    string               `json:"intent"`
-	Status    string               `json:"status"`
-	Resumes   int                  `json:"resumes"`
-	CreatedAt string               `json:"created_at"`
-	UpdatedAt string               `json:"updated_at"`
-	Result    *ExecutionResultView `json:"result,omitempty"`
+	ID         string               `json:"id"`
+	ProjectID  string               `json:"project_id"`
+	Generation int64                `json:"generation"`
+	Kind       string               `json:"kind"`
+	Backend    string               `json:"backend"`
+	Intent     string               `json:"intent"`
+	Status     string               `json:"status"`
+	Resumes    int                  `json:"resumes"`
+	CreatedAt  string               `json:"created_at"`
+	UpdatedAt  string               `json:"updated_at"`
+	Result     *ExecutionResultView `json:"result,omitempty"`
 }
 
 type ExecutionResultView struct {
@@ -59,7 +60,7 @@ func (t *Tx) ProjectExecutions(project string) ([]ExecutionView, error) {
 	if !exists {
 		return nil, Err(404, "Project not found")
 	}
-	rows, err := t.Query(`SELECT id,project_id,kind,backend,intent,status,resumes,created_at,updated_at,result FROM xloom_executions WHERE project_id=? ORDER BY created_at,rowid`, project)
+	rows, err := t.Query(`SELECT id,project_id,kind,backend,intent,status,resumes,created_at,updated_at,result,job FROM xloom_executions WHERE project_id=? ORDER BY created_at,rowid`, project)
 	if err != nil {
 		return nil, err
 	}
@@ -67,9 +68,21 @@ func (t *Tx) ProjectExecutions(project string) ([]ExecutionView, error) {
 	out := []ExecutionView{}
 	for rows.Next() {
 		var entry ExecutionView
-		var result []byte
-		if err := rows.Scan(&entry.ID, &entry.ProjectID, &entry.Kind, &entry.Backend, &entry.Intent, &entry.Status, &entry.Resumes, &entry.CreatedAt, &entry.UpdatedAt, &result); err != nil {
+		var result, job []byte
+		if err := rows.Scan(&entry.ID, &entry.ProjectID, &entry.Kind, &entry.Backend, &entry.Intent, &entry.Status, &entry.Resumes, &entry.CreatedAt, &entry.UpdatedAt, &result, &job); err != nil {
 			return nil, err
+		}
+		// Only the round number crosses the UI projection. The immutable job
+		// itself remains private to dispatcher recovery.
+		var round struct {
+			Graph struct {
+				Project struct {
+					Generation int64 `json:"generation"`
+				} `json:"project"`
+			} `json:"graph"`
+		}
+		if json.Unmarshal(job, &round) == nil {
+			entry.Generation = round.Graph.Project.Generation
 		}
 		entry.Result = executionResultView(result)
 		out = append(out, entry)

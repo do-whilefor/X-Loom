@@ -10,6 +10,8 @@ import (
 	mrand "math/rand/v2"
 	"slices"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,6 +65,8 @@ type Scheduler struct {
 	decisionRevisions map[string]int64
 	stateRevisions    map[string]int64
 	states            map[string]board.State
+	generations       map[string]int64
+	restartCleaned    map[string]int64
 	leaseTimeout      time.Duration
 	// CheckHealth overrides the model readiness probe in tests or embeddings.
 	CheckHealth func(context.Context, config.Worker) error
@@ -71,6 +75,8 @@ type Scheduler struct {
 func New(c config.Config, r Runner) *Scheduler {
 	s := &Scheduler{Config: c, Runner: r, Client: &Client{Base: c.Server}, running: map[string]*task{}, admitted: map[string]bool{}, checkpoints: map[string]checkpoint{}, unhealthy: map[string]time.Time{}, rejected: map[string]time.Time{}, cleanup: map[string]string{}, cleaned: map[string]string{}, done: make(chan finished, c.Runtime.MaxWorkers), cleanupDone: make(chan cleaned, c.Runtime.MaxProjects+8), decisionRevisions: map[string]int64{}, stateRevisions: map[string]int64{}, states: map[string]board.State{}}
 	s.configureGraphHandler()
+	s.generations = map[string]int64{}
+	s.restartCleaned = map[string]int64{}
 	return s
 }
 func (s *Scheduler) Health(ctx context.Context, force bool) error {
@@ -160,7 +166,7 @@ func (s *Scheduler) reap() {
 			} else {
 				delete(s.rejected, key)
 			}
-			if f.Outcome == "success" && f.Task.Job.Kind == "reason" {
+			if f.Outcome == "success" && f.Task.Job.Kind == "reason" && f.Task.Job.Graph.Project.Generation == s.generations[f.Task.Job.Graph.Project.ID] {
 				g := f.Task.Job.Graph
 				s.checkpoints[g.Project.ID] = checkpoint{len(g.Facts), len(g.Hints), g.OpenCount()}
 				s.decisionRevisions[g.Project.ID] = f.Task.Job.DecisionRevision
@@ -177,6 +183,10 @@ cleanup:
 			delete(s.cleanup, f.ID)
 			if f.Err == nil {
 				s.cleaned[f.ID] = f.State
+				if raw, ok := strings.CutPrefix(f.State, "restart:"); ok {
+					generation, _ := strconv.ParseInt(raw, 10, 64)
+					s.restartCleaned[f.ID] = generation
+				}
 			} else {
 				slog.Warn("container cleanup failed", "project", f.ID, "error", f.Err)
 			}
@@ -207,6 +217,7 @@ func (s *Scheduler) Step(ctx context.Context) error {
 	states := map[string]string{}
 	active := []board.Summary{}
 	for _, p := range summaries {
+		s.observeGeneration(p.Project)
 		states[p.ID] = p.Status
 		if p.Status == "active" {
 			active = append(active, p)
@@ -223,7 +234,7 @@ func (s *Scheduler) Step(ctx context.Context) error {
 		}
 	}
 	for _, t := range s.running {
-		if states[t.Job.Graph.Project.ID] != "active" {
+		if states[t.Job.Graph.Project.ID] != "active" || t.Job.Graph.Project.Generation != s.generations[t.Job.Graph.Project.ID] {
 			t.Cancel()
 		}
 	}
@@ -249,18 +260,7 @@ func (s *Scheduler) Step(ctx context.Context) error {
 		if s.cleaned[id] == state || s.cleanup[id] != "" {
 			continue
 		}
-		s.cleanup[id] = state
-		s.wg.Add(1)
-		go func(id, state string) {
-			defer s.wg.Done()
-			cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			err := s.Runner.Cleanup(cleanupCtx, id, state)
-			select {
-			case s.cleanupDone <- cleaned{id, state, err}:
-			case <-ctx.Done():
-			}
-		}(id, state)
+		s.queueCleanup(ctx, id, state)
 	}
 	sort.Slice(active, func(i, j int) bool { return active[i].ID < active[j].ID })
 	if len(active) > 0 {
@@ -330,6 +330,9 @@ func initial(g board.Graph) bool {
 	return true
 }
 func (s *Scheduler) trigger(g board.Graph) string {
+	if s.previous(g, "reason", nil) != "" {
+		return "explicit_retry"
+	}
 	p, ok := s.checkpoints[g.Project.ID]
 	if !ok {
 		return "initial"
@@ -341,6 +344,55 @@ func (s *Scheduler) trigger(g board.Graph) string {
 	}
 	return ""
 }
+
+// Restart keeps the project ID but replaces its execution round. Forget the
+// prior planner boundary, including when a restart raced the list request.
+func (s *Scheduler) observeGeneration(project board.Project) {
+	if s.generations == nil {
+		s.generations = map[string]int64{}
+	}
+	if s.generations[project.ID] != project.Generation {
+		delete(s.checkpoints, project.ID)
+		delete(s.decisionRevisions, project.ID)
+		delete(s.stateRevisions, project.ID)
+		delete(s.states, project.ID)
+		s.generations[project.ID] = project.Generation
+	}
+}
+
+func (s *Scheduler) queueCleanup(ctx context.Context, id, state string) {
+	s.cleanup[id] = state
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		err := s.Runner.Cleanup(cleanupCtx, id, state)
+		select {
+		case s.cleanupDone <- cleaned{id, state, err}:
+		case <-ctx.Done():
+		}
+	}()
+}
+
+// Individual process cancellation is best effort during Docker outages. A
+// restart additionally requires a confirmed container stop before any worker
+// may enter the new round; this retains the container and workspace files.
+func (s *Scheduler) restartReady(ctx context.Context, project board.Project) bool {
+	if project.Generation == 0 || s.restartCleaned[project.ID] == project.Generation {
+		return true
+	}
+	for _, task := range s.running {
+		if task.Job.Graph.Project.ID == project.ID {
+			return false
+		}
+	}
+	if s.cleanup[project.ID] == "" {
+		s.queueCleanup(ctx, project.ID, "restart:"+strconv.FormatInt(project.Generation, 10))
+	}
+	return false
+}
+
 func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 	if s.cleanup[id] != "" {
 		return false, nil
@@ -363,6 +415,22 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		return false, err
 	}
 	g := state.Graph
+	s.observeGeneration(g.Project)
+	// Cancellation may take time in a container. Do not start the new round
+	// in the same workspace until every old local execution has actually left.
+	stale := false
+	for _, task := range s.running {
+		if task.Job.Graph.Project.ID == id && task.Job.Graph.Project.Generation != g.Project.Generation {
+			task.Cancel()
+			stale = true
+		}
+	}
+	if stale {
+		return false, nil
+	}
+	if !s.restartReady(ctx, g.Project) {
+		return false, nil
+	}
 	s.stateRevisions[id] = state.DecisionRevision
 	s.states[id] = state
 	if g.Project.Status != "active" {

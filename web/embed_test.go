@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io/fs"
+	"strings"
 	"testing"
 )
 
@@ -41,6 +42,11 @@ func TestLegacyCairnAssets(t *testing.T) {
 		}
 		if owned[path] {
 			return nil
+		}
+		// The classic page may use the project's X-Loom title; its original
+		// scripts, markup and styles remain pinned to Cairn's asset digest.
+		if path == "legacy.html" {
+			data = []byte(strings.Replace(string(data), "<title>X-Loom</title>", "<title>Cairn</title>", 1))
 		}
 		if got := fmt.Sprintf("%x", sha256.Sum256(data)); got != want[path] {
 			t.Errorf("asset differs from Cairn: %s = %s", path, got)

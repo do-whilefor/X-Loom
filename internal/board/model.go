@@ -33,13 +33,15 @@ type Reason struct {
 	Heartbeat string `json:"last_heartbeat_at"`
 }
 type Project struct {
-	ID        string  `json:"id"`
-	Title     string  `json:"title"`
-	Status    string  `json:"status"`
-	Bootstrap bool    `json:"bootstrap_enabled"`
-	CreatedAt string  `json:"created_at"`
-	Reason    *Reason `json:"reason"`
-	Scenario  string  `json:"scenario,omitempty"`
+	ID          string  `json:"id"`
+	Title       string  `json:"title"`
+	Status      string  `json:"status"`
+	Bootstrap   bool    `json:"bootstrap_enabled"`
+	CreatedAt   string  `json:"created_at"`
+	Reason      *Reason `json:"reason"`
+	Scenario    string  `json:"scenario,omitempty"`
+	Generation  int64   `json:"generation,omitempty"`
+	RestartedAt string  `json:"restarted_at,omitempty"`
 }
 type Graph struct {
 	Project Project  `json:"project"`

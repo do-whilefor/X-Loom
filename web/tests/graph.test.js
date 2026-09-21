@@ -1,6 +1,6 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {XLoomGraph, mapState, resolveNodeKey, LABEL_LAYOUT, createTextMeasurer, wrapMeasuredText, formatNodeLabel} = require('../static/graph.js');
+const {XLoomGraph, mapState, resolveNodeKey, LABEL_LAYOUT, createTextMeasurer, wrapMeasuredText, formatNodeLabel, buildFlowLayout, nodePresentation} = require('../static/graph.js');
 
 // Deliberately proportional metrics: equal-length strings can have very
 // different rendered widths. Browser acceptance uses the real canvas metrics.
@@ -35,7 +35,7 @@ test('node labels bound Chinese, continuous UUIDs and paths by measured width an
     const formatted = formatNodeLabel(node, proportionalWidth);
     assertFitsNode(formatted);
     assert.equal(formatted.lines.length, 3);
-    assert.equal(formatted.lines[0], 'FACT · 有效');
+    assert.equal(formatted.lines[0], '事实 · 有效');
     assert.ok(formatted.lines.at(-1).endsWith('…'));
     assert.equal(formatted.truncated, true);
     assert.deepEqual(node, before, 'layout must never shorten content exposed to the log or selection callback');
@@ -268,35 +268,284 @@ test('polling order and revision-only changes produce the same deterministic map
   assert.equal(resolveNodeKey(initial.nodes, 'missing'), null);
 });
 
-test('vendored Dagre adds nodes without moving retained positions or changing the viewport', () => {
-  const fs = require('node:fs');
-  const path = require('node:path');
-  const vm = require('node:vm');
-  const cytoscape = require('../static/vendor/cytoscape.min.js');
-  const dagre = require('../static/vendor/dagre.min.js');
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../static/vendor/cytoscape-dagre.js'), 'utf8'), {cytoscape, dagre});
+test('flow uses real origin once, preserves every typed record and places the actual root goal last', () => {
   const mapped = mapState(stateFixture());
-  const cy = cytoscape({headless: true, elements: [
-    ...mapped.nodes.map(node => ({group: 'nodes', data: {id: node.key}})),
-    ...mapped.edges.map(edge => ({group: 'edges', data: edge}))
-  ]});
+  const before = structuredClone(mapped);
+  const layout = buildFlowLayout(mapped);
+  assert.equal(layout.startKey, 'fact:origin');
+  assert.equal(layout.endKey, 'goal:goal');
+  assert.equal(layout.nodes.length, mapped.nodes.length - 1);
+  assert.equal(layout.nodes.filter(node => node.role === 'start').length, 1);
+  assert.equal(layout.nodes.filter(node => node.role === 'goal').length, 1);
+  assert.equal(layout.nodes.find(node => node.key === 'goal:child').label, '子目标');
+  assert.equal(layout.nodes.some(node => node.key === 'fact:goal'), false);
+  assert.deepEqual(layout.aliases, {'fact:goal':'goal:goal'});
+  assert.equal(mapped.nodes.find(node => node.key === 'fact:goal').label, '同名的用户目标输入');
+  const y = Object.fromEntries(layout.nodes.map(node => [node.key, node.position.y]));
+  for (const node of layout.nodes) {
+    if (node.key !== layout.startKey) assert.ok(node.position.y > y[layout.startKey]);
+    if (node.key !== layout.endKey) assert.ok(node.position.y < y[layout.endKey]);
+  }
+  assert.ok(y['step:run'] < y['fact:result']);
+  assert.ok(y['fact:result'] < y['finding:found']);
+  assert.ok(y['fact:result'] < y['goal:child']);
+  assert.deepEqual(mapped, before, 'layout must not rewrite FGS facts, status or relationships');
+});
+
+test('corrections and goal ownership preserve directions without affecting execution order', () => {
+  const state = stateFixture();
+  const before = buildFlowLayout(mapState(state));
+  state.fact_relations = ['refutes','supersedes','narrows'].map(kind => ({kind, source:'result', target:'origin'}));
+  const mapped = mapState(state);
+  const after = buildFlowLayout(mapped);
+  assert.deepEqual(after.nodes.map(node => [node.key,node.position]), before.nodes.map(node => [node.key,node.position]));
+  for (const edge of mapped.edges.filter(edge => ['refutes','supersedes','narrows'].includes(edge.kind))) {
+    assert.equal(edge.source, 'fact:result');
+    assert.equal(edge.target, 'fact:origin');
+  }
+  const ownership = mapped.edges.find(edge => edge.kind === 'goal_step');
+  assert.equal(ownership.source, 'goal:child');
+  assert.equal(ownership.target, 'step:run');
+  assert.equal(ownership.label, '任务归属');
+});
+
+test('empty or incomplete State does not manufacture start or goal evidence', () => {
+  assert.deepEqual(buildFlowLayout(mapState(null)), {nodes:[], edges:[], aliases:{}, endKey:null, startKey:null});
+  const mapped = mapState({fact_records:[{id:'unlinked',description:'未连接的事实',status:'valid'}]});
+  const layout = buildFlowLayout(mapped);
+  assert.equal(layout.nodes.length, 1);
+  assert.equal(layout.startKey, null);
+  assert.equal(layout.endKey, null);
+  assert.equal(layout.nodes[0].role, 'fact');
+  const onlyGoal = buildFlowLayout(mapState({goals:[{id:'real-root',condition:'实际根目标',status:'open'}]}));
+  assert.equal(onlyGoal.endKey, 'goal:real-root');
+  assert.equal(onlyGoal.nodes.length, 1);
+  const legacy = buildFlowLayout(mapState({fact_records:[
+    {id:'origin',description:'真实输入',status:'input'},
+    {id:'goal',description:'历史项目目标',status:'input'}
+  ]}));
+  assert.equal(legacy.nodes.length, 2);
+  assert.equal(legacy.startKey, 'fact:origin');
+  assert.equal(legacy.endKey, 'fact:goal');
+  assert.deepEqual(legacy.aliases, {});
+  assert.equal(legacy.nodes.find(node => node.key === 'fact:goal').role, 'goal');
+});
+
+test('cycles remain together and arbitrary large branches retain bounded non-overlapping cards', () => {
+  const state = stateFixture();
+  state.steps.push({id:'cycle', description:'再次检查', from:['result'], result:'origin-cycle', status:'open'});
+  state.fact_records.push({id:'origin-cycle',description:'循环依据',status:'valid'});
+  state.steps[0].from.push('origin-cycle');
+  for (let i = 0; i < 120; i++) {
+    state.steps.push({id:'branch-' + i,description:'并行检查',from:['origin'],result:'branch-result-' + i,status:'open'});
+    state.fact_records.push({id:'branch-result-' + i,description:'检查事实',status:'valid'});
+  }
+  const layout = buildFlowLayout(mapState(state));
+  const byKey = new Map(layout.nodes.map(node => [node.key,node]));
+  assert.equal(byKey.get('step:run').layer, byKey.get('step:cycle').layer);
+  assert.equal(byKey.get('step:run').layer, byKey.get('fact:result').layer);
+  for (let i = 0; i < layout.nodes.length; i++) for (let j = i + 1; j < layout.nodes.length; j++) {
+    const a = layout.nodes[i], b = layout.nodes[j];
+    assert.ok(Math.abs(a.position.x - b.position.x) >= (a.width + b.width) / 2 + 40 || Math.abs(a.position.y - b.position.y) >= (a.height + b.height) / 2 + 40);
+  }
+  const reversed = mapState(state);
+  reversed.nodes.reverse(); reversed.edges.reverse();
+  assert.deepEqual(buildFlowLayout(reversed), layout);
+  assert.equal(nodePresentation(byKey.get('fact:origin').node, layout.endKey).label, '起点');
+});
+
+test('large peer layers wrap at four cards without growing canvas width or inventing dependencies', () => {
+  const state = stateFixture();
+  for (let index = 0; index < 97; index++) {
+    state.steps.push({id:'parallel-' + index,description:'独立分支',from:['origin'],result:'result-' + index,status:'open'});
+    state.fact_records.push({id:'result-' + index,description:'分支证据',status:'valid'});
+    state.fact_records.push({id:'isolated-' + index,description:'孤立事实',status:'valid'});
+  }
+  const mapped = mapState(state);
+  const original = structuredClone(mapped);
+  const layout = buildFlowLayout(mapped);
+  const physicalRows = new Map(), layerRows = new Map();
+  for (const entry of layout.nodes) {
+    if (!physicalRows.has(entry.position.y)) physicalRows.set(entry.position.y, []);
+    physicalRows.get(entry.position.y).push(entry);
+    if (!layerRows.has(entry.layer)) layerRows.set(entry.layer, []);
+    layerRows.get(entry.layer).push(entry.position.y);
+    assert.ok(entry.position.x - entry.width / 2 >= -503);
+    assert.ok(entry.position.x + entry.width / 2 <= 503);
+  }
+  for (const entries of physicalRows.values()) {
+    assert.ok(entries.length <= 4);
+    assert.equal(new Set(entries.map(entry => entry.layer)).size, 1, 'physical rows never mix dependency layers');
+    const sorted = entries.toSorted((a,b) => a.position.x - b.position.x);
+    for (let i = 1; i < sorted.length; i++) {
+      const left = sorted[i - 1], right = sorted[i];
+      assert.ok(right.position.x - right.width / 2 - left.position.x - left.width / 2 >= 42);
+    }
+  }
+  const layers = [...layerRows].sort(([a],[b]) => a - b);
+  for (let i = 1; i < layers.length; i++) {
+    assert.ok(Math.max(...layers[i - 1][1]) < Math.min(...layers[i][1]), 'all wrapped peers precede the next dependency layer');
+  }
+  assert.ok(new Set(layerRows.get(1)).size > 1, 'wide first layer actually wraps');
+  assert.equal(layout.nodes.find(entry => entry.key === layout.startKey).position.x, 0);
+  assert.equal(layout.nodes.find(entry => entry.key === layout.endKey).position.x, 0);
+  assert.equal(layout.edges.length, mapped.edges.length);
+  for (const edge of layout.edges) {
+    const real = mapped.edges.find(item => item.id === edge.id);
+    assert.equal(edge.recordSource, real.source);
+    assert.equal(edge.recordTarget, real.target);
+    assert.equal(edge.kind, real.kind);
+  }
+  assert.deepEqual(mapped, original);
+});
+
+function headlessGraph() {
+  const cytoscape = require('../static/vendor/cytoscape.min.js');
+  const graph = Object.create(XLoomGraph.prototype);
+  Object.assign(graph, {
+    cy:cytoscape({headless:true}), nodes:[], edges:[], diagnostics:[], selectedKey:null,
+    projectId:null, generation:null, topology:null, snapshot:null, pendingFit:false, destroyed:false,
+    filter:'all', measureLabel:proportionalWidth, empty:{hidden:false}, warning:{hidden:true,textContent:''},
+    picker:{value:''}, live:{textContent:''}, host:{clientWidth:800,clientHeight:500},
+    fits:0, selections:[], fit() { this.fits++; }, refreshViewport() {}, renderCards() {}, updatePicker() {},
+    onSelect(node) { this.selections.push(node); }
+  });
+  return graph;
+}
+
+test('merged endpoint projects input edges while selection and logs keep their original typed records', () => {
+  const graph = headlessGraph();
   try {
-    const graph = Object.create(XLoomGraph.prototype);
-    graph.cy = cy;
-    graph.layoutNewNodes(new Map(), mapped.nodes.map(node => node.key));
-    cy.getElementById('fact:result').position({x: 700, y: 300});
+    const state = stateFixture();
+    state.steps[0].from.push('goal');
+    state.goals[0].status = 'achieved';
+    state.goals[0].sources = ['result'];
+    graph.setState(state);
+    assert.equal(graph.getNodes().length, 7, 'raw graph keeps both records');
+    assert.equal(graph.getVisibleNodeCount(), 6, 'only one root endpoint is rendered');
+    assert.equal(graph.cy.getElementById('fact:goal').length, 0);
+    assert.equal(graph.cy.getElementById('goal:goal').length, 1);
+    const input = graph.cy.edges().filter(edge => edge.data('recordSource') === 'fact:goal');
+    assert.equal(input.length, 1);
+    assert.equal(input.source().id(), 'goal:goal');
+    assert.equal(input.target().id(), 'step:run');
+    const support = graph.cy.edges().filter(edge => edge.data('kind') === 'goal_support' && edge.data('recordTarget') === 'goal:goal');
+    graph.selectNode({type:'fact',id:'goal'});
+    assert.equal(graph.selectedKey, 'fact:goal');
+    assert.equal(graph.cy.getElementById('goal:goal').hasClass('is-selected'), true);
+    assert.equal(graph.selections.at(-1).type, 'fact');
+    assert.equal(graph.selections.at(-1).label, '同名的用户目标输入');
+    assert.equal(input.hasClass('is-related'), true);
+    assert.equal(support.hasClass('is-related'), false);
+    graph.selectNode({type:'goal',id:'goal'});
+    assert.equal(graph.selections.at(-1).type, 'goal');
+    assert.equal(graph.selections.at(-1).label, '真实根目标');
+    assert.equal(input.hasClass('is-related'), false);
+    assert.equal(support.hasClass('is-related'), true);
+  } finally { graph.cy.destroy(); }
+});
+
+test('a legacy target gains a root Goal without duplicate cards or losing typed fact selection', () => {
+  const graph = headlessGraph();
+  try {
+    const state = stateFixture();
+    state.steps[0].from.push('goal');
+    const goals = state.goals;
+    state.goals = [];
+    graph.setState(state);
+    graph.selectNode({type:'fact',id:'goal'});
+    assert.equal(graph.flowLayout.endKey, 'fact:goal');
+    assert.equal(graph.cy.getElementById('fact:goal').length, 1);
+    state.goals = goals;
+    graph.setState(state);
+    assert.equal(graph.selectedKey, 'fact:goal');
+    assert.equal(graph.flowLayout.endKey, 'goal:goal');
+    assert.equal(graph.cy.getElementById('fact:goal').length, 0);
+    assert.equal(graph.cy.getElementById('goal:goal').hasClass('is-selected'), true);
+    assert.equal(graph.cy.edges().filter(edge => edge.data('recordSource') === 'fact:goal').source().id(), 'goal:goal');
+    assert.equal(graph.getVisibleNodeCount(), graph.getNodes().length - 1);
+  } finally { graph.cy.destroy(); }
+});
+
+test('start filter isolates the real origin and aliases participate in typed fact and goal filters', () => {
+  const graph = headlessGraph();
+  try {
+    graph.setState(stateFixture());
+    graph.setFilter('start');
+    assert.equal(graph.filter, 'start');
+    for (const node of graph.cy.nodes()) assert.equal(node.hasClass('is-dimmed'), node.id() !== 'fact:origin');
+    graph.setFilter('fact');
+    assert.equal(graph.cy.getElementById('goal:goal').hasClass('is-dimmed'), false);
+    graph.setFilter('goal');
+    assert.equal(graph.cy.getElementById('goal:goal').hasClass('is-dimmed'), false);
+    assert.equal(graph.cy.getElementById('goal:child').hasClass('is-dimmed'), false);
+    assert.equal(graph.cy.getElementById('fact:result').hasClass('is-dimmed'), true);
+    const legacy = stateFixture();
+    legacy.goals = [];
+    graph.setState(legacy);
+    assert.equal(graph.cy.getElementById('fact:goal').hasClass('is-dimmed'), false);
+  } finally { graph.cy.destroy(); }
+});
+
+test('status polling retains positions and viewport while a new generation clears selection and refits', () => {
+  const graph = headlessGraph();
+  try {
+    const state = stateFixture();
+    state.graph.project.generation = 1;
+    graph.setState(state);
+    assert.equal(graph.fits, 1);
+    graph.selectedKey = 'fact:result';
+    graph.cy.getElementById('fact:result').position({x:777,y:333});
+    graph.cy.zoom(.65); graph.cy.pan({x:31,y:49});
+    state.steps[0].status = 'running';
+    graph.setState(state);
+    assert.equal(graph.fits, 1);
+    assert.equal(graph.selectedKey, 'fact:result');
+    assert.deepEqual(graph.cy.getElementById('fact:result').position(), {x:777,y:333});
+    assert.equal(graph.cy.zoom(), .65);
+    assert.deepEqual(graph.cy.pan(), {x:31,y:49});
+    state.graph.project.generation = 2;
+    graph.setState(state);
+    assert.equal(graph.fits, 2);
+    assert.equal(graph.selectedKey, null);
+    assert.deepEqual(graph.selections, [null]);
+    assert.notDeepEqual(graph.cy.getElementById('fact:result').position(), {x:777,y:333});
+  } finally { graph.cy.destroy(); }
+});
+
+test('first real nodes arriving after an empty State fit once', () => {
+  const graph = headlessGraph();
+  try {
+    graph.setState({graph:{project:{id:'proj-real'}},goals:[],steps:[],fact_records:[],findings:[]});
+    const fits = graph.fits;
+    graph.setState(stateFixture());
+    assert.equal(graph.fits, fits + 1);
+    graph.setState(stateFixture());
+    assert.equal(graph.fits, fits + 1);
+  } finally { graph.cy.destroy(); }
+});
+
+test('topology changes keep real anchors at the extremes without changing the viewport', () => {
+  const state = stateFixture();
+  const graph = headlessGraph();
+  const cy = graph.cy;
+  try {
+    graph.setState(state);
     cy.zoom(.7);
     cy.pan({x: 21, y: 43});
-    const positions = new Map(cy.nodes().map(node => [node.id(), {...node.position()}]));
     const zoom = cy.zoom();
     const pan = {...cy.pan()};
-    cy.add({group: 'nodes', data: {id: 'fact:new'}});
-    cy.add({group: 'edges', data: {id: 'added-edge', source: 'step:run', target: 'fact:new'}});
-    graph.layoutNewNodes(positions, ['fact:new']);
-    for (const [key, position] of positions) assert.deepEqual(cy.getElementById(key).position(), position);
+    state.fact_records.push({id:'new', description:'新增事实', status:'valid'});
+    state.fact_relations.push({kind:'refutes', source:'new', target:'origin'});
+    graph.setState(state);
     const added = cy.getElementById('fact:new').position();
     assert.ok(Number.isFinite(added.x) && Number.isFinite(added.y));
-    assert.ok([...positions.values()].every(position => Math.abs(position.x - added.x) >= 252 || Math.abs(position.y - added.y) >= 108));
+    const origin = cy.getElementById('fact:origin').position().y;
+    const goal = cy.getElementById('goal:goal').position().y;
+    for (const node of cy.nodes()) {
+      if (node.id() !== 'fact:origin') assert.ok(node.position().y > origin);
+      if (node.id() !== 'goal:goal') assert.ok(node.position().y < goal);
+    }
     assert.equal(cy.zoom(), zoom);
     assert.deepEqual(cy.pan(), pan);
   } finally {
