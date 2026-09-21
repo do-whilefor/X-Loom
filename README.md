@@ -2,11 +2,9 @@
 
 使用 Go 重写 Cairn 的协作探索系统。一个二进制提供 `serve`、`dispatch`、`worker`；保留 Cairn 黑板图与三类执行任务，接入 X-Loom 三栏 Web 工作台，使用自研的 Pi 风格两层 Agent Loop。
 
-仅支持 Linux。计划与验收依据见 [DEVELOPMENT.md](DEVELOPMENT.md)，实际兼容边界见 [docs/compatibility.md](docs/compatibility.md)。
+仅支持 Linux。
 
-[DEVELOPMENT-NEXT.md](DEVELOPMENT-NEXT.md) 的会话、压缩与 FGS 扩展已接入。新增接口和重试方式见 [FGS 与执行登记 API](docs/next-state-api.md)，恢复及图工具边界见 [执行会话](docs/session-recovery.md)，验证结果见 [下一阶段验收记录](docs/validation-next.md)。
-
-Web 首页使用真实项目、FGS 状态、事件与执行摘要，界面说明见 [Web 工作台](docs/web-workspace.md)，已完成的检查见 [Web 接入验收记录](docs/validation-web.md)。独立样式 Demo 保留在 `design/web-demo/`，经典 Cairn 管理页保留在 `/static/legacy.html`。
+系统已接入会话、上下文压缩与 FGS 状态扩展。Web 首页展示真实项目、FGS 状态、事件与执行摘要；经典 Cairn 管理页保留在 `/static/legacy.html`。
 
 ## 目录
 
@@ -23,12 +21,9 @@ internal/agent      两层循环、消息、事件、工具接口与上下文压
 internal/provider   Anthropic 兼容请求和流式协议
 internal/tools      read/bash/edit/write/grep/find/ls
 internal/process    Linux 执行取消与子进程清理
-container           Kali Worker 镜像、基础环境说明和检查脚本
-web/static         X-Loom 工作台、经典 Cairn 管理页与本地静态资源
-web/tests          Web 数据转换、图模型和请求隔离测试
-design/web-demo    独立样式 Demo，不接入后端
-tests/integration  真实容器链路与真实模型的显式验收
-tests/compatibility 原 Cairn 与 Go API 差分检查
+container           Kali Worker 镜像、环境说明和镜像检查脚本
+web/static          X-Loom 工作台、经典 Cairn 管理页与本地静态资源
+web/tests           Web 数据转换、图模型和请求隔离测试
 ```
 
 `process` 供 Worker 生命周期和 shell 工具共用，避免重复实现 Linux 进程取消。包内单元测试与实现文件相邻。
@@ -45,15 +40,14 @@ go build -o ./bin/xloom ./cmd/xloom
 
 Web 使用原生 HTML/CSS/JavaScript，无 npm 安装或前端构建步骤。安装 Node.js 后可执行 `node --test web/tests/*.test.js`；静态资源随 Go 二进制嵌入，更新页面后需要重新构建和启动 Server。
 
-项目 Dockerfile 的构建阶段强制执行 race 测试与 vet，通过后才产出运行镜像：
+项目 Dockerfile 的构建阶段强制执行 race 测试与 vet，通过后才产出运行镜像。Worker 镜像以**仓库根**为构建上下文，且末层从 `xloom:dev` 复制 Go 二进制，因此必须先构建控制镜像：
 
 ```sh
 docker build -t xloom:dev .
 docker build -f container/Dockerfile -t xloom-worker:dev .
-python tests/integration/kali_image.py --image xloom-worker:dev
 ```
 
-默认自动测试使用 Mock 模型，不消耗模型额度。真实 Docker 和真实模型测试需要显式启用，命令见 [基础验收记录](docs/validation.md) 和 [本轮运行时验收](docs/validation-runtime.md)。
+默认自动测试使用 Mock 模型，不消耗模型额度。真实 Docker 与真实模型测试需要显式设置环境变量后才运行，未设置时自动跳过（如 `XLOOM_DOCKER_TEST_IMAGE`、`XLOOM_LIVE_MODEL_TEST=1`）。
 
 ## 启动
 
@@ -76,7 +70,7 @@ docker compose up -d --no-deps --force-recreate dispatcher
 
 Compose 插值时，启动终端里已导出的同名环境变量优先于根 `.env`。若编辑后仍使用旧设置，先清除终端里这三项旧导出，再重建 Dispatcher；排查时无需打印密钥值。Linux shell 可执行 `unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_DEFAULT_FABLE_MODEL` 后再运行上述 Compose 命令。
 
-使用前按上述顺序构建两张镜像。访问 <http://localhost:8000>。Server 的数据库在 `xloom-data` 卷中，项目 Worker 容器由 Dispatcher 动态创建。Server/Dispatcher 使用 Debian 上的 `xloom:dev`，Worker 使用 Kali 上的 `xloom-worker:dev`。Worker 提供 Go 程序与通用 shell、Python、JSON、文件和网络诊断工具；本轮未完整迁入原 Cairn 的安全工具及 PoC 库，详见 [容器迁移边界](docs/compatibility-container.md)。
+使用前按上述顺序构建两张镜像。访问 <http://localhost:8000>。Server 的数据库在 `xloom-data` 卷中，项目 Worker 容器由 Dispatcher 动态创建。Server/Dispatcher 使用 Debian 上的 `xloom:dev`，Worker 使用 Kali 上的 `xloom-worker:dev`。Worker 镜像内置 Kali 工具集与常见 PoC、知识库，以及 Playwright 无头浏览器，具体内容见 `container/environment.md`。
 
 Compose 的 `worker-image` 服务仅用于显式构建：先 `docker compose build server`，再 `docker compose --profile images build worker-image`。默认 `docker compose up -d` 只启动 Server 和 Dispatcher。
 
@@ -104,4 +98,4 @@ set +a
 - 第一版只运行一个 Dispatcher。默认实例任务并发上限 16、单项目上限 4；每个具名 Worker 后端的 `max_running` 在所有项目间共享，三层限制同时生效。默认 general 后端上限为 16，最多同时接纳 4 个项目；实际执行数量由可执行任务和剩余额度决定，没有独立“实际配额”。
 - `completed_action: stop` 保留项目容器文件；`remove` 会删除容器及其可写层中的项目文件。项目删除同样清理对应容器。
 
-已有 Cairn SQLite 文件可通过 `--db-path` 接入；迁移与明确差异见 [服务端兼容说明](docs/compatibility-server.md)。
+已有 Cairn SQLite 文件可通过 `--db-path` 接入；数据库结构与兼容差异以 `internal/board` 中的迁移逻辑为准。
