@@ -49,6 +49,9 @@ func TestCairnDatabaseMigrationAndCounterRecovery(t *testing.T) {
 				if g.Project.Bootstrap != (mode != "disabled") {
 					t.Fatalf("bootstrap: %+v", g.Project)
 				}
+				if g.Project.Scenario != "" {
+					t.Fatalf("migration invented a project scenario: %+v", g.Project)
+				}
 				id, err := tx.Next("", "project")
 				if id != "proj_042" {
 					t.Fatalf("counter collision: %s", id)

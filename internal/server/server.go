@@ -73,6 +73,7 @@ func New(store *b.Store) http.Handler {
 	}
 	s.registerStateRoutes(m)
 	s.registerExecutionRoutes(m)
+	s.registerUIRoutes(m)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, pattern := m.Handler(r)
 		if pattern == "" {
@@ -325,6 +326,13 @@ func (s *Server) projects(t *b.Tx, q *request, r *http.Request) (int, any, error
 		return 200, out, nil
 	}
 	title, origin, goal, bootstrap := q.text("title"), q.text("origin"), q.text("goal"), q.bootstrap()
+	scenario := ""
+	if _, exists := q.fields["scenario"]; exists {
+		scenario = q.text("scenario")
+		if !b.ValidScenario(scenario) {
+			q.invalid("scenario", "must be ctf, pentest or audit")
+		}
+	}
 	if q.err != nil {
 		return 0, nil, q.err
 	}
@@ -332,7 +340,7 @@ func (s *Server) projects(t *b.Tx, q *request, r *http.Request) (int, any, error
 	if err != nil {
 		return 0, nil, err
 	}
-	g := b.Graph{Project: b.Project{ID: id, Title: title, Status: "active", Bootstrap: bootstrap, CreatedAt: t.Now}, Facts: []b.Fact{{ID: "origin", Description: origin}, {ID: "goal", Description: goal}}, Intents: []b.Intent{}, Hints: []b.Hint{}}
+	g := b.Graph{Project: b.Project{ID: id, Title: title, Status: "active", Bootstrap: bootstrap, CreatedAt: t.Now, Scenario: scenario}, Facts: []b.Fact{{ID: "origin", Description: origin}, {ID: "goal", Description: goal}}, Intents: []b.Intent{}, Hints: []b.Hint{}}
 	if err = t.Save(g); err != nil {
 		return 0, nil, err
 	}

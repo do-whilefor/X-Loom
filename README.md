@@ -1,10 +1,12 @@
 # X-Loom
 
-使用 Go 重写 Cairn 的协作探索系统。一个二进制提供 `serve`、`dispatch`、`worker`；保留 Cairn 黑板图、三类任务和原 Web，使用自研的 Pi 风格两层 Agent Loop。
+使用 Go 重写 Cairn 的协作探索系统。一个二进制提供 `serve`、`dispatch`、`worker`；保留 Cairn 黑板图与三类执行任务，接入 X-Loom 三栏 Web 工作台，使用自研的 Pi 风格两层 Agent Loop。
 
 仅支持 Linux。计划与验收依据见 [DEVELOPMENT.md](DEVELOPMENT.md)，实际兼容边界见 [docs/compatibility.md](docs/compatibility.md)。
 
 [DEVELOPMENT-NEXT.md](DEVELOPMENT-NEXT.md) 的会话、压缩与 FGS 扩展已接入。新增接口和重试方式见 [FGS 与执行登记 API](docs/next-state-api.md)，恢复及图工具边界见 [执行会话](docs/session-recovery.md)，验证结果见 [下一阶段验收记录](docs/validation-next.md)。
+
+Web 首页使用真实项目、FGS 状态、事件与执行摘要，界面说明见 [Web 工作台](docs/web-workspace.md)，已完成的检查见 [Web 接入验收记录](docs/validation-web.md)。独立样式 Demo 保留在 `design/web-demo/`，经典 Cairn 管理页保留在 `/static/legacy.html`。
 
 ## 目录
 
@@ -22,7 +24,9 @@ internal/provider   Anthropic 兼容请求和流式协议
 internal/tools      read/bash/edit/write/grep/find/ls
 internal/process    Linux 执行取消与子进程清理
 container           Kali Worker 镜像、基础环境说明和检查脚本
-web/static         原 Cairn Web，原样嵌入
+web/static         X-Loom 工作台、经典 Cairn 管理页与本地静态资源
+web/tests          Web 数据转换、图模型和请求隔离测试
+design/web-demo    独立样式 Demo，不接入后端
 tests/integration  真实容器链路与真实模型的显式验收
 tests/compatibility 原 Cairn 与 Go API 差分检查
 ```
@@ -38,6 +42,8 @@ go test -race ./...
 go vet ./...
 go build -o ./bin/xloom ./cmd/xloom
 ```
+
+Web 使用原生 HTML/CSS/JavaScript，无 npm 安装或前端构建步骤。安装 Node.js 后可执行 `node --test web/tests/*.test.js`；静态资源随 Go 二进制嵌入，更新页面后需要重新构建和启动 Server。
 
 项目 Dockerfile 的构建阶段强制执行 race 测试与 vet，通过后才产出运行镜像：
 

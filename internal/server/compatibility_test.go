@@ -295,7 +295,7 @@ func TestRoutingWebAndExportContentTypes(t *testing.T) {
 		detail(t, h, "POST", path, `{}`, 404, "Not Found")
 	}
 	detail(t, h, "PATCH", "/projects/proj_001", `{}`, 405, "Method Not Allowed")
-	for _, item := range []struct{ path, typ, contains string }{{"/", "text/html", "Cairn"}, {"/static/index.html", "text/html", "Cairn"}, {"/static/favicon.svg", "image/svg+xml", "<svg"}, {"/static/vendor/alpine.min.js", "javascript", "Alpine"}, {"/projects/proj_001/export", "text/plain", "origin: Known"}, {"/projects/proj_001/export?format=timeline", "text/plain", "PROJECT CREATED"}} {
+	for _, item := range []struct{ path, typ, contains string }{{"/", "text/html", "X-Loom"}, {"/static/index.html", "text/html", "X-Loom"}, {"/static/favicon.svg", "image/svg+xml", "<svg"}, {"/static/vendor/alpine.min.js", "javascript", "Alpine"}, {"/projects/proj_001/export", "text/plain", "origin: Known"}, {"/projects/proj_001/export?format=timeline", "text/plain", "PROJECT CREATED"}} {
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, httptest.NewRequest("GET", item.path, nil))
 		if w.Code != 200 || !strings.Contains(w.Header().Get("Content-Type"), item.typ) || !strings.Contains(w.Body.String(), item.contains) {

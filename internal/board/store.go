@@ -67,7 +67,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	defer migration.Rollback()
-	if _, err = migration.Exec(schema + stateSchema + executionSchema); err != nil {
+	if _, err = migration.Exec(schema + stateSchema + executionSchema + projectMetadataSchema); err != nil {
 		migration.Rollback()
 		db.Close()
 		return nil, err
@@ -216,7 +216,7 @@ func (t *Tx) IDs() ([]string, error) {
 func (t *Tx) Load(id string) (Graph, error) {
 	g := Graph{Facts: []Fact{}, Intents: []Intent{}, Hints: []Hint{}}
 	var rw, rt, rs, rh *string
-	err := t.QueryRow("SELECT id,title,status,bootstrap_enabled,created_at,reason_worker,reason_trigger,reason_started_at,reason_last_heartbeat_at FROM projects WHERE id=?", id).Scan(&g.Project.ID, &g.Project.Title, &g.Project.Status, &g.Project.Bootstrap, &g.Project.CreatedAt, &rw, &rt, &rs, &rh)
+	err := t.QueryRow(`SELECT p.id,p.title,p.status,p.bootstrap_enabled,p.created_at,p.reason_worker,p.reason_trigger,p.reason_started_at,p.reason_last_heartbeat_at,COALESCE(m.scenario,'') FROM projects p LEFT JOIN xloom_project_metadata m ON m.project_id=p.id WHERE p.id=?`, id).Scan(&g.Project.ID, &g.Project.Title, &g.Project.Status, &g.Project.Bootstrap, &g.Project.CreatedAt, &rw, &rt, &rs, &rh, &g.Project.Scenario)
 	if errors.Is(err, sql.ErrNoRows) {
 		return g, Err(404, "Project not found")
 	}
@@ -300,6 +300,9 @@ func (t *Tx) Load(id string) (Graph, error) {
 }
 func (t *Tx) Save(g Graph) error {
 	p := g.Project
+	if p.Scenario != "" && !ValidScenario(p.Scenario) {
+		return Err(422, "scenario must be ctf, pentest or audit")
+	}
 	var rw, rt, rs, rh *string
 	if p.Reason != nil {
 		r := p.Reason
@@ -308,6 +311,13 @@ func (t *Tx) Save(g Graph) error {
 	_, err := t.Exec(`INSERT INTO projects(id,title,status,bootstrap_enabled,created_at,reason_worker,reason_trigger,reason_started_at,reason_last_heartbeat_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,status=excluded.status,bootstrap_enabled=excluded.bootstrap_enabled,reason_worker=excluded.reason_worker,reason_trigger=excluded.reason_trigger,reason_started_at=excluded.reason_started_at,reason_last_heartbeat_at=excluded.reason_last_heartbeat_at`, p.ID, p.Title, p.Status, p.Bootstrap, p.CreatedAt, rw, rt, rs, rh)
 	if err != nil {
 		return err
+	}
+	// Older graph callers omit this optional metadata. Keep their updates from
+	// silently clearing the scenario chosen by the project creator.
+	if p.Scenario != "" {
+		if _, err = t.Exec(`INSERT INTO xloom_project_metadata(project_id,scenario) VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET scenario=excluded.scenario`, p.ID, p.Scenario); err != nil {
+			return err
+		}
 	}
 	for _, f := range g.Facts {
 		if _, err = t.Exec("INSERT OR IGNORE INTO facts(id,project_id,description) VALUES(?,?,?)", f.ID, p.ID, f.Description); err != nil {

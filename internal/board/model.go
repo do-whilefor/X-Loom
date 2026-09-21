@@ -39,6 +39,7 @@ type Project struct {
 	Bootstrap bool    `json:"bootstrap_enabled"`
 	CreatedAt string  `json:"created_at"`
 	Reason    *Reason `json:"reason"`
+	Scenario  string  `json:"scenario,omitempty"`
 }
 type Graph struct {
 	Project Project  `json:"project"`
