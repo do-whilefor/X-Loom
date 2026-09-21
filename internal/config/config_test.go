@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestWorkerEnvironmentAndDuplicateNames(t *testing.T) {
@@ -68,6 +70,8 @@ func TestLoadRejectsUnknownFieldsAndMultipleDocuments(t *testing.T) {
 
 func TestExampleConfiguration(t *testing.T) {
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "example-test-token")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://api.stepfun.com/step_plan")
+	t.Setenv("ANTHROPIC_DEFAULT_FABLE_MODEL", "step-5-preview")
 	c, err := Load(filepath.Join("..", "..", "dispatch.example.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -83,5 +87,65 @@ func TestExampleConfiguration(t *testing.T) {
 	}
 	if c.Workers[0].Env["XLOOM_REASONING_EFFORT"] != "max" || c.Workers[0].Env["XLOOM_MAX_OUTPUT_TOKENS"] != "32768" {
 		t.Fatal("example is missing maximum reasoning or its output budget")
+	}
+	for key, want := range map[string]string{
+		"ANTHROPIC_AUTH_TOKEN":          "example-test-token",
+		"ANTHROPIC_BASE_URL":            "https://api.stepfun.com/step_plan",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL": "step-5-preview",
+		"ANTHROPIC_MODEL":               "step-5-preview",
+	} {
+		if c.Workers[0].Env[key] != want {
+			t.Fatalf("example did not propagate %s", key)
+		}
+	}
+}
+
+func TestExampleModelEnvironmentSwitchAndWorkerOverrides(t *testing.T) {
+	// A saved dispatch.yaml should follow changed process environment without
+	// editing provider values in that file. Scoped backend overrides still win.
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "switched-test-token")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://switch.example.invalid/anthropic")
+	t.Setenv("ANTHROPIC_DEFAULT_FABLE_MODEL", "switched-test-model")
+	t.Setenv("XLOOM_SCOPED_TEST_TOKEN", "scoped-test-token")
+	raw, err := os.ReadFile(filepath.Join("..", "..", "dispatch.example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input Config
+	if err = yaml.Unmarshal(raw, &input); err != nil {
+		t.Fatal(err)
+	}
+	input.Workers = append(input.Workers,
+		Worker{Name: "scoped", Type: "go", TaskTypes: []string{"reason"}, MaxRunning: 1, Env: map[string]string{
+			"ANTHROPIC_AUTH_TOKEN": "${XLOOM_SCOPED_TEST_TOKEN}", "ANTHROPIC_BASE_URL": "https://scoped.example.invalid/v1",
+			"ANTHROPIC_DEFAULT_FABLE_MODEL": "scoped-default-model",
+		}},
+		Worker{Name: "explicit", Type: "go", TaskTypes: []string{"explore"}, MaxRunning: 1, Env: map[string]string{
+			"ANTHROPIC_MODEL": "explicit-model", "ANTHROPIC_DEFAULT_FABLE_MODEL": "unused-default-model",
+		}},
+	)
+	raw, err = yaml.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "dispatch.yaml")
+	if err = os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []map[string]string{
+		{"ANTHROPIC_AUTH_TOKEN": "switched-test-token", "ANTHROPIC_BASE_URL": "https://switch.example.invalid/anthropic", "ANTHROPIC_DEFAULT_FABLE_MODEL": "switched-test-model", "ANTHROPIC_MODEL": "switched-test-model"},
+		{"ANTHROPIC_AUTH_TOKEN": "scoped-test-token", "ANTHROPIC_BASE_URL": "https://scoped.example.invalid/v1", "ANTHROPIC_DEFAULT_FABLE_MODEL": "scoped-default-model", "ANTHROPIC_MODEL": "scoped-default-model"},
+		{"ANTHROPIC_AUTH_TOKEN": "switched-test-token", "ANTHROPIC_BASE_URL": "https://switch.example.invalid/anthropic", "ANTHROPIC_DEFAULT_FABLE_MODEL": "unused-default-model", "ANTHROPIC_MODEL": "explicit-model"},
+	}
+	for n, env := range want {
+		for key, value := range env {
+			if loaded.Workers[n].Env[key] != value {
+				t.Fatalf("worker %s did not resolve %s according to override precedence", loaded.Workers[n].Name, key)
+			}
+		}
 	}
 }

@@ -64,6 +64,18 @@ cp .env.example .env
 docker compose up -d
 ```
 
+模型配置统一放在项目根目录 `.env`：`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL`、`ANTHROPIC_DEFAULT_FABLE_MODEL`。模板使用 StepFun 的 `https://api.stepfun.com/step_plan` 与 `step-5-preview`；`.env.example` 不包含真实密钥。Compose 将三项传入 Dispatcher，再由 `dispatch.yaml` 的 `common_env` 引用并传给 Worker。已有配置若仍硬编码地址或模型，应先按新模板把这两项改成环境变量引用，之后只需编辑根 `.env`。
+
+修改 `.env` 后，使用与原启动一致的 Compose 项目及 `-f` 参数重建 Dispatcher，让新环境生效：
+
+```sh
+docker compose up -d --no-deps --force-recreate dispatcher
+```
+
+`docker compose restart dispatcher` 不会重新注入 `.env`。模型修改不需要重建镜像；新设置用于后续 Worker 执行，不会把正在运行的模型请求热切换到另一模型。具名 Worker 的 `env` 仍优先于 `common_env`；若配置了显式 `ANTHROPIC_MODEL`，它优先于 `ANTHROPIC_DEFAULT_FABLE_MODEL`，需要随模型切换一起检查。
+
+Compose 插值时，启动终端里已导出的同名环境变量优先于根 `.env`。若编辑后仍使用旧设置，先清除终端里这三项旧导出，再重建 Dispatcher；排查时无需打印密钥值。Linux shell 可执行 `unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_DEFAULT_FABLE_MODEL` 后再运行上述 Compose 命令。
+
 使用前按上述顺序构建两张镜像。访问 <http://localhost:8000>。Server 的数据库在 `xloom-data` 卷中，项目 Worker 容器由 Dispatcher 动态创建。Server/Dispatcher 使用 Debian 上的 `xloom:dev`，Worker 使用 Kali 上的 `xloom-worker:dev`。Worker 提供 Go 程序与通用 shell、Python、JSON、文件和网络诊断工具；本轮未完整迁入原 Cairn 的安全工具及 PoC 库，详见 [容器迁移边界](docs/compatibility-container.md)。
 
 Compose 的 `worker-image` 服务仅用于显式构建：先 `docker compose build server`，再 `docker compose --profile images build worker-image`。默认 `docker compose up -d` 只启动 Server 和 Dispatcher。
@@ -72,14 +84,18 @@ Compose 的 `worker-image` 服务仅用于显式构建：先 `docker compose bui
 
 ```sh
 ./bin/xloom serve --host 127.0.0.1 --port 8000 --db-path ./data/xloom.db
+# 在另一个终端中导出本机可信的 .env，再启动 Dispatcher。
+set -a
+. ./.env
+set +a
 ./bin/xloom dispatch --config ./dispatch.yaml
 ```
 
-此时把配置的 `server` 改为实际 Server URL；Dispatcher 仍通过 Docker socket 管理项目容器。`worker --job <job.json>` 由 Dispatcher 调用；`worker --cancel <run-directory>` 只取消该次执行。
+此时把配置的 `server` 改为实际 Server URL；Go 程序不会自动读取 `.env`，重新配置后需要重新导出并启动 Dispatcher。Dispatcher 仍通过 Docker socket 管理项目容器。`worker --job <job.json>` 由 Dispatcher 调用；`worker --cancel <run-directory>` 只取消该次执行。
 
 ## 配置与行为
 
-- 指定模型默认目标为 `https://opencode.ai/zen/go`、`deepseek-v4.1-flash`；凭据只从环境注入。OpenCode Go 请求携带稳定会话标识和 X-Loom 客户端标识。
+- 交付配置使用 `.env` 中的 StepFun 地址与 `step-5-preview`，通过 Anthropic 兼容消息协议请求；凭据只从环境注入。旧配置可以继续显式指定其他兼容端点和模型。
 - 默认请求 `thinking.type=enabled` 与 `output_config.effort=max`；`XLOOM_REASONING_EFFORT` 可选 `low/high/max`。响应中的 `thinking:""` 是需要原样重放的思考块，不是强度配置。默认最大输出为 32768 token，可用 `XLOOM_MAX_OUTPUT_TOKENS` 调整；思考强度、输出上限和时间预算分别管理。
 - `timeout: 0` 禁用任务探索时间预算，不禁用模型请求、工具或独立收尾超时。没有固定模型轮次/工具总次数上限。
 - 非零探索预算在当前轮次完成后切换收尾；运行时内联图与本次执行的有界证据快照，收尾阶段关闭全部工具，独立截止到期后结束执行。

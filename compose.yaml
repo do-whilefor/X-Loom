@@ -25,6 +25,8 @@ services:
     command: ["dispatch", "--config", "/etc/xloom/dispatch.yaml"]
     environment:
       ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.stepfun.com/step_plan}
+      ANTHROPIC_DEFAULT_FABLE_MODEL: ${ANTHROPIC_DEFAULT_FABLE_MODEL:-step-5-preview}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./dispatch.yaml:/etc/xloom/dispatch.yaml:ro
