@@ -29,6 +29,7 @@ func (t *Tx) RestartProject(project string, expected *int64) (Graph, error) {
 		return Graph{}, err
 	}
 	for _, query := range []string{
+		"DELETE FROM xloom_project_termination WHERE project_id=?",
 		"DELETE FROM xloom_state_actions WHERE project_id=?",
 		"DELETE FROM xloom_state_events WHERE project_id=?",
 		"DELETE FROM xloom_state WHERE project_id=?",
@@ -43,6 +44,7 @@ func (t *Tx) RestartProject(project string, expected *int64) (Graph, error) {
 	g.Project.Status, g.Project.Reason = "active", nil
 	g.Project.Generation++
 	g.Project.RestartedAt = t.Now
+	g.Project.TerminatedAt = ""
 	g.Facts, g.Intents = inputs, []Intent{}
 	if _, err = t.Exec(`INSERT INTO xloom_project_rounds(project_id,generation,restarted_at) VALUES(?,?,?) ON CONFLICT(project_id) DO UPDATE SET generation=excluded.generation,restarted_at=excluded.restarted_at`, project, g.Project.Generation, t.Now); err != nil {
 		return Graph{}, err

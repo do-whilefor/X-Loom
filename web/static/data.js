@@ -11,7 +11,7 @@
     Object.freeze({id:'audit', name:'代码审计', description:'从代码到可追溯的结论', icon:'code'})
   ]);
   const NAMES = Object.freeze({
-    active:'进行中', running:'进行中', paused:'已暂停', stopped:'已暂停', completed:'已完成',
+    active:'进行中', running:'进行中', paused:'已暂停', stopped:'已暂停', completed:'已完成', terminated:'已终止',
     open:'待执行', achieved:'已达成', withdrawn:'已撤回', abandoned:'已放弃',
     valid:'有效', input:'项目输入', superseded:'已被替代', refuted:'已反驳', narrowed:'范围已收窄',
     candidate:'待验证', verified:'已验证', failed:'执行失败', rejected:'结果被拒绝', cancelled:'已取消',
@@ -80,6 +80,13 @@
     return true;
   }
 
+  function terminationTime(project) {
+    if (project.status !== 'terminated') return null;
+    const terminated = timestamp(project.terminated_at);
+    const restarted = timestamp(project.restarted_at);
+    return terminated !== null && (restarted === null || terminated >= restarted) ? terminated : null;
+  }
+
   function projectTiming(state, executions = []) {
     state = object(state);
     const graph = object(state.graph), project = object(graph.project);
@@ -103,7 +110,12 @@
     const started = starts.length ? Math.min(...starts) : null;
     const rootGoal = array(state.goals).find(goal => goal && goal.id === 'goal');
     const ends = [];
-    if (project.status === 'completed' && (!rootGoal || rootGoal.status === 'achieved')) {
+    if (project.status === 'terminated') {
+      // Termination ends the round without claiming that the root goal was
+      // achieved. Only the persisted termination time can close this round.
+      const terminated = terminationTime(project);
+      if (terminated !== null && (started === null || terminated >= started)) ends.push(terminated);
+    } else if (project.status === 'completed' && (!rootGoal || rootGoal.status === 'achieved')) {
       for (const item of array(graph.intents)) {
         const intent = object(item);
         if (intent.to !== 'goal') continue;
@@ -268,6 +280,11 @@
     if (Number.isInteger(project.generation) && project.generation > 0 && timestamp(project.restarted_at) !== null) {
       add({...base('project:' + string(project.id) + ':restart:' + project.generation,project.restarted_at,'state'),
         title:'项目已重启',body:'已清空本轮任务图、发现、执行记录和日志，保留原始输入、目标和补充提示，等待重新执行。'});
+    }
+    if (terminationTime(project) !== null) {
+      const generation = Number.isInteger(project.generation) ? project.generation : 0;
+      add({...base('project:' + string(project.id) + ':terminate:' + generation,project.terminated_at,'state'),
+        title:'项目已终止',body:'本轮已终止，不再调度任务。已有任务图、发现、执行记录和日志已保留。'});
     }
     for (const [key,event] of orderedEvents) {
       const payload = object(event.payload), result = object(event.result);

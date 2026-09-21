@@ -71,6 +71,9 @@ func (t *Tx) SetStatus(g *Graph, status string) error {
 	if g.Project.Status == "completed" {
 		return Err(409, "Completed projects cannot change status")
 	}
+	if g.Project.Status == "terminated" {
+		return Err(409, "Terminated projects require an explicit restart")
+	}
 	if g.Project.Status == status {
 		return nil
 	}

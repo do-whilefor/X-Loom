@@ -6,14 +6,14 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
   <title>X-Loom · 工作台</title>
   <link rel="icon" href="/static/xloom.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/style.css?v=flow-1">
+  <link rel="stylesheet" href="/static/style.css?v=terminate-1">
   <script defer src="/static/vendor/cytoscape.min.js"></script>
   <script defer src="/static/vendor/dagre.min.js"></script>
   <script defer src="/static/vendor/cytoscape-dagre.js"></script>
-  <script defer src="/static/api.js?v=flow-1"></script>
-  <script defer src="/static/data.js?v=flow-1"></script>
-  <script defer src="/static/graph.js?v=flow-1"></script>
-  <script defer src="/static/app.js?v=flow-1"></script>
+  <script defer src="/static/api.js?v=terminate-1"></script>
+  <script defer src="/static/data.js?v=terminate-1"></script>
+  <script defer src="/static/graph.js?v=terminate-1"></script>
+  <script defer src="/static/app.js?v=terminate-1"></script>
 </head>
 <body>
   <svg class="icon-library" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
@@ -33,6 +33,7 @@
     <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M12 4v16m-6-6 6 6 6-6"/></symbol>
     <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
     <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
     <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></symbol>
     <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></symbol>
     <symbol id="i-restart" viewBox="0 0 24 24"><path d="M3 4v6h6M3 10a9 9 0 1 1 1 9"/></symbol>
@@ -57,7 +58,7 @@
     <div class="workspace">
       <main class="center-pane">
         <header class="project-heading"><div class="project-title-row"><h1 id="project-title"></h1><span class="project-status" id="project-status"></span></div><div class="project-meta" id="project-meta"><span id="project-scenario"></span><i></i><span id="project-progress"></span><i></i><span class="project-timing">开始 <time id="project-start"></time></span><i></i><span class="project-timing">结束 <time id="project-end"></time></span></div></header>
-        <div class="graph-toolbar"><div class="view-tabs" role="tablist" aria-label="项目视图"><button class="graph-tab" id="graph-tab" role="tab" aria-selected="true" aria-controls="graph-stage"><svg class="icon"><use href="#i-graph"/></svg>任务图<span id="node-count">0</span></button><button class="graph-tab" id="findings-tab" role="tab" aria-selected="false" aria-controls="findings-view" tabindex="-1"><svg class="icon"><use href="#i-shield"/></svg>发现<span id="finding-count">0</span></button></div><div class="task-controls" role="group" aria-label="当前项目操作"><button class="task-action" id="toggle-running"><svg class="icon"><use href="#i-pause"/></svg><span>暂停</span></button><button class="task-action hint-action" id="add-hint"><svg class="icon"><use href="#i-message"/></svg><span>补充提示</span></button></div></div>
+        <div class="graph-toolbar"><div class="view-tabs" role="tablist" aria-label="项目视图"><button class="graph-tab" id="graph-tab" role="tab" aria-selected="true" aria-controls="graph-stage"><svg class="icon"><use href="#i-graph"/></svg>任务图<span id="node-count">0</span></button><button class="graph-tab" id="findings-tab" role="tab" aria-selected="false" aria-controls="findings-view" tabindex="-1"><svg class="icon"><use href="#i-shield"/></svg>发现<span id="finding-count">0</span></button></div><div class="task-controls" role="group" aria-label="当前项目操作"><button class="task-action" id="toggle-running"><svg class="icon"><use href="#i-pause"/></svg><span>暂停</span></button><button class="task-action terminate-action" id="terminate-project" title="目标未完成，但不再继续此项目" hidden><svg class="icon"><use href="#i-stop"/></svg><span>终止</span></button><button class="task-action hint-action" id="add-hint"><svg class="icon"><use href="#i-message"/></svg><span>补充提示</span></button></div></div>
         <div id="workspace-error" class="workspace-error" role="alert" hidden></div>
         <section class="graph-stage" id="graph-stage" role="tabpanel" aria-labelledby="graph-tab">
           <div id="graph-host" aria-label="从起点到终点目标的任务图"></div>
@@ -103,7 +104,7 @@
     </form>
   </dialog>
   <dialog id="manage-dialog" aria-labelledby="manage-title"><form id="manage-form" novalidate><h2 id="manage-title"></h2><p id="manage-project" class="dialog-project"></p><label id="manage-label" class="field-label" for="manage-input"></label><textarea id="manage-input" maxlength="32768" rows="4"></textarea><p id="manage-warning"></p><p class="form-error" id="manage-error" role="alert"></p><div class="dialog-footer"><button class="button secondary" type="button" id="cancel-manage">取消</button><button class="button primary" type="submit" id="submit-manage">保存</button></div></form></dialog>
-  <dialog id="about-dialog" aria-labelledby="about-title"><div class="dialog-top"><span class="dialog-mark"><svg class="icon"><use href="#i-info"/></svg></span><button class="icon-button" id="close-about" aria-label="关闭说明"><svg class="icon"><use href="#i-close"/></svg></button></div><h2 id="about-title">X-Loom 工作台</h2><p>点击节点在右侧查看完整记录；拖动画布平移，滚轮缩放。图中的支持、反驳与替代关系均来自实际记录。</p><p>暂停会取消当前执行并保留图和记录；继续由调度器重新安排执行。重启会清空本轮任务图、执行记录和日志，从原目标重新开始。</p><div class="help-actions"><button class="button secondary" data-action="rename">重命名当前项目</button><a class="button secondary" id="export-state" download>导出任务图</a><a class="button secondary" id="export-timeline" download>导出时间线</a><a class="button secondary" href="/static/legacy.html" target="_blank" rel="noopener">经典管理界面</a></div><div class="dialog-footer"><span>N 创建项目 · / 搜索项目</span><button class="button primary" id="acknowledge-help">知道了</button></div></dialog>
+  <dialog id="about-dialog" aria-labelledby="about-title"><div class="dialog-top"><span class="dialog-mark"><svg class="icon"><use href="#i-info"/></svg></span><button class="icon-button" id="close-about" aria-label="关闭说明"><svg class="icon"><use href="#i-close"/></svg></button></div><h2 id="about-title">X-Loom 工作台</h2><p>点击节点在右侧查看完整记录；拖动画布平移，滚轮缩放。图中的支持、反驳与替代关系均来自实际记录。</p><p>暂停会取消执行并停止项目容器，保留图、记录和工作目录；继续由调度器重新安排执行。终止表示目标未完成但不再继续，同样停止容器并保留证据，只有明确重启才能重新运行。停止后的容器和文件仍占磁盘，公共服务继续运行。重启会清空本轮任务图、执行记录和日志，从原目标重新开始。</p><div class="help-actions"><button class="button secondary" data-action="rename">重命名当前项目</button><a class="button secondary" id="export-state" download>导出任务图</a><a class="button secondary" id="export-timeline" download>导出时间线</a><a class="button secondary" href="/static/legacy.html" target="_blank" rel="noopener">经典管理界面</a></div><div class="dialog-footer"><span>N 创建项目 · / 搜索项目</span><button class="button primary" id="acknowledge-help">知道了</button></div></dialog>
   <div class="toast" id="toast" role="status" hidden></div>
 </body>
 </html>

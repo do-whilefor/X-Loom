@@ -84,7 +84,8 @@
     }));
   }
   function renderHeader() {
-    const project = current(), running = project?.status === 'active', completed = project?.status === 'completed';
+    const project = current(), running = project?.status === 'active', completed = project?.status === 'completed', terminated = project?.status === 'terminated';
+    const ended = completed || terminated;
     $('breadcrumb-title').textContent = project?.title || '工作台';
     $('project-title').textContent = project?.title || (connected ? '创建你的第一个项目' : '正在加载项目');
     $('project-status').textContent = project ? data.statusName(project.status) : '';
@@ -93,15 +94,17 @@
     $('project-meta').hidden = !project;
     const progress = data.taskProgress(state), timing = data.projectTiming(state,executions);
     $('project-progress').textContent = progress.completed + ' / ' + progress.total + ' 个任务已完成';
-    for (const [id,time,empty] of [['project-start',timing.startedAt,completed ? '未记录' : '尚未开始'],['project-end',timing.endedAt,completed ? '未记录' : '尚未结束']]) {
+    for (const [id,time,empty] of [['project-start',timing.startedAt,ended ? '未记录' : '尚未开始'],['project-end',timing.endedAt,ended ? '未记录' : '尚未结束']]) {
       $(id).textContent = time ? data.formatTime(time) : empty;
       if (time) $(id).dateTime = time; else $(id).removeAttribute('datetime');
     }
-    $('toggle-running').replaceChildren(icon(completed ? 'check' : running ? 'pause' : 'play'),el('span','',completed ? '已完成' : running ? '暂停' : '继续'));
-    $('toggle-running').disabled = !project || completed || mutating || !connected;
-    $('toggle-running').title = running ? '暂停并取消当前执行，保留已有图和记录' : completed ? '项目已完成，可在左侧重启' : '重新调度未完成任务';
-    $('add-hint').disabled = !project || completed || mutating || !connected;
-    $('add-hint').title = completed ? '已完成项目需先重启再补充提示' : '';
+    $('toggle-running').replaceChildren(icon(terminated ? 'stop' : completed ? 'check' : running ? 'pause' : 'play'),el('span','',terminated ? '已终止' : completed ? '已完成' : running ? '暂停' : '继续'));
+    $('toggle-running').disabled = !project || ended || mutating || !connected;
+    $('toggle-running').title = running ? '暂停并取消当前执行，保留已有图和记录' : terminated ? '项目已终止，重新执行需在左侧重启' : completed ? '项目已完成，可在左侧重启' : '重新调度未完成任务';
+    $('terminate-project').hidden = !project || ended;
+    $('terminate-project').disabled = mutating || !connected;
+    $('add-hint').disabled = !project || ended || mutating || !connected;
+    $('add-hint').title = ended ? '项目已结束，需先重启再补充提示' : '';
     $('new-project').disabled = $('empty-create').disabled = mutating;
     $('refresh-project').disabled = mutating;
     $('node-count').textContent = graph.getVisibleNodeCount();
@@ -379,7 +382,7 @@
   }
   const mutationError = error => error.message + (error.status === 0 ? '；结果未确认，请先刷新核对，避免重复操作。' : '');
   $('toggle-running').addEventListener('click',async () => {
-    const project = current(); if (!project || mutating || project.status === 'completed' || !connected) return;
+    const project = current(); if (!project || mutating || !['active','stopped'].includes(project.status) || !connected) return;
     const next = project.status === 'active' ? 'stopped' : 'active'; startMutation();
     try { await api.request(pathFor(project.id) + '/status',{method:'PUT',body:{status:next}}); toast(next === 'stopped' ? '项目已暂停，当前执行已取消' : '项目已继续调度'); }
     catch (error) { toast(mutationError(error)); }
@@ -388,19 +391,22 @@
   function openManagement(action,id) {
     if (mutating || !connected) return;
     const project = projects.find(item => item.id === id); if (!project) return;
+    if (action === 'terminate' && !['active','stopped'].includes(project.status)) return;
     $('about-dialog').close(); closeProjectMenus();
     management = {action,id,generation:project.generation || 0}; $('manage-error').textContent = '';
-    const labels = {rename:['重命名项目','新名称','保存'],restart:['重启项目','','重启项目'],delete:['删除项目','','删除项目']}[action];
+    const labels = {rename:['重命名项目','新名称','保存'],restart:['重启项目','','重启项目'],terminate:['终止项目','','终止项目'],delete:['删除项目','','删除项目']}[action];
     if (!labels) return;
     $('manage-title').textContent = labels[0]; $('manage-label').textContent = labels[1]; $('submit-manage').textContent = labels[2];
     $('manage-project').textContent = project.title; $('manage-input').value = action === 'rename' ? project.title : '';
     $('manage-input').maxLength = 200; $('manage-input').hidden = $('manage-label').hidden = action !== 'rename';
     $('manage-warning').textContent = action === 'delete' ? '将永久删除此项目及其任务图、发现、执行记录和提示，并取消尚未结束的执行。'
-      : action === 'restart' ? '将取消当前执行，清空本轮任务图、发现、执行记录和日志，从原始目标重新开始。保留项目名称、创建时间、原始输入和补充提示。此操作无法撤销。' : '';
-    $('submit-manage').className = 'button ' + (action === 'delete' ? 'danger-button' : 'primary');
+      : action === 'restart' ? '将取消当前执行，清空本轮任务图、发现、执行记录和日志，从原始目标重新开始。保留项目名称、创建时间、原始输入和补充提示。此操作无法撤销。'
+      : action === 'terminate' ? '停止调度和当前执行，并停止项目容器。保留任务图、发现、日志和证据文件，目标不会被标记为完成。终止后不能直接继续；需要重新执行时，请在左侧选择重启项目。' : '';
+    $('submit-manage').className = 'button ' + (['delete','terminate'].includes(action) ? 'danger-button' : 'primary');
     $('manage-dialog').showModal(); $('cancel-manage').focus();
   }
   document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click',() => openManagement(button.dataset.action,selectedId)));
+  $('terminate-project').addEventListener('click',() => openManagement('terminate',selectedId));
   $('cancel-manage').addEventListener('click',() => $('manage-dialog').close());
   $('manage-dialog').addEventListener('close',() => { management = null; });
   $('manage-dialog').addEventListener('cancel',event => { if (mutating) event.preventDefault(); });
@@ -413,17 +419,18 @@
       const base = pathFor(command.id);
       if (command.action === 'delete') await api.request(base,{method:'DELETE'});
       if (command.action === 'restart') await api.request(base + '/restart',{method:'POST',body:{expected_generation:command.generation}});
+      if (command.action === 'terminate') await api.request(base + '/terminate',{method:'POST',body:{expected_generation:command.generation}});
       if (command.action === 'rename') await api.request(base + '/title',{method:'PUT',body:{title:value}});
       $('manage-dialog').close();
-      if (command.action !== 'rename') eventCache.delete(command.id);
+      if (['delete','restart'].includes(command.action)) eventCache.delete(command.id);
       if (command.action === 'delete' && selectedId === command.id) resetSelection('');
       if (command.action === 'restart') resetSelection(command.id);
-      toast(command.action === 'delete' ? '项目已删除' : command.action === 'restart' ? '项目已重启，等待重新执行' : '项目名称已保存');
+      toast(command.action === 'delete' ? '项目已删除' : command.action === 'restart' ? '项目已重启，等待重新执行' : command.action === 'terminate' ? '项目已终止，后台正在停止执行与容器' : '项目名称已保存');
     } catch (error) { $('manage-error').textContent = mutationError(error); }
     finally { $('submit-manage').disabled = $('cancel-manage').disabled = false; await finishMutation(); }
   });
   function openHint() {
-    const project = current(); if (!project || project.status === 'completed' || mutating || !connected) return;
+    const project = current(); if (!project || !['active','stopped'].includes(project.status) || mutating || !connected) return;
     hintProjectId = project.id;
     $('hint-form').reset(); $('hint-error').textContent = ''; $('hint-length').textContent = '0'; $('hint-project').textContent = project.title;
     const hints = state?.graph?.hints || [];

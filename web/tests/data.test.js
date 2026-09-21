@@ -280,6 +280,7 @@ test('status phase and node display names are Chinese while log phase enums stay
   assert.equal(data.statusName('active'),'进行中');
   assert.equal(data.statusName('running'),'进行中');
   assert.equal(data.statusName('stopped'),'已暂停');
+  assert.equal(data.statusName('terminated'),'已终止');
   assert.deepEqual(['Bootstrap','Decide','Execute','Model','System'].map(data.phaseName),['启动引导','决策','执行','模型结论','系统']);
   assert.deepEqual(['start','step','fact','finding','goal'].map(data.nodeTypeName),['起点','任务','事实','发现','目标']);
   assert.equal(data.phaseName('unknown'),'unknown');
@@ -303,6 +304,8 @@ test('task progress counts actual steps rather than deduplicating shared worker 
   state.graph.project.status = 'stopped';
   assert.deepEqual(data.taskProgress(state),{completed:1,total:6,running:0});
   state.graph.project.status = 'completed';
+  assert.equal(data.taskProgress(state).running,0);
+  state.graph.project.status = 'terminated';
   assert.equal(data.taskProgress(state).running,0);
 });
 
@@ -454,4 +457,76 @@ test('missing invalid or initial-round restart metadata cannot fabricate a resta
     Object.assign(state.graph.project,metadata);
     assert.equal(data.buildLogs(state).some(log => log.title === '项目已重启'),false);
   }
+});
+
+test('termination uses its persisted time without requiring or claiming goal completion', () => {
+  const state = fixture();
+  Object.assign(state.graph.project,{status:'terminated',terminated_at:'2026-09-21T01:10:07Z'});
+  const executions = [{id:'run',project_id:'project-a',status:'cancelled',created_at:'2026-09-21T01:01:00Z',updated_at:'2026-09-21T01:10:09Z'}];
+  const original = structuredClone({state,executions});
+  assert.deepEqual(data.projectTiming(state,executions),{
+    startedAt:'2026-09-21T01:01:00.000Z',endedAt:'2026-09-21T01:10:07.000Z'
+  });
+  assert.deepEqual(data.projectTiming(state),{startedAt:null,endedAt:'2026-09-21T01:10:07.000Z'});
+  assert.equal(state.goals[0].status,'open');
+  const logs = data.buildLogs(state,[],executions);
+  const terminated = logs.filter(log => log.title === '项目已终止');
+  assert.equal(terminated.length,1);
+  assert.equal(terminated[0].id,'project:project-a:terminate:0');
+  assert.equal(terminated[0].time,'2026-09-21T01:10:07Z');
+  assert.equal(terminated[0].source,'state');
+  assert.equal(terminated[0].phase,'System');
+  assert.equal(terminated[0].kind,undefined);
+  assert.match(terminated[0].body,/不再调度任务/);
+  assert.doesNotMatch(terminated[0].body,/达成|完成目标/);
+  assert.equal(data.formatTime(terminated[0].time),'2026-09-21 09:10:07');
+  assert.deepEqual(data.buildLogs(state,[],executions),logs,'repeated projection preserves the persisted time');
+  assert.deepEqual({state,executions},original);
+});
+
+test('a terminated project never falls back to goal conclusions or the last task end', () => {
+  for (const ended of [undefined,null,'','invalid','09:10:07']) {
+    const state = fixture();
+    Object.assign(state.graph.project,{status:'terminated',terminated_at:ended});
+    state.goals[0].status = 'achieved';
+    state.graph.intents.push({id:'goal-result',to:'goal',concluded_at:'2026-09-21T01:11:00Z'});
+    assert.equal(data.projectTiming(state,[{id:'run',status:'succeeded',created_at:'2026-09-21T01:01:00Z',updated_at:'2026-09-21T01:12:00Z'}]).endedAt,null);
+    assert.equal(data.buildLogs(state).some(log => log.title === '项目已终止'),false);
+  }
+  const state = fixture();
+  Object.assign(state.graph.project,{status:'terminated',terminated_at:'2026-09-21T01:10:07Z'});
+  state.goals[0].status = 'achieved';
+  state.graph.intents.push({id:'goal-result',to:'goal',concluded_at:'2026-09-21T01:11:00Z'});
+  assert.equal(data.projectTiming(state).endedAt,'2026-09-21T01:10:07.000Z');
+  assert.equal(data.projectTiming(state,[{id:'inconsistent',status:'running',created_at:'2026-09-21T01:20:00Z'}]).endedAt,null,'end cannot precede the recorded start');
+});
+
+test('restart removes prior termination time and log while retaining the new round restart log', () => {
+  const state = fixture();
+  Object.assign(state.graph.project,{status:'terminated',generation:1,restarted_at:'2026-09-21T02:00:00Z',terminated_at:'2026-09-21T02:10:00Z'});
+  assert.equal(data.buildLogs(state).find(log => log.title === '项目已终止').id,'project:project-a:terminate:1');
+  Object.assign(state.graph.project,{status:'active',generation:2,restarted_at:'2026-09-21T03:00:00Z'});
+  delete state.graph.project.terminated_at;
+  assert.equal(data.projectTiming(state).endedAt,null);
+  assert.equal(data.buildLogs(state).some(log => log.title === '项目已终止'),false);
+  assert.equal(data.buildLogs(state).filter(log => log.title === '项目已重启').length,1);
+  state.graph.project.terminated_at = '2026-09-21T02:10:00Z';
+  assert.equal(data.projectTiming(state).endedAt,null,'active state cannot be terminated by stale metadata');
+  assert.equal(data.buildLogs(state).some(log => log.title === '项目已终止'),false);
+  state.graph.project.status = 'terminated';
+  assert.equal(data.projectTiming(state).endedAt,null,'earlier-round timestamp cannot terminate this round');
+  assert.equal(data.buildLogs(state).some(log => log.title === '项目已终止'),false);
+});
+
+test('termination metadata does not alter active paused or completed end-time contracts', () => {
+  const state = fixture();
+  state.graph.project.terminated_at = '2026-09-21T01:10:00Z';
+  for (const status of ['active','paused','stopped','completed']) {
+    state.graph.project.status = status;
+    assert.equal(data.projectTiming(state).endedAt,null);
+    assert.equal(data.buildLogs(state).some(log => log.title === '项目已终止'),false);
+  }
+  state.goals[0].status = 'achieved';
+  state.graph.intents.push({id:'completed-root',to:'goal',concluded_at:'2026-09-21T01:12:00Z'});
+  assert.equal(data.projectTiming(state).endedAt,'2026-09-21T01:12:00.000Z');
 });

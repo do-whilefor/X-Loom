@@ -55,8 +55,9 @@ func New(store *b.Store) http.Handler {
 		"PUT /projects/{pid}/title": s.title, "PUT /projects/{pid}/status": s.status,
 		"POST /projects/{pid}/hints": s.hint, "POST /projects/{pid}/intents": s.intent,
 		"POST /projects/{pid}/complete": s.complete, "POST /projects/{pid}/reopen": s.reopen,
-		"POST /projects/{pid}/restart": s.restart,
-		"GET /projects/{pid}/export":   s.export,
+		"POST /projects/{pid}/restart":   s.restart,
+		"POST /projects/{pid}/terminate": s.terminate,
+		"GET /projects/{pid}/export":     s.export,
 	} {
 		m.HandleFunc(pattern, s.wrap(fn))
 	}
