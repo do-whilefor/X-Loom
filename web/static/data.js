@@ -59,10 +59,10 @@
     return string(record.reason) ? description + '\n\n' + record.reason : description;
   }
 
-  function findingSupport(finding, facts) {
+  function sourceSupport(record, facts) {
     // State computes support_valid; event results are stored before that computation.
-    if (typeof finding.support_valid === 'boolean') return finding.support_valid;
-    const sources = refs(finding.sources);
+    if (typeof record.support_valid === 'boolean') return record.support_valid;
+    const sources = refs(record.sources);
     return sources.length > 0 && sources.every(source => facts.get(source.id)?.status === 'valid');
   }
 
@@ -79,24 +79,33 @@
       title:({goal:'目标',step:'步骤',fact:'事实',finding:'关键结论'}[type] || type) + ' · ' + statusName(status),
       level:['failed','refuted','superseded','abandoned','withdrawn'].includes(status) ? 'warning' : 'info',
       evidence:refs(type === 'step' ? record.from : record.sources)};
-    if (type === 'fact' || type === 'finding') log.scope = string(record.scope);
-    if (type === 'finding') {
-      log.kind = 'model';
-      log.phase = 'Model';
-      log.supportValid = findingSupport(record, facts);
-      log.statusLabel = findingLabel(record, log.supportValid);
-      log.title = '关键结论 · ' + log.statusLabel;
-      log.level = status === 'verified' && log.supportValid ? 'success' : status === 'candidate' ? 'info' : 'warning';
+    if (type === 'fact' || type === 'finding') {
+      log.scope = string(record.scope);
       log.artifacts = array(record.evidence).map(evidence => ({
         run_id:string(evidence.run_id),path:string(evidence.path),excerpt:string(evidence.excerpt),
         start_line:Number(evidence.start_line) || 0,end_line:Number(evidence.end_line) || 0
       }));
     }
+    if (type === 'goal' && status === 'achieved') {
+      log.supportValid = sourceSupport(record, facts);
+      if (!log.supportValid) {
+        log.title += ' · 证据失效';
+        log.level = 'warning';
+      }
+    }
+    if (type === 'finding') {
+      log.kind = 'model';
+      log.phase = 'Model';
+      log.supportValid = sourceSupport(record, facts);
+      log.statusLabel = findingLabel(record, log.supportValid);
+      log.title = '关键结论 · ' + log.statusLabel;
+      log.level = status === 'verified' && log.supportValid ? 'success' : status === 'candidate' ? 'info' : 'warning';
+    }
     return log;
   }
 
   function fingerprint(log) {
-    return JSON.stringify([nodeKey(log.node),log.body,log.status,log.scope,log.supportValid,log.evidence]);
+    return JSON.stringify([nodeKey(log.node),log.body,log.status,log.scope,log.supportValid,log.evidence,log.artifacts]);
   }
 
   function parseFinal(text) {
@@ -148,7 +157,10 @@
     const graph = object(state.graph), project = object(graph.project);
     const rows = [], identities = new Set(), represented = new Set();
     const facts = new Map(array(state.fact_records).map(fact => [fact.id,fact]));
-    const currentFindings = new Map(array(state.findings).map(finding => [finding.id,finding]));
+    const currentSupportRecords = {
+      finding:new Map(array(state.findings).map(finding => [finding.id,finding])),
+      goal:new Map(array(state.goals).map(goal => [goal.id,goal]))
+    };
     const intents = new Map(array(graph.intents).map(intent => [intent.id,intent]));
     const uniqueEvents = new Map();
     for (const event of array(events)) {
@@ -174,14 +186,14 @@
       const common = {...base('event:' + key,event.created_at,'event',event.run_id),revision:event.revision};
       if (['goal','step','fact','finding'].includes(event.op)) {
         let record = {...payload,...result,id:string(event.id) || string(result.id)};
-        if (event.op === 'finding') {
+        if (event.op === 'finding' || event.op === 'goal') {
           // Stored event support_valid defaults false. Use current authoritative state
           // for the latest event, and current source effectiveness for older evidence.
           delete record.support_valid;
-          const current = currentFindings.get(record.id);
+          const current = currentSupportRecords[event.op].get(record.id);
           const snapshotCoversEvent = Number.isSafeInteger(state.revision) && Number.isSafeInteger(event.revision)
             && state.revision >= event.revision;
-          if (current && snapshotCoversEvent && lastEvent.get('finding:' + record.id) === key) record = {...record,...current};
+          if (current && snapshotCoversEvent && lastEvent.get(event.op + ':' + record.id) === key) record = {...record,...current};
         }
         const log = recordLog(record,event.op,{...common,phase:['goal','step'].includes(event.op) ? 'Decide' : 'Execute'},facts);
         add(log);

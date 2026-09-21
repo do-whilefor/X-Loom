@@ -69,6 +69,54 @@ test('paginated duplicate events collapse and equivalent state is suppressed', (
   assert.equal(logs.filter(log => log.id === 'event:1').length,1);
 });
 
+test('fact logs retain full node content, scope and structured evidence after the graph popup is removed', () => {
+  const state = fixture();
+  const evidence = {run_id:'run-2',path:'/workspace/proof.txt',start_line:12,end_line:14,excerpt:'<script>plain evidence</script>\nHTTP 403'};
+  Object.assign(state.fact_records[0], {
+    description:'完整事实内容'.repeat(100),scope:'只验证匿名请求',evidence:[evidence]
+  });
+  const before = structuredClone(state);
+  const log = data.buildLogs(state).find(log => log.node?.type === 'fact' && log.node.id === 'f1');
+  assert.equal(log.body,state.fact_records[0].description);
+  assert.equal(log.scope,'只验证匿名请求');
+  assert.deepEqual(log.artifacts,[evidence]);
+  assert.notEqual(log.kind,'model');
+  log.artifacts[0].excerpt = 'changed';
+  assert.deepEqual(state,before,'log evidence must be detached from the source state');
+});
+
+test('a fact snapshot with evidence missing from its event is still available in the log', () => {
+  const state = fixture();
+  const fact = state.fact_records[0];
+  fact.evidence = [{run_id:'run-2',path:'/workspace/proof.txt',start_line:1,end_line:1,excerpt:'HTTP 403'}];
+  const event = {revision:1,op:'fact',id:fact.id,created_at:fact.observed_at,result:{...fact,evidence:[]}};
+  const logs = data.buildLogs(state,[event]).filter(log => log.node?.type === 'fact' && log.node.id === fact.id);
+  assert.equal(logs.length,2);
+  assert.deepEqual(logs.find(log => log.source === 'state').artifacts,fact.evidence);
+  assert.equal(data.buildLogs(state,[{...event,result:fact}]).filter(log => log.node?.type === 'fact' && log.node.id === fact.id).length,1);
+});
+
+test('goal logs retain reasons, source links and authoritative support warnings', () => {
+  const state = fixture();
+  const goal = state.goals[0];
+  Object.assign(goal,{status:'achieved',sources:['f1'],reason:'由响应证据确认',support_valid:true});
+  const event = {revision:3,op:'goal',id:goal.id,created_at:goal.created_at,result:{...goal,support_valid:false}};
+  const logs = data.buildLogs(state,[event]).filter(log => log.node?.type === 'goal');
+  assert.equal(logs.length,1,'equivalent state must not duplicate the goal event');
+  assert.equal(logs[0].supportValid,true,'event defaults must not hide current support');
+  assert.doesNotMatch(logs[0].title,/证据失效/);
+  assert.match(logs[0].body,/由响应证据确认/);
+  assert.deepEqual(logs[0].evidence,[{type:'fact',id:'f1'}]);
+  goal.support_valid = false;
+  const invalid = data.buildLogs(state,[event]).find(log => log.node?.type === 'goal');
+  assert.equal(invalid.supportValid,false);
+  assert.equal(invalid.level,'warning');
+  assert.match(invalid.title,/证据失效/);
+  goal.status = 'open';
+  const open = data.buildLogs(state).find(log => log.node?.type === 'goal');
+  assert.doesNotMatch(open.title,/证据失效/,'open goals do not claim completed support');
+});
+
 test('same node transitions stay in timeline without repeated final snapshot', () => {
   const state = fixture();
   const finding = state.findings[0];

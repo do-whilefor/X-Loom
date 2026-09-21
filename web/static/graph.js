@@ -4,7 +4,10 @@
   if (typeof module === 'object' && module.exports) module.exports = api;
   else {
     root.XLoomGraph = api.XLoomGraph;
-    root.XLoomGraphData = {mapState: api.mapState, resolveNodeKey: api.resolveNodeKey};
+    root.XLoomGraphData = {
+      mapState: api.mapState, resolveNodeKey: api.resolveNodeKey,
+      formatNodeLabel: api.formatNodeLabel, createTextMeasurer: api.createTextMeasurer, LABEL_LAYOUT: api.LABEL_LAYOUT
+    };
   }
 }(typeof window === 'object' ? window : globalThis, function (root) {
   'use strict';
@@ -18,6 +21,14 @@
   const RELATION_LABELS = {supersedes: '取代', refutes: '反驳', narrows: '收窄'};
   const COLORS = {goal: '#668b73', step: '#ba9558', fact: '#6a90ac', finding: '#a080b0'};
   const BACKGROUNDS = {goal: '#f4f9f5', step: '#fffaf1', fact: '#f5f9fc', finding: '#faf6fc'};
+  // Three measured lines fit inside the unchanged 220 x 80 card: one status
+  // line and two content lines, 55.8px high with at least 10px vertical inset.
+  const LABEL_LAYOUT = Object.freeze({
+    width: 220, height: 80, fontSize: 12, lineHeight: 1.55,
+    fontFamily: 'Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif',
+    insetX: 12, insetY: 10, maxLines: 3, measureSlack: 2
+  });
+  const LABEL_FONT = 'normal normal ' + LABEL_LAYOUT.fontSize + 'px ' + LABEL_LAYOUT.fontFamily;
   const array = value => Array.isArray(value) ? value : [];
   const strings = value => array(value).filter(item => typeof item === 'string' && item.length > 0);
   const clone = value => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -27,6 +38,86 @@
     const chars = Array.from(text(value).replace(/\s+/g, ' ').trim());
     return chars.length > limit ? chars.slice(0, limit - 1).join('') + '…' : chars.join('');
   };
+
+  const segmenter = typeof Intl === 'object' && typeof Intl.Segmenter === 'function'
+    ? new Intl.Segmenter(undefined, {granularity: 'grapheme'}) : null;
+  function graphemes(value) {
+    if (segmenter) return Array.from(segmenter.segment(value), part => part.segment);
+    // Keep common composed emoji and combining sequences intact on older
+    // browsers too; Array.from alone would split ZWJ emoji and flag pairs.
+    const parts = [];
+    for (const char of Array.from(value)) {
+      const last = parts[parts.length - 1];
+      const continuation = /[\p{Mark}\p{Emoji_Modifier}\u200d\uFE0E\uFE0F\u{E0020}-\u{E007F}]/u.test(char);
+      const flagPair = /^\p{Regional_Indicator}$/u.test(char) && /^\p{Regional_Indicator}$/u.test(last || '');
+      if (last && (continuation || last.endsWith('\u200d') || flagPair)) parts[parts.length - 1] += char;
+      else parts.push(char);
+    }
+    return parts;
+  }
+
+  function createTextMeasurer(context) {
+    if (!context || typeof context.measureText !== 'function') throw new TypeError('A canvas text measurement context is required');
+    const cache = new Map();
+    return value => {
+      if (cache.has(value)) return cache.get(value);
+      context.font = LABEL_FONT;
+      const metrics = context.measureText(value);
+      // Include ink overhang, while retaining advance width for spaces/kerning.
+      const ink = Number(metrics.actualBoundingBoxLeft) + Number(metrics.actualBoundingBoxRight);
+      const width = Math.max(metrics.width, Number.isFinite(ink) ? ink : 0);
+      if (!Number.isFinite(width) || width < 0) throw new TypeError('Canvas returned invalid text metrics');
+      if (cache.size >= 4096) cache.clear();
+      cache.set(value, width);
+      return width;
+    };
+  }
+
+  function wrapMeasuredText(value, measure, maxWidth, maxLines) {
+    if (typeof measure !== 'function' || !(maxWidth > 0) || !Number.isInteger(maxLines) || maxLines < 1) {
+      throw new TypeError('Text wrapping requires a pixel measurer and positive bounds');
+    }
+    const parts = graphemes(text(value).replace(/\s+/g, ' ').trim());
+    const lines = [];
+    const fits = value => measure(value) <= maxWidth;
+    let start = 0;
+    while (start < parts.length && lines.length < maxLines) {
+      let end = start;
+      let line = '';
+      while (end < parts.length && fits(line + parts[end])) line += parts[end++];
+      if (end === parts.length) { lines.push(line.trimEnd()); start = end; break; }
+      // A single unusually wide grapheme cannot be cut in half. Represent the
+      // omitted content with an ellipsis, provided that itself fits the card.
+      if (lines.length === maxLines - 1 || end === start) {
+        while (end > start && !fits(parts.slice(start, end).join('').trimEnd() + '…')) end--;
+        if (fits('…')) lines.push(parts.slice(start, end).join('').trimEnd() + '…');
+        return {lines, truncated: true};
+      }
+      // Prefer word boundaries when available; unspaced Chinese, UUIDs and
+      // paths use measured grapheme boundaries instead of overflowing.
+      let boundary = end;
+      for (let index = end - 1; index > start; index--) {
+        if (parts[index] === ' ') { boundary = index; break; }
+      }
+      lines.push(parts.slice(start, boundary).join('').trimEnd());
+      start = boundary;
+      while (parts[start] === ' ') start++;
+    }
+    return {lines, truncated: start < parts.length};
+  }
+
+  function supportWarning(node) {
+    return (node.type === 'finding' || node.type === 'goal') && node.supportValid === false && (node.status === 'verified' || node.status === 'achieved');
+  }
+
+  function formatNodeLabel(node, measure) {
+    const maxWidth = LABEL_LAYOUT.width - LABEL_LAYOUT.insetX * 2 - LABEL_LAYOUT.measureSlack;
+    const header = node.type.toUpperCase() + ' · ' + (STATUS_LABELS[node.status] || node.status) + (supportWarning(node) ? ' · 支持失效' : '');
+    const heading = wrapMeasuredText(header, measure, maxWidth, 1);
+    const body = wrapMeasuredText(text(node.label).trim() || node.id, measure, maxWidth, LABEL_LAYOUT.maxLines - 1);
+    const lines = [...heading.lines, ...body.lines];
+    return {text: lines.join('\n'), lines, truncated: heading.truncated || body.truncated};
+  }
 
   // State is the server's complete /projects/{id}/state response. No inferred facts
   // or evidence are added here: a missing endpoint is reported and its edge omitted.
@@ -112,24 +203,22 @@
     return matches.length === 1 ? matches[0].key : null;
   }
 
-  function visualData(node) {
-    const supportWarning = (node.type === 'finding' || node.type === 'goal') && node.supportValid === false && (node.status === 'verified' || node.status === 'achieved');
-    const statusLabel = STATUS_LABELS[node.status] || node.status;
+  function visualData(node, measure) {
     return {
       id: node.key, key: node.key, type: node.type, status: node.status,
-      text: node.type.toUpperCase() + ' · ' + statusLabel + (supportWarning ? ' · 支持失效' : '') + '\n' + (shortText(node.label) || node.id),
+      text: formatNodeLabel(node, measure).text,
       borderColor: COLORS[node.type], backgroundColor: BACKGROUNDS[node.type],
-      supportWarning, invalid: ['failed', 'refuted', 'superseded', 'narrowed', 'withdrawn', 'abandoned'].includes(node.status)
+      supportWarning: supportWarning(node), invalid: ['failed', 'refuted', 'superseded', 'narrowed', 'withdrawn', 'abandoned'].includes(node.status)
     };
   }
 
   const GRAPH_STYLE = [
     {selector: 'node', style: {
-      shape: 'roundrectangle', width: 220, height: 80, 'background-color': 'data(backgroundColor)',
+      shape: 'roundrectangle', width: LABEL_LAYOUT.width, height: LABEL_LAYOUT.height, 'background-color': 'data(backgroundColor)',
       'border-width': 1.4, 'border-color': 'data(borderColor)', label: 'data(text)', color: '#34473b',
-      'font-family': 'Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif', 'font-size': 12,
-      'text-wrap': 'wrap', 'text-max-width': 196, 'text-valign': 'center', 'text-halign': 'center',
-      'line-height': 1.55, 'overlay-opacity': 0, 'text-events': 'no'
+      'font-family': LABEL_LAYOUT.fontFamily, 'font-size': LABEL_LAYOUT.fontSize, 'font-style': 'normal', 'font-weight': 'normal',
+      'text-wrap': 'wrap', 'text-max-width': LABEL_LAYOUT.width - LABEL_LAYOUT.insetX * 2, 'text-valign': 'center', 'text-halign': 'center',
+      'line-height': LABEL_LAYOUT.lineHeight, 'overlay-opacity': 0, 'text-events': 'no'
     }},
     {selector: 'node[?invalid]', style: {'background-color': '#f7f6f4', 'border-color': '#b6aaa2', color: '#7a7069', 'border-style': 'dashed'}},
     {selector: 'node[?supportWarning]', style: {'border-color': '#c68b5b', 'border-style': 'dashed'}},
@@ -171,6 +260,7 @@
       if (typeof root.cytoscape !== 'function') throw new Error('Local Cytoscape dependency is unavailable');
       this.host = host;
       this.document = host.ownerDocument;
+      this.measureLabel = createTextMeasurer(this.document.createElement('canvas').getContext('2d'));
       this.onSelect = typeof options.onSelect === 'function' ? options.onSelect : function () {};
       this.nodes = [];
       this.edges = [];
@@ -246,7 +336,7 @@
         else this.cy.elements().filter(element => !nextKeys.has(element.id())).remove();
         this.nodes.forEach(node => {
           const existing = this.cy.getElementById(node.key);
-          const data = visualData(node);
+          const data = visualData(node, this.measureLabel);
           if (existing.length) existing.data(data);
           else this.cy.add({group: 'nodes', data});
         });
@@ -420,5 +510,5 @@
     }
   }
 
-  return {XLoomGraph, mapState, resolveNodeKey};
+  return {XLoomGraph, mapState, resolveNodeKey, LABEL_LAYOUT, createTextMeasurer, wrapMeasuredText, formatNodeLabel};
 }));

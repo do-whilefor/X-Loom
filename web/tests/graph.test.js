@@ -1,6 +1,122 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {XLoomGraph, mapState, resolveNodeKey} = require('../static/graph.js');
+const {XLoomGraph, mapState, resolveNodeKey, LABEL_LAYOUT, createTextMeasurer, wrapMeasuredText, formatNodeLabel} = require('../static/graph.js');
+
+// Deliberately proportional metrics: equal-length strings can have very
+// different rendered widths. Browser acceptance uses the real canvas metrics.
+function proportionalWidth(value) {
+  const segmenter = new Intl.Segmenter(undefined, {granularity:'grapheme'});
+  return [...segmenter.segment(value)].reduce((width, {segment}) => {
+    if (/\p{Extended_Pictographic}|\p{Regional_Indicator}/u.test(segment)) return width + 16;
+    if (/\p{Script=Han}/u.test(segment)) return width + 12;
+    if (segment === ' ') return width + 3.5;
+    if (segment === 'i' || segment === 'l') return width + 3;
+    if (segment === 'W' || segment === 'M') return width + 11;
+    return width + 7;
+  }, 0);
+}
+
+function assertFitsNode(formatted, measure = proportionalWidth) {
+  const maxWidth = LABEL_LAYOUT.width - 2 * LABEL_LAYOUT.insetX - LABEL_LAYOUT.measureSlack;
+  assert.ok(formatted.lines.length <= LABEL_LAYOUT.maxLines);
+  for (const line of formatted.lines) assert.ok(measure(line) <= maxWidth, 'pixel width overflow: ' + line);
+  assert.ok(formatted.lines.length * LABEL_LAYOUT.fontSize * LABEL_LAYOUT.lineHeight <= LABEL_LAYOUT.height - 2 * LABEL_LAYOUT.insetY);
+}
+
+test('node labels bound Chinese, continuous UUIDs and paths by measured width and three-line height', () => {
+  for (const value of [
+    '真实模型接入检查成功已读取本地文件并确认随机标记' + '没有空格的中文事实'.repeat(18),
+    'f72b5d67-3d69-4ff8-9cab-68dc9ca4b04b'.repeat(5),
+    '/workspace/.xloom/runs/24dab863-75b4-4b37-b09c-a46c371b459a/model-acceptance-evidence.txt'.repeat(3),
+    '模型验收 UUID=f72b5d67-3d69-4ff8-9cab-68dc9ca4b04b 读取 /workspace/proof.txt 后确认结果。'.repeat(4)
+  ]) {
+    const node = {type:'fact', status:'valid', id:'f001', label:value, description:value};
+    const before = structuredClone(node);
+    const formatted = formatNodeLabel(node, proportionalWidth);
+    assertFitsNode(formatted);
+    assert.equal(formatted.lines.length, 3);
+    assert.equal(formatted.lines[0], 'FACT · 有效');
+    assert.ok(formatted.lines.at(-1).endsWith('…'));
+    assert.equal(formatted.truncated, true);
+    assert.deepEqual(node, before, 'layout must never shorten content exposed to the log or selection callback');
+  }
+});
+
+test('pixel layout distinguishes narrow and wide text instead of using a character limit', () => {
+  const base = {type:'step', status:'open', id:'i001'};
+  const narrow = formatNodeLabel({...base, label:'i'.repeat(60)}, proportionalWidth);
+  const wide = formatNodeLabel({...base, label:'W'.repeat(60)}, proportionalWidth);
+  assertFitsNode(narrow); assertFitsNode(wide);
+  assert.equal(narrow.truncated, false);
+  assert.equal(narrow.lines.length, 2);
+  assert.equal(narrow.lines[1], 'i'.repeat(60));
+  assert.equal(wide.truncated, true);
+  assert.equal(wide.lines.length, 3);
+});
+
+test('status header and empty-label ID fallback obey the same bounds', () => {
+  const warning = formatNodeLabel({type:'finding', status:'verified', supportValid:false, id:'finding_1', label:'有界说明'}, proportionalWidth);
+  assertFitsNode(warning);
+  assert.ok(warning.lines[0].includes('支持失效'));
+  const unknown = formatNodeLabel({type:'fact', status:'上游自定义超长状态'.repeat(12), id:'f001', label:'原文'}, proportionalWidth);
+  assertFitsNode(unknown);
+  assert.ok(unknown.lines[0].endsWith('…'));
+  const fallback = formatNodeLabel({type:'goal', status:'open', id:'goal-' + 'a'.repeat(100), label:' \n\t'}, proportionalWidth);
+  assertFitsNode(fallback);
+  assert.ok(fallback.lines[1].startsWith('goal-'));
+  assert.ok(fallback.lines.at(-1).endsWith('…'));
+});
+
+test('wrapping retains emoji, flags and combining marks as whole graphemes', () => {
+  for (const glyph of ['👩🏽‍💻', '👨‍👩‍👧‍👦', '🇨🇳', 'e\u0301', '1️⃣']) {
+    const glyphMeasure = value => [...new Intl.Segmenter(undefined, {granularity:'grapheme'}).segment(value)]
+      .reduce((sum, {segment}) => sum + (segment === '…' ? 5 : 16), 0);
+    const result = wrapMeasuredText(glyph.repeat(8), glyphMeasure, 23, 2);
+    assert.deepEqual(result.lines, [glyph, glyph + '…']);
+    assert.equal(result.truncated, true);
+    assert.ok(result.lines.every(line => glyphMeasure(line) <= 23));
+  }
+});
+
+test('grapheme fallback also avoids splitting composed emoji and flag pairs', () => {
+  const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
+  const context = {module:{exports:{}}, Intl:{}};
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../static/graph.js'), 'utf8'), context);
+  for (const glyph of ['👩🏽‍💻', '👨‍👩‍👧‍👦', '🇨🇳', 'e\u0301', '1️⃣']) {
+    const measure = value => [...new Intl.Segmenter(undefined, {granularity:'grapheme'}).segment(value)]
+      .reduce((sum, {segment}) => sum + (segment === '…' ? 5 : 16), 0);
+    const wrapped = context.module.exports.wrapMeasuredText(glyph.repeat(8), measure, 23, 2);
+    assert.equal(wrapped.lines.join('\n'), glyph + '\n' + glyph + '…');
+  }
+});
+
+test('ellipsis reserves actual pixel width and oversized graphemes cannot escape the card', () => {
+  const measure = value => proportionalWidth(value) + (value.endsWith('…') ? 14 : 0);
+  const result = wrapMeasuredText('W'.repeat(100), measure, 34, 2);
+  assert.ok(result.lines.every(line => measure(line) <= 34));
+  assert.equal(result.lines.at(-1), 'W…');
+  assert.deepEqual(wrapMeasuredText('👩🏽‍💻', value => value === '…' ? 8 : 400, 194, 2), {lines:['…'], truncated:true});
+  assert.deepEqual(wrapMeasuredText('大', () => 400, 194, 2), {lines:[], truncated:true});
+  assert.deepEqual(wrapMeasuredText('', proportionalWidth, 194, 2), {lines:[], truncated:false});
+});
+
+test('canvas measurer uses the rendered font, ink width and a bounded cache', () => {
+  let calls = 0;
+  const context = {font:'', measureText(value) {
+    calls++;
+    assert.equal(this.font, 'normal normal 12px ' + LABEL_LAYOUT.fontFamily);
+    return {width:value.length * 4, actualBoundingBoxLeft:2, actualBoundingBoxRight:value.length * 4 + 1};
+  }};
+  const measure = createTextMeasurer(context);
+  assert.equal(measure('ink'), 15);
+  assert.equal(measure('ink'), 15);
+  assert.equal(calls, 1);
+  for (let i = 0; i < 4100; i++) measure('unique' + i);
+  const before = calls;
+  measure('ink');
+  assert.equal(calls, before + 1, 'old cache entries must not grow without bound');
+  assert.throws(() => createTextMeasurer(null), TypeError);
+});
 
 function stateFixture() {
   return {

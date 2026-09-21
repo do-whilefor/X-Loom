@@ -25,7 +25,7 @@
     clearTimeout(toastTimer); $('toast').textContent = message; $('toast').hidden = false;
     toastTimer = setTimeout(() => { $('toast').hidden = true; }, 4000);
   }
-  const graph = new window.XLoomGraph($('graph-host'), {onSelect: showNode});
+  const graph = new window.XLoomGraph($('graph-host'), {onSelect: selectLogNode});
   const current = () => state?.graph?.project || projects.find(project => project.id === selectedId);
   const pathFor = id => '/projects/' + encodeURIComponent(id);
   const nodeKey = node => node ? node.type + ':' + node.id : '';
@@ -131,22 +131,8 @@
     }
     return box;
   }
-  function showNode(node) {
+  function selectLogNode(node) {
     selectedNode = node ? {type:node.type, id:node.id} : null;
-    $('node-detail').hidden = !node;
-    if (node) {
-      $('node-detail-type').textContent = node.type.toUpperCase() + ' · ' + data.statusName(node.status);
-      $('node-detail-id').textContent = node.id;
-      $('node-detail-title').textContent = node.label;
-      $('node-detail-body').textContent = node.description;
-      $('node-detail-evidence').replaceChildren();
-      const raw = node.raw || {};
-      if (raw.scope) $('node-detail-evidence').append(el('p', '', '范围：' + raw.scope));
-      if (raw.reason) $('node-detail-evidence').append(el('p', '', raw.reason));
-      if (node.supportValid === false && (node.status === 'verified' || node.status === 'achieved')) $('node-detail-evidence').append(el('p', 'danger-text', '当前支持证据无效，请结合事实状态复核。'));
-      if (node.sources?.length) $('node-detail-evidence').append(evidenceButtons(node.sources.map(id => ({type:'fact', id}))));
-      if (node.evidence?.length) $('node-detail-evidence').append(artifacts(node.evidence));
-    }
     renderLogs({reset:true});
   }
   function renderModelAnswer(log) {
@@ -172,6 +158,9 @@
     const meta = el('div', 'log-meta', data.formatTime(log.time));
     meta.append(el('span', 'phase-label ' + log.phase, log.phase));
     article.append(meta, el('h3', '', log.title), el('p', '', log.body));
+    if (log.scope) article.append(el('p', '', '范围：' + log.scope));
+    if (log.evidence?.length) article.append(evidenceButtons(log.evidence));
+    if (log.artifacts?.length) article.append(artifacts(log.artifacts));
     if (log.code) article.append(el('code', '', log.code));
     if (log.worker) article.append(el('div', 'log-worker', log.worker));
     if (log.node && graph.getNodes().some(node => nodeKey(node) === nodeKey(log.node))) {
@@ -231,7 +220,7 @@
   }
   function resetSelection(id) {
     selectedId = id; state = null; executions = []; logs = []; selectedNode = null; logSignature = ''; logLimit = 300;
-    $('node-detail').hidden = true; $('log-query').value = ''; setPhase('all'); setGraphFilter('all');
+    $('log-query').value = ''; setPhase('all'); setGraphFilter('all');
     graph.setState(null); switchView('graph'); renderHeader(); renderLogs({reset:true});
     try { if (id) localStorage.setItem('xloom.selected-project', id); else localStorage.removeItem('xloom.selected-project'); } catch {}
   }
@@ -284,7 +273,7 @@
       renderHeader();
       if (selectedNode) {
         const node = graph.getNodes().find(item => nodeKey(item) === nodeKey(selectedNode));
-        if (!node) showNode(null);
+        if (!node) selectLogNode(null);
       }
       if (view === 'findings') renderFindings();
       renderLogs({force:firstLoad});
@@ -326,7 +315,7 @@
   $('log-query').addEventListener('input', () => { logLimit = 300; renderLogs({reset:true}); });
   document.querySelectorAll('[data-phase]').forEach(button => button.addEventListener('click', () => { setPhase(button.dataset.phase); logLimit = 300; renderLogs({reset:true}); }));
   document.querySelectorAll('[data-graph-filter]').forEach(button => button.addEventListener('click', () => setGraphFilter(button.dataset.graphFilter)));
-  ['close-node', 'clear-log-node'].forEach(id => $(id).addEventListener('click', () => graph.selectNode(null)));
+  $('clear-log-node').addEventListener('click', () => graph.selectNode(null));
   $('zoom-in').addEventListener('click', () => graph.zoomBy(1.2)); $('zoom-out').addEventListener('click', () => graph.zoomBy(1 / 1.2));
   $('fit-graph').addEventListener('click', () => graph.fit());
   $('graph-host').addEventListener('graphzoom', event => { $('zoom-label').textContent = Math.round(event.detail.zoom * 100) + '%'; });
