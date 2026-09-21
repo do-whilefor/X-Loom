@@ -5,6 +5,16 @@
 # ---- 第三方参考源码（不纳入版本控制）----
 # Cairn-main / pi-main / 参考资料，仅作本地重写参考
 /refer/
+/docs/
+/design/
+/tests/
+DEVELOPMENT.md
+DEVELOPMENT-NEXT.md
+
+# ---- 本地 AI 协作说明（不纳入版本控制）----
+# 不带前导斜杠 => 匹配任意层级，如根目录与 container/ 下的 AGENTS.md
+AGENTS.md
+.agents/
 
 # ---- Go ----
 *.exe
