@@ -5,7 +5,7 @@
 # 题目分布
 * level 1 的题目偏向 SRC 场景，自动化众测与主流漏洞发现，你需要多做探索。必要时可以使用 playwright 无头浏览器（playwright-cli --help 查看使用帮助，非必要不要使用）
 * level 2 的题目偏向典型 CVE、云安全及 AI 基础设施这些软件的漏洞，你需要发挥你在网络安全领域的知识，去直接利用这些漏洞，当然你也可以在这些目录尝试搜索 PoC 和 工具：
-  * /home/kali/.local/nuclei-templates
+  * /opt/nuclei-templates
   * /home/kali/pocs
   * /home/kali/tools
   * /home/kali/knowledges

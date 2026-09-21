@@ -14,6 +14,10 @@ done
 python3 -c 'import ssl; assert ssl.get_default_verify_paths().cafile'
 sudo -l -U kali | grep -F 'NOPASSWD: ALL' >/dev/null
 su -s /bin/sh kali -c 'test -w /workspace'
+# /workspace 是 git 仓库且 Worker 以 root 运行，而目录属主是 kali。
+# 必须能真正执行 git 操作，否则依赖 git 的任务会以 128 (dubious ownership) 失败。
+# 仅检查 git 命令存在无法覆盖这一点，故这里实际执行一次仓库操作。
+git -C /workspace status --short >/dev/null
 file=$(mktemp /workspace/.xloom-smoke.XXXXXX)
 trap 'rm -f -- "$file"' EXIT HUP INT TERM
 printf 'xloom-worker-smoke\n' > "$file"
