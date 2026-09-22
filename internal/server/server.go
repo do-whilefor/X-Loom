@@ -34,7 +34,7 @@ func New(store *b.Store) http.Handler {
 		name := strings.TrimPrefix(r.URL.Path, "/static/")
 		data, err := fs.ReadFile(web.Files, name)
 		if err != nil {
-			writeError(w, b.Err(404, "Not Found"))
+			writeError(w, r, b.Err(404, "Not Found"))
 			return
 		}
 		http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(data))
@@ -99,9 +99,9 @@ func New(store *b.Store) http.Handler {
 			}
 			if len(allowed) > 0 {
 				w.Header().Set("Allow", strings.Join(allowed, ", "))
-				writeError(w, b.Err(405, "Method Not Allowed"))
+				writeError(w, r, b.Err(405, "Method Not Allowed"))
 			} else {
-				writeError(w, b.Err(404, "Not Found"))
+				writeError(w, r, b.Err(404, "Not Found"))
 			}
 			return
 		}
@@ -115,12 +115,12 @@ func (s *Server) wrap(fn action) http.HandlerFunc {
 			dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20))
 			dec.UseNumber()
 			if err := dec.Decode(&in.fields); err != nil || in.fields == nil {
-				writeError(w, &b.APIError{Status: 422, Detail: "Expected a JSON object"})
+				writeError(w, r, &b.APIError{Status: 422, Detail: "Expected a JSON object"})
 				return
 			}
 			var extra any
 			if err := dec.Decode(&extra); err != io.EOF {
-				writeError(w, &b.APIError{Status: 422, Detail: "Expected one JSON object"})
+				writeError(w, r, &b.APIError{Status: 422, Detail: "Expected one JSON object"})
 				return
 			}
 		}
@@ -138,7 +138,7 @@ func (s *Server) wrap(fn action) http.HandlerFunc {
 			return err
 		})
 		if err != nil {
-			writeError(w, err)
+			writeError(w, r, err)
 			return
 		}
 		if txt, ok := body.(plain); ok {
@@ -154,14 +154,14 @@ func (s *Server) wrap(fn action) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		if err := json.NewEncoder(w).Encode(body); err != nil {
-			slog.Warn("response write failed", "error", err)
+			slog.Warn("response write failed", "error", err, "method", r.Method, "path", r.URL.Path, "context_error", r.Context().Err())
 		}
 	}
 }
-func writeError(w http.ResponseWriter, err error) {
+func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	var ae *b.APIError
 	if !errors.As(err, &ae) {
-		slog.Error("server request failed", "error", err)
+		slog.Error("server request failed", "error", err, "method", r.Method, "path", r.URL.Path, "context_error", r.Context().Err())
 		ae = &b.APIError{Status: 500, Detail: "Internal Server Error"}
 	}
 	w.Header().Set("Content-Type", "application/json")

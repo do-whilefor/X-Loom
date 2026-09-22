@@ -1,5 +1,9 @@
 .git
 refer
+design
+docs
+DEVELOPMENT*.md
+VALIDATION*.md
 AGENTS.md
 .env
 .env.*
@@ -13,6 +17,7 @@ bin
 dist
 logs
 tmp
+tpm
 *.db
 *.db-shm
 *.db-wal

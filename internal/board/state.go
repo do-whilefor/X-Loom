@@ -91,15 +91,18 @@ type Finding struct {
 	SupportValid bool          `json:"support_valid"`
 }
 type StateAction struct {
-	Op             string          `json:"op"`
-	IdempotencyKey string          `json:"idempotency_key"`
-	Payload        json.RawMessage `json:"payload"`
+	Op              string          `json:"op"`
+	IdempotencyKey  string          `json:"idempotency_key"`
+	Payload         json.RawMessage `json:"payload"`
+	ExpectedVersion string          `json:"expected_version,omitempty"`
 }
 type StateActionResult struct {
-	Op       string          `json:"op"`
-	ID       string          `json:"id"`
-	Revision int64           `json:"revision"`
-	Result   json.RawMessage `json:"result"`
+	Op           string          `json:"op"`
+	ID           string          `json:"id"`
+	Revision     int64           `json:"revision"`
+	Result       json.RawMessage `json:"result"`
+	StateVersion string          `json:"state_version,omitempty"`
+	Unchanged    bool            `json:"unchanged,omitempty"`
 }
 type StateEvent struct {
 	Revision  int64           `json:"revision"`
@@ -405,12 +408,16 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 	if !errors.Is(err, sql.ErrNoRows) {
 		return StateActionResult{}, err
 	}
+	if err = t.CheckDecisionStateVersion(s, fence, action.ExpectedVersion); err != nil {
+		return StateActionResult{}, err
+	}
 	d, _, _, err := t.stateData(project)
 	if err != nil {
 		return StateActionResult{}, err
 	}
 	var id string
 	var result any
+	changed := true
 	switch action.Op {
 	case "fact":
 		id, result, err = t.addStateFact(&s, &d, fence, action.Payload)
@@ -421,30 +428,39 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 	case "goal":
 		id, result, err = t.changeGoal(s, &d, action.Payload)
 	case "step":
-		id, result, err = t.changeStep(&s, &d, fence, action.Payload)
+		id, result, changed, err = t.changeStep(&s, &d, fence, action.Payload)
 	}
 	if err != nil {
 		return StateActionResult{}, err
 	}
-	s.Revision++
-	if action.Op == "fact" || action.Op == "finding" || (action.Op == "fact_relation" && fence.Lease != "reason") {
-		s.DecisionRevision++
-	}
-	raw, err := json.Marshal(d)
-	if err != nil {
-		return StateActionResult{}, err
-	}
-	if _, err = t.Exec("INSERT INTO xloom_state(project_id,data,revision,decision_revision) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET data=excluded.data,revision=excluded.revision,decision_revision=excluded.decision_revision", project, string(raw), s.Revision, s.DecisionRevision); err != nil {
-		return StateActionResult{}, err
+	if changed {
+		s.Revision++
+		if action.Op == "fact" || action.Op == "finding" || (action.Op == "fact_relation" && fence.Lease != "reason") {
+			s.DecisionRevision++
+		}
+		raw, err := json.Marshal(d)
+		if err != nil {
+			return StateActionResult{}, err
+		}
+		if _, err = t.Exec("INSERT INTO xloom_state(project_id,data,revision,decision_revision) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET data=excluded.data,revision=excluded.revision,decision_revision=excluded.decision_revision", project, string(raw), s.Revision, s.DecisionRevision); err != nil {
+			return StateActionResult{}, err
+		}
 	}
 	resultJSON, err := json.Marshal(result)
 	if err != nil {
 		return StateActionResult{}, err
 	}
-	out := StateActionResult{Op: action.Op, ID: id, Revision: s.Revision, Result: resultJSON}
+	current, err := t.State(project)
+	if err != nil {
+		return StateActionResult{}, err
+	}
+	out := StateActionResult{Op: action.Op, ID: id, Revision: s.Revision, Result: resultJSON, StateVersion: DecisionStateVersion(current), Unchanged: !changed}
 	response, _ := json.Marshal(out)
 	if _, err = t.Exec("INSERT INTO xloom_state_actions(project_id,idempotency_key,request,response) VALUES(?,?,?,?)", project, action.IdempotencyKey, string(canonical), string(response)); err != nil {
 		return StateActionResult{}, err
+	}
+	if !changed {
+		return out, nil
 	}
 	event, _ := json.Marshal(StateEvent{Revision: s.Revision, Op: action.Op, ID: id, RunID: fence.Run, CreatedAt: t.Now, Payload: action.Payload, Result: resultJSON})
 	_, err = t.Exec("INSERT INTO xloom_state_events(project_id,revision,event) VALUES(?,?,?)", project, s.Revision, string(event))
@@ -681,7 +697,7 @@ func (t *Tx) changeGoal(s State, d *stateData, raw json.RawMessage) (string, any
 	return "", nil, Err(404, "Goal not found")
 }
 
-func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.RawMessage) (string, any, error) {
+func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.RawMessage) (string, any, bool, error) {
 	var input struct {
 		Action      string   `json:"action"`
 		ID          string   `json:"id"`
@@ -692,17 +708,17 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 		Reason      string   `json:"reason"`
 	}
 	if err := decodeAction(raw, &input); err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 	if input.Priority < 0 || input.Priority > 1000000 {
-		return "", nil, Err(422, "step priority must be between 0 and 1000000")
+		return "", nil, false, Err(422, "step priority must be between 0 and 1000000")
 	}
 	if input.Action == "add" {
 		if input.ID != "" || !required(input.Description, 16384) {
-			return "", nil, Err(422, "new step requires description and a server-assigned ID")
+			return "", nil, false, Err(422, "new step requires description and a server-assigned ID")
 		}
 		if err := s.ValidateFactSources(input.From, false); err != nil {
-			return "", nil, err
+			return "", nil, false, err
 		}
 		if input.GoalID == "" {
 			input.GoalID = "goal"
@@ -712,32 +728,37 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 			goalOpen = goalOpen || (goal.ID == input.GoalID && goal.Status == "open")
 		}
 		if !goalOpen {
-			return "", nil, Err(409, "step requires an open goal")
+			return "", nil, false, Err(409, "step requires an open goal")
 		}
 		if err := t.CheckNewStepLimit(s.Graph.Project.ID, fence.Run); err != nil {
-			return "", nil, err
+			return "", nil, false, err
 		}
 		id, err := t.Next(s.Graph.Project.ID, "intent")
 		if err != nil {
-			return "", nil, err
+			return "", nil, false, err
 		}
 		step := Step{ID: id, From: input.From, GoalID: input.GoalID, Description: strings.TrimSpace(input.Description), Status: "open", Priority: input.Priority, CreatedAt: t.Now}
 		d.Steps = append(d.Steps, step)
 		s.Graph.Intents = append(s.Graph.Intents, Intent{ID: id, From: input.From, Description: step.Description, Creator: fence.Run, CreatedAt: t.Now})
-		return id, step, t.Save(s.Graph)
+		return id, step, true, t.Save(s.Graph)
 	}
 	if !slices.Contains([]string{"priority", "abandon"}, input.Action) || !required(input.Reason, 8192) || input.GoalID != "" || len(input.From) != 0 || input.Description != "" {
-		return "", nil, Err(422, "step change requires a reason; existing task inputs are immutable")
+		return "", nil, false, Err(422, "step change requires a reason; existing task inputs are immutable")
 	}
 	for _, current := range s.Steps {
 		if current.ID != input.ID {
 			continue
 		}
 		if current.Status == "completed" || current.Status == "abandoned" {
-			return "", nil, Err(409, "step is already terminal")
+			return "", nil, false, Err(409, "step is already terminal")
 		}
 		if input.Action == "priority" && current.Status == "running" {
-			return "", nil, Err(409, "running step inputs cannot be changed")
+			return "", nil, false, Err(409, "running step inputs cannot be changed")
+		}
+		// Keep the successful action available for idempotent replay without
+		// adding an event when neither the priority nor its rationale changed.
+		if input.Action == "priority" && current.Priority == input.Priority && current.Reason == input.Reason {
+			return current.ID, current, false, nil
 		}
 		current.Reason = input.Reason
 		if input.Action == "priority" {
@@ -751,13 +772,13 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 				}
 				if i.Worker != nil {
 					if _, err := t.Exec("INSERT OR IGNORE INTO xloom_revoked_runs(project_id,worker) VALUES(?,?)", s.Graph.Project.ID, *i.Worker); err != nil {
-						return "", nil, err
+						return "", nil, false, err
 					}
 				}
 				i.Worker, current.Worker, i.ConcludedAt = nil, nil, Ptr(t.Now)
 			}
 			if err := t.Save(s.Graph); err != nil {
-				return "", nil, err
+				return "", nil, false, err
 			}
 		}
 		found := false
@@ -770,9 +791,9 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 		if !found {
 			d.Steps = append(d.Steps, current)
 		}
-		return current.ID, current, nil
+		return current.ID, current, true, nil
 	}
-	return "", nil, Err(404, "Step not found")
+	return "", nil, false, Err(404, "Step not found")
 }
 
 func (t *Tx) StateEvents(project string, after int64) ([]StateEvent, error) {

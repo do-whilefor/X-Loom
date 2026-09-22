@@ -14,18 +14,23 @@ import (
 	"strings"
 	"time"
 	"xloom/internal/agent"
+	"xloom/internal/board"
 	"xloom/internal/process"
 	"xloom/internal/provider"
 )
 
 type Options struct {
-	Provider     agent.Provider
-	Tools        []agent.Tool
-	RunDir       string
-	Output       io.Writer
-	Now          func() time.Time
-	SoftStop     <-chan struct{}
-	ContextBytes int
+	Provider            agent.Provider
+	Tools               []agent.Tool
+	RunDir              string
+	Output              io.Writer
+	Now                 func() time.Time
+	SoftStop            <-chan struct{}
+	ContextBytes        int
+	ContextTokens       int
+	ContextTargetTokens int
+	GraphVersion        *string
+	ReplanShadow        bool
 }
 
 func Execute(ctx context.Context, jobPath string, output io.Writer) error {
@@ -133,6 +138,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		return Result{}, err
 	}
 	state := session{SchemaVersion: sessionSchemaVersion, Identity: identity, RunID: j.RunID, Kind: j.Kind, StartedAt: o.Now()}
+	if j.Kind == "reason" && j.Decision != nil && j.State != nil {
+		state.GraphVersion = board.DecisionStateVersion(*j.State)
+	}
 	if j.Budget.Timeout > 0 {
 		state.ExecutionDeadline = state.StartedAt.Add(time.Duration(j.Budget.Timeout) * time.Second)
 	}
@@ -200,6 +208,12 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		if r.Status == "failed" && r.FailureKind == "" {
 			r.FailureKind = "execution"
 		}
+		r.StateVersion = state.GraphVersion
+		if j.Kind == "reason" {
+			metrics := journal.metrics.finish(j, r, state.StartedAt, o.Now())
+			metrics.Replan = state.Replan
+			r.Metrics = &metrics
+		}
 		if err := journal.append(r); err != nil {
 			return r, err
 		}
@@ -255,15 +269,22 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		}
 		o.Provider = p
 	}
+	o.GraphVersion = &state.GraphVersion
 	if err := ConfigureRuntimeTools(j, &o); err != nil {
 		return Result{}, err
 	}
 	if o.ContextBytes <= 0 {
-		o.ContextBytes = envInt("XLOOM_CONTEXT_BYTES", 240000)
+		o.ContextBytes = envInt("XLOOM_CONTEXT_BYTES", DefaultContextBytes)
+	}
+	if o.ContextTokens <= 0 {
+		o.ContextTokens = envInt("XLOOM_CONTEXT_TOKENS", DefaultContextTokens)
+	}
+	if o.ContextTargetTokens <= 0 {
+		o.ContextTargetTokens = envInt("XLOOM_CONTEXT_TARGET_TOKENS", DefaultContextTargetTokens)
 	}
 	l = &agent.Loop{Provider: o.Provider, Tools: o.Tools, History: state.History, Concluding: state.Concluding, Repairing: state.Repairing, RepairPrompt: state.RepairPrompt, Emit: emit, Checkpoint: state.ContextCheckpoint, SaveState: func(history []agent.Message, _ *agent.ContextCheckpoint) error {
 		return save(history)
-	}, ContextBytes: o.ContextBytes, TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt}
+	}, ContextBytes: o.ContextBytes, ContextTokens: o.ContextTokens, ContextTargetTokens: o.ContextTargetTokens, ObserveRequests: j.Kind == "reason", TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt}
 	var endCancel context.CancelFunc = func() {}
 	defer func() { endCancel() }()
 	runCtx := ctx
@@ -419,6 +440,36 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		}
 		if err != nil {
 			return finish(Result{Type: "result", Status: "failed", Conclude: l.Concluding, Error: err.Error()})
+		}
+	}
+	// The experiment runs once, before planning, with the same absolute task
+	// deadline. A crash cannot buy another check or carry its private transcript
+	// into Decide. Even a valid keep does not skip the normal planner.
+	if j.Kind == "reason" {
+		if state.Replan != nil && state.Replan.Status == "running" {
+			state.Replan.Status, state.Replan.Fallback = "interrupted", "decide"
+		} else if !resuming && (o.ReplanShadow || os.Getenv("XLOOM_REPLAN_SHADOW") == "1") {
+			state.Replan = &ReplanObservation{Mode: "shadow", Status: "skipped", Fallback: "decide"}
+			if j.Decision != nil {
+				state.Replan.StateVersion, state.Replan.Generation = j.Decision.StateVersion, j.Decision.Generation
+				state.Replan.FromRevision, state.Replan.ToRevision = j.Decision.FromRevision, j.Decision.ToRevision
+			}
+			if j.Decision != nil && j.Decision.Mode == "changes" && j.State != nil && j.Graph.OpenCount() > 0 {
+				state.Replan.Status = "running"
+				if err = save(l.History); err != nil {
+					return Result{}, err
+				}
+				if err = runReplanCheck(runCtx, j, o, state.Replan, emit, func() error { return save(l.History) }); err != nil {
+					return Result{}, err
+				}
+			}
+		}
+		if state.Replan != nil {
+			raw, _ := json.Marshal(state.Replan)
+			emit(agent.Event{Type: "replan_observation", Text: string(raw)})
+			if err = save(l.History); err != nil {
+				return Result{}, err
+			}
 		}
 	}
 	if len(l.History) == 0 {

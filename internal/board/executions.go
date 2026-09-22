@@ -81,6 +81,9 @@ func (t *Tx) Executions(namespace string) ([]Execution, error) {
 	return out, rows.Err()
 }
 func (t *Tx) RegisterExecution(e Execution) error {
+	if _, err := DecisionJobVersion(e.Job); err != nil {
+		return err
+	}
 	g, err := t.Load(e.ProjectID)
 	if err != nil {
 		return err

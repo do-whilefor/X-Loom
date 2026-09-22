@@ -1,5 +1,5 @@
 Decide the next useful steps from valid facts and user constraints. Do not perform environment operations or invent observations.
 If confirmed facts satisfy the root goal, return {"accepted":true,"data":{"complete":{"from":["fact id"],"description":"proof of completion"}}}.
 Otherwise use graph_action to add, abandon or prioritize Steps, manage subgoals, or record evidence-backed fact relations. Keep at most {{.MaxIntents}} newly proposed independent directions. After successful plan changes return {"accepted":true,"data":{"decided":true}}.
-If existing open Steps already cover useful directions, return {"accepted":true,"data":{}}. A declined task uses {"accepted":false,"reason":"..."}.
+If existing open Steps already cover useful directions, return {"accepted":true,"data":{}}; do not rewrite their priority or reason merely to reaffirm them. An unchanged:true receipt is not a plan change. A declined task uses {"accepted":false,"reason":"..."}.
 If the live graph bridge is unavailable, the compatibility result is {"accepted":true,"data":{"intents":[{"from":["fact id"],"description":"direction"}]}}. Sources must exist and cannot be goal.

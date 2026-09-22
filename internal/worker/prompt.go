@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"embed"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -28,7 +29,10 @@ func Prompt(j Job, conclude bool, runDir string) (string, error) {
 	if conclude {
 		context += "All tools are disabled. Use only this frozen input and existing evidence. Do not open files.\n"
 	} else if j.Kind == "reason" {
-		context += "Decide from a fresh context. Only graph tools are available. Use read_graph pages for current facts, goals, steps, findings, relations and hints before changing the plan.\n"
+		context += "Plan from the supplied changes and evidence. Read missing support or conflicting evidence by ids first; widen to pages when relevant evidence cannot be located. Do not reread supplied evidence merely because other items were omitted. Omission is not proof of absence or completion.\n"
+		if j.Decision != nil {
+			context += "Graph pages and writes are version checked. After state_changed, read overview and re-read affected evidence before deciding. A refreshed version alone does not validate earlier conclusions.\n"
+		}
 		if !j.GraphRPC {
 			context += "This local snapshot has no live graph submission bridge.\n"
 		}
@@ -41,7 +45,7 @@ func Prompt(j Job, conclude bool, runDir string) (string, error) {
 		if err = os.WriteFile(path, []byte(graph), 0600); err != nil {
 			return "", err
 		}
-		context += "The complete original legacy graph is retained at " + path + ". Use read_graph pages for current shared state. Submit important verified Fact or Finding evidence through graph_action while working; this does not finish the Step or project. Long evidence belongs in retained files with stable run/path references and necessary excerpts.\n"
+		context += "The complete original legacy graph is retained at " + path + ". Use read_graph pages for current shared state. Submit important verified Fact or Finding evidence through graph_action while working; this does not finish the Step or project. Select evidence files and necessary line ranges; the runtime retains originals and extracts exact excerpts.\n"
 	}
 	body, err := taskTemplate(j, conclude)
 	if err != nil {
@@ -73,6 +77,12 @@ func intentContext(j Job) string {
 }
 
 func jobContextView(j Job) ([]byte, error) {
+	if j.Kind == "reason" && j.Decision != nil {
+		if j.State == nil || j.Decision.Version != 1 || j.Decision.StateVersion != board.DecisionStateVersion(*j.State) || j.Decision.Generation != j.Graph.Project.Generation || !json.Valid(j.Decision.View) {
+			return nil, errors.New("invalid decision input binding")
+		}
+		return json.Marshal(j.Decision)
+	}
 	state := board.State{Graph: j.Graph}
 	if j.State != nil {
 		state = *j.State

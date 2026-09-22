@@ -597,6 +597,12 @@ func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, inte
 		state.Graph = g
 		t.Job.State = &state
 	}
+	if kind == "reason" {
+		if err := s.prepareDecision(ctx, t, trigger); err != nil {
+			_ = s.Client.Do(ctx, "POST", s.leasePath(t)+"/release", map[string]string{"worker": lease.Run}, nil, nil)
+			return false, err
+		}
+	}
 	if err := s.register(ctx, t); err != nil {
 		_ = s.Client.Do(ctx, "POST", s.leasePath(t)+"/release", map[string]string{"worker": lease.Run}, nil, nil)
 		return false, err

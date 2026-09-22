@@ -181,8 +181,9 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 		return 0, nil, err
 	}
 	var result struct {
-		Text     string `json:"text"`
-		Conclude bool   `json:"conclude"`
+		Text         string `json:"text"`
+		Conclude     bool   `json:"conclude"`
+		StateVersion string `json:"state_version"`
 	}
 	if err = json.Unmarshal(e.Result, &result); err != nil {
 		return 0, nil, err
@@ -194,6 +195,21 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 	}
 	if err = json.Unmarshal(e.Job, &job); err != nil {
 		return 0, nil, err
+	}
+	if e.Kind == "reason" {
+		initialVersion, err := b.DecisionJobVersion(e.Job)
+		if err != nil {
+			return 0, nil, err
+		}
+		if initialVersion != "" || result.StateVersion != "" {
+			state, err := t.State(e.ProjectID)
+			if err != nil {
+				return 0, nil, err
+			}
+			if result.StateVersion == "" || result.StateVersion != b.DecisionStateVersion(state) {
+				return 0, nil, b.Err(409, "state_changed: decision result does not match current shared state")
+			}
+		}
 	}
 	open := 0
 	for _, intent := range g.Intents {

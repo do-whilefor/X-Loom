@@ -184,7 +184,24 @@ func (p *Anthropic) generate(ctx context.Context, messages []agent.Message, tool
 			Stop    string        `json:"stop_reason"`
 			Usage   *agent.Usage  `json:"usage"`
 		}
-		if err = json.NewDecoder(io.LimitReader(res.Body, 32<<20)).Decode(&m); err != nil {
+		// A successful first Decode does not prove that the complete response
+		// contains one JSON value. Keep one extra byte to distinguish the body
+		// limit from a real EOF while checking for trailing values or garbage.
+		body := &io.LimitedReader{R: res.Body, N: (32 << 20) + 1}
+		decoder := json.NewDecoder(body)
+		if err = decoder.Decode(&m); err == nil {
+			var extra json.RawMessage
+			err = decoder.Decode(&extra)
+			if err == io.EOF {
+				err = nil
+			} else if err == nil {
+				err = errors.New("multiple model response values")
+			}
+		}
+		if body.N == 0 {
+			return agent.Message{}, &agent.ModelError{Kind: agent.ErrorProvider, Err: errors.New("model response body exceeds 32 MiB")}
+		}
+		if err != nil {
 			kind := agent.ErrorProvider
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) {
 				kind = agent.ErrorTransport

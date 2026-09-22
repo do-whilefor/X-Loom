@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"slices"
+	"strings"
 	"time"
 
 	"xloom/internal/board"
@@ -33,6 +35,12 @@ func (s *Scheduler) environmentID(w config.Worker) string {
 	env := map[string]string{}
 	for _, key := range []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL", "XLOOM_REASONING_EFFORT", "XLOOM_MAX_OUTPUT_TOKENS", "XLOOM_CONTEXT_BYTES", "XLOOM_REQUEST_TIMEOUT"} {
 		env[key] = w.Env[key]
+	}
+	// Keep existing identities stable when these newer settings are absent.
+	for _, key := range []string{"XLOOM_CONTEXT_TOKENS", "XLOOM_CONTEXT_TARGET_TOKENS"} {
+		if value := w.Env[key]; value != "" {
+			env[key] = value
+		}
 	}
 	return digest(struct {
 		Type    string
@@ -139,6 +147,11 @@ func (s *Scheduler) register(ctx context.Context, t *task) error {
 	}
 	e := board.Execution{ProjectID: t.Job.Graph.Project.ID, ID: t.Job.RunID, Namespace: s.namespace(), Backend: t.Worker.Name, Kind: t.Job.Kind, Intent: t.Lease.Intent, Lease: t.Lease.Run, Job: raw, RetryKey: s.retryKey(t.Job.Graph, t.Job.Kind, t.Job.Intent)}
 	if err = s.Client.Do(ctx, "POST", projectPath(e.ProjectID)+"/executions", e, &t.Execution, &t.Lease); err != nil {
+		return err
+	}
+	// The HTTP decoder canonicalizes embedded JSON objects. Run exactly the
+	// stored job so RawMessage ordering cannot change the identity on recovery.
+	if err = json.Unmarshal(t.Execution.Job, &t.Job); err != nil {
 		return err
 	}
 	s.executions = append(s.executions, t.Execution)
@@ -253,14 +266,22 @@ func (s *Scheduler) recoverExecutions(ctx context.Context, states map[string]str
 	return nil
 }
 func (s *Scheduler) runRegistered(ctx context.Context, t *task, stopHeartbeat func()) (string, error) {
+	var result worker.Result
+	if t.Execution.Status == "result_pending" {
+		if err := json.Unmarshal(t.Execution.Result, &result); err != nil {
+			return "failed", err
+		}
+	}
 	if t.Execution.Status != "result_pending" {
 		if err := s.status(ctx, t, "running", worker.Result{}); err != nil {
 			return "interrupted", err
 		}
-		var result worker.Result
 		for attempt := 0; attempt <= 2; attempt++ {
 			var err error
 			result, err = s.Runner.Run(ctx, t.Worker, t.Job)
+			if result.Metrics != nil {
+				slog.Info("decision observation", "project", t.Job.Graph.Project.ID, "run", t.Job.RunID, "metrics", result.Metrics)
+			}
 			if ctx.Err() != nil {
 				// Process-wide shutdown leaves a recoverable registry entry. Explicit
 				// project/lease cancellation is terminal and cannot mint a fresh attempt.
@@ -308,7 +329,11 @@ func (s *Scheduler) runRegistered(ctx context.Context, t *task, stopHeartbeat fu
 	if err != nil {
 		var pe *ProtocolError
 		if errors.As(err, &pe) && pe.Status >= 400 && pe.Status < 500 {
-			s.terminal(t, "failed", worker.Result{Status: "failed", FailureKind: "invalid_output", Error: err.Error()})
+			result.Status, result.FailureKind, result.Error = "failed", "invalid_output", err.Error()
+			if pe.Status == 409 && strings.Contains(pe.Detail, "state_changed") {
+				result.FailureKind = "state_changed"
+			}
+			s.terminal(t, "failed", result)
 			return "failed", err
 		}
 		return "interrupted", err

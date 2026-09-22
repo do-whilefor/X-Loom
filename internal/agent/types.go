@@ -76,13 +76,14 @@ type Tool struct {
 	Execute  func(context.Context, json.RawMessage) (string, error)
 }
 type Event struct {
-	Type       string            `json:"type"`
-	Text       string            `json:"text,omitempty"`
-	ToolID     string            `json:"tool_id,omitempty"`
-	ToolName   string            `json:"tool_name,omitempty"`
-	Error      string            `json:"error,omitempty"`
-	Message    *Message          `json:"message,omitempty"`
-	Compaction *CompactionRecord `json:"compaction,omitempty"`
+	Type       string              `json:"type"`
+	Text       string              `json:"text,omitempty"`
+	ToolID     string              `json:"tool_id,omitempty"`
+	ToolName   string              `json:"tool_name,omitempty"`
+	Error      string              `json:"error,omitempty"`
+	Message    *Message            `json:"message,omitempty"`
+	Compaction *CompactionRecord   `json:"compaction,omitempty"`
+	Request    *RequestObservation `json:"request,omitempty"`
 }
 type Emit func(Event)
 type Provider interface {

@@ -145,15 +145,27 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 	if l.TaskPrompt == "" && len(l.History) > 0 {
 		l.TaskPrompt = l.History[0].Text()
 	}
-	target := l.ContextBytes
-	if target <= 0 {
-		target = before * 3 / 4
+	inputLimit := l.ContextBytes
+	if inputLimit <= 0 {
+		inputLimit = before * 3 / 4
 	}
-	if force && target >= before {
-		target = before * 3 / 4
+	if force && inputLimit >= before {
+		inputLimit = before * 3 / 4
 	}
-	if l.ContextTokens > 0 && target > l.ContextTokens*3 {
-		target = l.ContextTokens * 3
+	if l.ContextTokens > 0 && inputLimit > l.ContextTokens*3 {
+		inputLimit = l.ContextTokens * 3
+	}
+	// The summary still reads under the original input allowance. A smaller
+	// retained-context target must not also discard its source evidence.
+	target := inputLimit
+	targetTokens := l.ContextTokens
+	if l.ContextTargetTokens > 0 {
+		if targetTokens <= 0 || l.ContextTargetTokens < targetTokens {
+			targetTokens = l.ContextTargetTokens
+		}
+		if target > targetTokens*3 {
+			target = targetTokens * 3
+		}
 	}
 	if target <= 0 {
 		return budgetError("input budget is too small for pinned instructions")
@@ -203,6 +215,12 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 	recentBudget := l.RecentBytes
 	if recentBudget <= 0 {
 		recentBudget = available / 2
+		if l.ContextTargetTokens > 0 {
+			// Fill the target with complete recent groups instead of halving
+			// it again. Reserve the summary's worst-case JSON escaping (six
+			// wire bytes per source byte); short histories need no padding.
+			recentBudget = max(0, available-summaryBudget*6)
+		}
 	}
 	if recentBudget > available-summaryBudget {
 		recentBudget = available - summaryBudget
@@ -262,7 +280,7 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 			l.emit(Event{Type: "context_compaction_failed", Error: resultErr.Error(), Compaction: attemptRecord})
 		}
 	}()
-	summaryInput, err := l.summaryInput(body[:cut], target)
+	summaryInput, err := l.summaryInput(body[:cut], inputLimit)
 	if err != nil {
 		return err
 	}
@@ -270,12 +288,7 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 	if maxTokens <= 0 {
 		maxTokens = DefaultSummaryMaxTokens
 	}
-	var summary Message
-	if p, ok := l.Provider.(SummaryProvider); ok {
-		summary, err = p.GenerateSummary(ctx, summaryInput, maxTokens, nil)
-	} else {
-		summary, err = l.Provider.Generate(ctx, summaryInput, nil, nil)
-	}
+	summary, err := l.generate(ctx, summaryInput, nil, maxTokens)
 	attemptRecord.Usage = summary.Usage
 	if err != nil {
 		return fmt.Errorf("context summary: %w", err)
@@ -301,7 +314,7 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 		return err
 	}
 	afterTokens, afterBasis := l.tokenEstimate(candidate, after, l.Checkpoint.LastSequence)
-	if after >= before || after > target || (l.ContextTokens > 0 && afterTokens > l.ContextTokens) {
+	if after >= before || after > target || (targetTokens > 0 && afterTokens > targetTokens) {
 		return budgetError("compaction did not produce a smaller request within the input budget")
 	}
 	record := &CompactionRecord{Version: 1, ID: l.Checkpoint.CompactionCount + 1, PreviousID: previousID, SourceStart: sourceStart, SourceEnd: sourceEnd, AtSequence: l.Checkpoint.LastSequence, Summary: text, BeforeBytes: before, AfterBytes: after, BeforeTokensEstimate: beforeTokens, AfterTokensEstimate: afterTokens, TokenBasis: basis + " -> " + afterBasis, Usage: summary.Usage, Reason: "threshold", Status: "committed", View: candidate}

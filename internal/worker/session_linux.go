@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"xloom/internal/agent"
@@ -70,6 +71,9 @@ type session struct {
 	Identity               executionIdentity        `json:"identity"`
 	Log                    journalCheckpoint        `json:"log_checkpoint"`
 	ContextCheckpoint      *agent.ContextCheckpoint `json:"context_checkpoint,omitempty"`
+	DecisionMetrics        *DecisionMetrics         `json:"decision_metrics,omitempty"`
+	Replan                 *ReplanObservation       `json:"replan,omitempty"`
+	GraphVersion           string                   `json:"graph_version,omitempty"`
 	RecoveryCount          int                      `json:"recovery_count"`
 	Phase                  string                   `json:"phase"`
 	RunID                  string                   `json:"run_id"`
@@ -132,6 +136,10 @@ func (s *session) save(runDir string, journal *eventJournal) error {
 		return err
 	}
 	s.Log = journal.checkpoint()
+	if s.Kind == "reason" {
+		metrics := journal.metrics
+		s.DecisionMetrics = &metrics
+	}
 	s.Phase = "execute"
 	if s.Concluding {
 		s.Phase = "conclude"
@@ -187,6 +195,7 @@ type eventJournal struct {
 	lastCompaction uint64
 	uncommitted    int64
 	partialArchive string
+	metrics        DecisionMetrics
 }
 
 // Complete raw records are append-only. Only an incomplete, uncommitted final
@@ -202,7 +211,7 @@ func openJournal(runDir string, saved *journalCheckpoint) (*eventJournal, error)
 			f.Close()
 		}
 	}()
-	j := &eventJournal{file: f, digest: sha256.New()}
+	j := &eventJournal{file: f, digest: sha256.New(), metrics: newDecisionMetrics()}
 	stat, err := f.Stat()
 	if err != nil {
 		return nil, err
@@ -262,20 +271,17 @@ func openJournal(runDir string, saved *journalCheckpoint) (*eventJournal, error)
 			j.partialArchive = filepath.Base(archive.Name())
 			break
 		}
-		var event struct {
-			Type       string                  `json:"type"`
-			Message    *agent.Message          `json:"message,omitempty"`
-			Compaction *agent.CompactionRecord `json:"compaction,omitempty"`
-		}
+		var event agent.Event
 		if err = json.Unmarshal(line, &event); err != nil || event.Type == "" {
 			return nil, fmt.Errorf("invalid complete event record at byte %d", j.offset)
 		}
-		if event.Message != nil && event.Message.Sequence > j.lastSequence {
+		if !strings.HasPrefix(event.Type, "replan_") && event.Message != nil && event.Message.Sequence > j.lastSequence {
 			j.lastSequence = event.Message.Sequence
 		}
-		if event.Compaction != nil && event.Compaction.ID > j.lastCompaction {
+		if !strings.HasPrefix(event.Type, "replan_") && event.Compaction != nil && event.Compaction.ID > j.lastCompaction {
 			j.lastCompaction = event.Compaction.ID
 		}
+		j.metrics.observe(event)
 		j.digest.Write(line)
 		j.offset += int64(len(line))
 		if err = verify(); err != nil {
@@ -311,5 +317,8 @@ func (j *eventJournal) append(v any) error {
 	}
 	j.digest.Write(raw)
 	j.offset += int64(n)
+	if event, ok := v.(agent.Event); ok {
+		j.metrics.observe(event)
+	}
 	return nil
 }

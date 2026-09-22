@@ -7,9 +7,16 @@
 /refer/
 /docs/
 /design/
-/tests/
-DEVELOPMENT.md
-DEVELOPMENT-NEXT.md
+/tpm/
+/DEVELOPMENT*.md
+/VALIDATION*.md
+
+# ---- 测试仅在本地维护，不随源码发布 ----
+tests/
+testdata/
+*_test.go
+*.test.*
+*.spec.*
 
 # ---- 本地 AI 协作说明（不纳入版本控制）----
 # 带前导斜杠 => 只匹配仓库根目录；container/ 下的 AGENTS.md 需要入库，不受影响

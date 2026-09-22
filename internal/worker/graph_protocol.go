@@ -14,12 +14,14 @@ import (
 const MaxGraphRPCBytes = 128 << 10
 
 type GraphRequest struct {
-	RequestID string            `json:"request_id"`
-	Op        string            `json:"op"`
-	Section   string            `json:"section,omitempty"`
-	Offset    int               `json:"offset,omitempty"`
-	Limit     int               `json:"limit,omitempty"`
-	Action    board.StateAction `json:"action,omitempty"`
+	RequestID       string            `json:"request_id"`
+	Op              string            `json:"op"`
+	Section         string            `json:"section,omitempty"`
+	Offset          int               `json:"offset,omitempty"`
+	Limit           int               `json:"limit,omitempty"`
+	ExpectedVersion string            `json:"expected_version,omitempty"`
+	IDs             []string          `json:"ids,omitempty"`
+	Action          board.StateAction `json:"action,omitempty"`
 }
 
 type GraphRequestEvent struct {
@@ -46,6 +48,9 @@ func ValidateGraphRequest(j Job, r GraphRequest) error {
 		return errors.New("invalid graph request_id")
 	}
 	if r.Op == "read_graph" {
+		if err := validateGraphIDs(r); err != nil {
+			return err
+		}
 		if r.Offset < 0 || r.Limit < 0 || r.Limit > 50 {
 			return errors.New("graph page requires offset >= 0 and limit <= 50")
 		}
@@ -73,6 +78,13 @@ func ValidateGraphRequest(j Job, r GraphRequest) error {
 // GraphPage retains complete objects and reports the page boundary explicitly.
 // The dispatcher obtains State under the current execution fence before calling.
 func GraphPage(s board.State, r GraphRequest) (any, error) {
+	if err := validateGraphIDs(r); err != nil {
+		return nil, err
+	}
+	version := board.DecisionStateVersion(s)
+	if r.ExpectedVersion != "" && r.ExpectedVersion != version {
+		return nil, errors.New("state_changed: graph changed since the previous view; read overview and re-read affected evidence before deciding")
+	}
 	if r.Offset < 0 || r.Limit < 0 || r.Limit > 50 {
 		return nil, errors.New("invalid graph page")
 	}
@@ -95,8 +107,9 @@ func GraphPage(s board.State, r GraphRequest) (any, error) {
 			Inputs           []board.Fact   `json:"user_inputs"`
 			Revision         int64          `json:"revision"`
 			DecisionRevision int64          `json:"decision_revision"`
+			StateVersion     string         `json:"state_version"`
 			Counts           map[string]int `json:"counts"`
-		}{s.Graph.Project, inputs, s.Revision, s.DecisionRevision, map[string]int{"facts": len(s.FactRecords), "goals": len(s.Goals), "steps": len(s.Steps), "findings": len(s.Findings), "relations": len(s.FactRelations), "hints": len(s.Graph.Hints)}}
+		}{s.Graph.Project, inputs, s.Revision, s.DecisionRevision, version, map[string]int{"facts": len(s.FactRecords), "goals": len(s.Goals), "steps": len(s.Steps), "findings": len(s.Findings), "relations": len(s.FactRelations), "hints": len(s.Graph.Hints)}}
 	} else {
 		var items []json.RawMessage
 		var raw []byte
@@ -123,6 +136,32 @@ func GraphPage(s board.State, r GraphRequest) (any, error) {
 		if err = json.Unmarshal(raw, &items); err != nil {
 			return nil, err
 		}
+		missing := []string{}
+		if len(r.IDs) > 0 {
+			matched := map[string]bool{}
+			filtered := []json.RawMessage{}
+			for _, item := range items {
+				var identity struct{ ID, Source, Target string }
+				if err := json.Unmarshal(item, &identity); err != nil {
+					return nil, err
+				}
+				include := false
+				for _, id := range r.IDs {
+					if identity.ID == id || (r.Section == "relations" && (identity.Source == id || identity.Target == id)) {
+						include, matched[id] = true, true
+					}
+				}
+				if include {
+					filtered = append(filtered, item)
+				}
+			}
+			items = filtered
+			for _, id := range r.IDs {
+				if !matched[id] {
+					missing = append(missing, id)
+				}
+			}
+		}
 		total := len(items)
 		start := min(r.Offset, total)
 		end := min(start+r.Limit, total)
@@ -130,7 +169,7 @@ func GraphPage(s board.State, r GraphRequest) (any, error) {
 		if page == nil {
 			page = []json.RawMessage{}
 		}
-		value := graphPage{Section: r.Section, Offset: start, Total: total, Items: page}
+		value := graphPage{Section: r.Section, Offset: start, Total: total, Items: page, Revision: s.Revision, Generation: s.Graph.Project.Generation, StateVersion: version, RequestedIDs: r.IDs, MissingIDs: missing}
 		if end < total {
 			value.NextOffset = &end
 		}
@@ -147,9 +186,31 @@ func GraphPage(s board.State, r GraphRequest) (any, error) {
 }
 
 type graphPage struct {
-	Section    string            `json:"section"`
-	Offset     int               `json:"offset"`
-	Total      int               `json:"total"`
-	NextOffset *int              `json:"next_offset,omitempty"`
-	Items      []json.RawMessage `json:"items"`
+	RequestedIDs []string          `json:"requested_ids,omitempty"`
+	MissingIDs   []string          `json:"missing_ids,omitempty"`
+	Revision     int64             `json:"revision"`
+	Generation   int64             `json:"generation"`
+	StateVersion string            `json:"state_version"`
+	Section      string            `json:"section"`
+	Offset       int               `json:"offset"`
+	Total        int               `json:"total"`
+	NextOffset   *int              `json:"next_offset,omitempty"`
+	Items        []json.RawMessage `json:"items"`
+}
+
+func validateGraphIDs(r GraphRequest) error {
+	if len(r.IDs) > 50 {
+		return errors.New("at most 50 graph IDs are allowed")
+	}
+	if len(r.IDs) > 0 && (r.Section == "" || r.Section == "overview") {
+		return errors.New("graph IDs require a specific section")
+	}
+	seen := map[string]bool{}
+	for _, id := range r.IDs {
+		if strings.TrimSpace(id) == "" || len(id) > 256 || seen[id] {
+			return errors.New("graph IDs must be unique, nonempty and at most 256 bytes")
+		}
+		seen[id] = true
+	}
+	return nil
 }

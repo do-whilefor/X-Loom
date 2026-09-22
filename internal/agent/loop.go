@@ -33,11 +33,15 @@ type Loop struct {
 	ContextBytes int
 	// ContextTokens is an optional input allowance after reserving output space.
 	// Token estimates are labelled estimates; ContextBytes remains a hard cap.
-	ContextTokens    int
-	RecentBytes      int
-	SummaryBytes     int
-	SummaryMaxTokens int
-	mu               sync.Mutex
+	ContextTokens int
+	// ContextTargetTokens bounds the rebuilt request after compaction without
+	// changing its trigger. Zero retains the legacy compaction allocation.
+	ContextTargetTokens int
+	RecentBytes         int
+	SummaryBytes        int
+	SummaryMaxTokens    int
+	ObserveRequests     bool
+	mu                  sync.Mutex
 }
 
 func (l *Loop) emit(e Event) {
@@ -133,7 +137,7 @@ func (l *Loop) Run(ctx context.Context, prompt string) (string, error) {
 				}
 			}
 			l.emit(Event{Type: "turn_start"})
-			m, err := l.Provider.Generate(ctx, l.History, defs, l.emit)
+			m, err := l.generate(ctx, l.History, defs, 0)
 			if err != nil {
 				var modelErr *ModelError
 				if errors.As(err, &modelErr) && modelErr.Kind == ErrorContextOverflow && l.Checkpoint.OverflowRetries < 1 {
@@ -146,7 +150,7 @@ func (l *Loop) Run(ctx context.Context, prompt string) (string, error) {
 					if compactErr := l.compactForced(ctx); compactErr != nil {
 						return last, compactErr
 					}
-					m, err = l.Provider.Generate(ctx, l.History, defs, l.emit)
+					m, err = l.generate(ctx, l.History, defs, 0)
 				}
 			}
 			if err != nil {
