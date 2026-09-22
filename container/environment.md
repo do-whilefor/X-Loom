@@ -8,31 +8,12 @@
 
 ## 基础工具
 
-bash、curl、wget、ripgrep (`rg`)、fd、Python 3/pip、jq、git、procps、iproute2、DNS 查询、zip/unzip、sudo、npm。
+bash、curl、wget、ripgrep (`rg`)、fd (`fdfind`)、Python 3、pip、venv、jq、git、coreutils、procps (`ps`)、iproute2 (`ip`)、dnsutils (`dig`)、zip/unzip、sudo，以及 CA 证书和时区数据。
 
-## 安全工具
+`/opt/xloom-venv/bin` 已加入 PATH，`python`/`python3` 和 `pip`/`pip3` 默认使用该虚拟环境。镜像不预装第三方 Python 包，任务可按需安装依赖。
 
-- Kali 工具集：`kali-linux-headless`，外加 bloodyad、coercer、enum4linux-ng、pwncat、dirsearch、yq、krb5-user、gitleaks、naabu、nikto、netexec、adb、ncat、rlwrap、sshpass。
-- chisel 二进制位于 `/usr/share/chisel-common-binaries`。
-- 额外二进制：katana、nuclei、dalfox、cloudfox、kerbrute、ysoserial。
-- Python 虚拟环境 `/opt/xloom-venv`（已在 PATH 中）：pwntools、pymongo、tccli、awscli；`jwt_tool` 的依赖也装在这里。
-- 云 CLI：`aliyun`。
+## 安装范围
 
-## 浏览器
-
-Playwright CLI 与其 Chromium 浏览器位于 `/opt/ms-playwright`（`playwright-cli --help` 查看用法，非必要不要使用）。
-
-## 知识库与 PoC
-
-- `/opt/nuclei-templates`：nuclei 模板，已为 root 和 kali 写好 `disable-update-check` 与 `update-template-dir` 配置。
-- `/home/kali/knowledges`：PayloadsAllTheThings、InternalAllTheThings、hacktricks、hacktricks-cloud。
-- `/home/kali/pocs`：CVE-PoC、exphub、2023Hvv_、Awesome-POC、vulhub。
-- `/home/kali/tools`：ysoserial、jwt_tool、jdwp-shellifier。
-
-以上仓库均固定在指定 commit，以保证镜像可复现。
-
-## 不包含
-
-Cairn 的外部代理 CLI（Codex、Claude Code、Pi）——任务由 X-Loom 自有 Go Agent Loop 执行。
+仅预装上述基础运行工具和 X-Loom 二进制。不预装 Kali 安全工具集、浏览器、云 CLI、知识库或 PoC，也不复制原竞赛环境的 `AGENTS.md`、`CLAUDE.md` 和技能目录。
 
 此文档只是镜像环境说明，不自动注入模型提示词。
