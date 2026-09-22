@@ -487,6 +487,9 @@ func (s *Server) intent(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 	if err = g.ValidateSources(from); err != nil {
 		return 0, nil, err
 	}
+	if worker != nil && *worker != creator {
+		return 0, nil, b.Err(400, "worker must be null or equal to creator")
+	}
 	if r.Header.Get("X-Xloom-Run") != "" {
 		state, err := t.State(g.Project.ID)
 		if err != nil {
@@ -495,9 +498,13 @@ func (s *Server) intent(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 		if err = state.ValidateFactSources(from, false); err != nil {
 			return 0, nil, err
 		}
-	}
-	if worker != nil && *worker != creator {
-		return 0, nil, b.Err(400, "worker must be null or equal to creator")
+		if existing, ok := state.MatchingStep("goal", from, desc); ok {
+			for _, intent := range g.Intents {
+				if intent.ID == existing.ID {
+					return 200, intent, nil
+				}
+			}
+		}
 	}
 	if r.Header.Get("X-Xloom-Lease") == "reason" && r.Header.Get("X-Xloom-Run") != "" {
 		if err = t.CheckNewStepLimit(g.Project.ID, r.Header.Get("X-Xloom-Run")); err != nil {

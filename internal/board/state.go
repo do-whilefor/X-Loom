@@ -426,7 +426,7 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 	case "finding":
 		id, result, err = t.upsertFinding(s, &d, fence, action.Payload)
 	case "goal":
-		id, result, err = t.changeGoal(s, &d, action.Payload)
+		id, result, changed, err = t.changeGoal(s, &d, action.Payload)
 	case "step":
 		id, result, changed, err = t.changeStep(&s, &d, fence, action.Payload)
 	}
@@ -622,7 +622,7 @@ func (t *Tx) stateID(project, kind, prefix string) (string, error) {
 	return fmt.Sprintf("%s%03d", prefix, n), err
 }
 
-func (t *Tx) changeGoal(s State, d *stateData, raw json.RawMessage) (string, any, error) {
+func (t *Tx) changeGoal(s State, d *stateData, raw json.RawMessage) (string, any, bool, error) {
 	var input struct {
 		Action    string   `json:"action"`
 		ID        string   `json:"id"`
@@ -632,14 +632,14 @@ func (t *Tx) changeGoal(s State, d *stateData, raw json.RawMessage) (string, any
 		Sources   []string `json:"sources"`
 	}
 	if err := decodeAction(raw, &input); err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 	if input.ID == "goal" {
-		return "", nil, Err(403, "root goal is user-owned; completion uses the project completion contract")
+		return "", nil, false, Err(403, "root goal is user-owned; completion uses the project completion contract")
 	}
 	if input.Action == "add" {
 		if input.ID != "" || !required(input.Condition, 16384) {
-			return "", nil, Err(422, "new goal requires condition and a server-assigned ID")
+			return "", nil, false, Err(422, "new goal requires condition and a server-assigned ID")
 		}
 		if input.ParentID == "" {
 			input.ParentID = "goal"
@@ -649,17 +649,22 @@ func (t *Tx) changeGoal(s State, d *stateData, raw json.RawMessage) (string, any
 			parent = parent || (g.ID == input.ParentID && g.Status == "open")
 		}
 		if !parent {
-			return "", nil, Err(409, "parent goal is not open")
+			return "", nil, false, Err(409, "parent goal is not open")
+		}
+		for _, goal := range s.Goals {
+			if goal.ParentID == input.ParentID && goal.Condition == strings.TrimSpace(input.Condition) {
+				return goal.ID, goal, false, nil
+			}
 		}
 		id, err := t.stateID(s.Graph.Project.ID, "goal", "g")
 		goal := Goal{ID: id, ParentID: input.ParentID, Condition: strings.TrimSpace(input.Condition), Status: "open", Sources: []string{}, CreatedAt: t.Now}
 		if err == nil {
 			d.Goals = append(d.Goals, goal)
 		}
-		return id, goal, err
+		return id, goal, true, err
 	}
 	if !slices.Contains([]string{"withdraw", "achieve"}, input.Action) || !required(input.Reason, 8192) || input.Condition != "" || input.ParentID != "" {
-		return "", nil, Err(422, "goal transition requires a reason and cannot rewrite its condition or parent")
+		return "", nil, false, Err(422, "goal transition requires a reason and cannot rewrite its condition or parent")
 	}
 	for n := range d.Goals {
 		goal := &d.Goals[n]
@@ -671,30 +676,30 @@ func (t *Tx) changeGoal(s State, d *stateData, raw json.RawMessage) (string, any
 			canRevalidate = canRevalidate || (current.ID == goal.ID && current.Status == "achieved" && !current.SupportValid)
 		}
 		if goal.Status != "open" && !canRevalidate {
-			return "", nil, Err(409, "goal is no longer open")
+			return "", nil, false, Err(409, "goal is no longer open")
 		}
 		for _, child := range d.Goals {
 			if child.ParentID == goal.ID && child.Status == "open" {
-				return "", nil, Err(409, "goal has an open child; resolve it explicitly first")
+				return "", nil, false, Err(409, "goal has an open child; resolve it explicitly first")
 			}
 		}
 		for _, step := range s.Steps {
 			if step.GoalID == goal.ID && (step.Status == "open" || step.Status == "running") {
-				return "", nil, Err(409, "goal has an active step; resolve it explicitly first")
+				return "", nil, false, Err(409, "goal has an active step; resolve it explicitly first")
 			}
 		}
 		if input.Action == "achieve" {
 			if err := s.ValidateFactSources(input.Sources, true); err != nil {
-				return "", nil, err
+				return "", nil, false, err
 			}
 			goal.Status, goal.Sources = "achieved", input.Sources
 		} else {
 			goal.Status = "withdrawn"
 		}
 		goal.Reason = input.Reason
-		return goal.ID, *goal, nil
+		return goal.ID, *goal, true, nil
 	}
-	return "", nil, Err(404, "Goal not found")
+	return "", nil, false, Err(404, "Goal not found")
 }
 
 func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.RawMessage) (string, any, bool, error) {
@@ -729,6 +734,9 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 		}
 		if !goalOpen {
 			return "", nil, false, Err(409, "step requires an open goal")
+		}
+		if existing, ok := s.MatchingStep(input.GoalID, input.From, input.Description); ok {
+			return existing.ID, existing, false, nil
 		}
 		if err := t.CheckNewStepLimit(s.Graph.Project.ID, fence.Run); err != nil {
 			return "", nil, false, err

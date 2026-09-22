@@ -41,14 +41,30 @@ func (s *Server) executions(t *b.Tx, q *request, r *http.Request) (int, any, err
 	}
 	e.ProjectID = r.PathValue("pid")
 	var job struct {
-		RunID     string    `json:"run_id"`
-		Kind      string    `json:"kind"`
-		Graph     b.Graph   `json:"graph"`
-		Intent    *b.Intent `json:"intent"`
-		Workspace string    `json:"workspace"`
+		RunID                 string          `json:"run_id"`
+		Kind                  string          `json:"kind"`
+		Graph                 b.Graph         `json:"graph"`
+		Intent                *b.Intent       `json:"intent"`
+		Workspace             string          `json:"workspace"`
+		GraphRPC              json.RawMessage `json:"graph_rpc"`
+		ResultContractVersion json.RawMessage `json:"result_contract_version"`
 	}
 	if json.Unmarshal(e.Job, &job) != nil || e.ID == "" || e.Namespace == "" || e.Backend == "" || e.Lease == "" || e.RetryKey == "" || job.RunID != e.ID || job.Kind != e.Kind || job.Graph.Project.ID != e.ProjectID || job.Workspace == "" {
 		return 0, nil, b.Err(422, "Invalid execution identity")
+	}
+	// Absence preserves old jobs. Explicit null or a malformed value must not
+	// silently select the compatibility protocol or poison a durable result.
+	if len(job.GraphRPC) != 0 {
+		var enabled bool
+		if strings.TrimSpace(string(job.GraphRPC)) == "null" || json.Unmarshal(job.GraphRPC, &enabled) != nil {
+			return 0, nil, b.Err(422, "graph_rpc must be a boolean")
+		}
+	}
+	if len(job.ResultContractVersion) != 0 {
+		var version int
+		if strings.TrimSpace(string(job.ResultContractVersion)) == "null" || json.Unmarshal(job.ResultContractVersion, &version) != nil || version < 0 || version > 1 {
+			return 0, nil, b.Err(422, "result_contract_version must be 0 or 1")
+		}
 	}
 	if !b.ValidExecutionID(e.ID) || len(e.Namespace) > 128 || len(e.Backend) > 256 || len(e.RetryKey) > 1024 || e.Lease != e.Backend+"@"+e.ID {
 		return 0, nil, b.Err(422, "Invalid execution identity")
@@ -189,7 +205,9 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 		return 0, nil, err
 	}
 	var job struct {
-		Budget struct {
+		GraphRPC              bool `json:"graph_rpc"`
+		ResultContractVersion int  `json:"result_contract_version"`
+		Budget                struct {
 			MaxIntents int `json:"max_intents"`
 		} `json:"budget"`
 	}
@@ -217,9 +235,14 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 			open++
 		}
 	}
-	parsed, err := contract.Parse(result.Text, e.Kind, result.Conclude, open, job.Budget.MaxIntents)
+	// The registered job fixes the submission protocol. A model response or
+	// apply request cannot opt a live graph run into legacy plan creation.
+	parsed, err := contract.ParseWithPolicy(result.Text, e.Kind, result.Conclude, open, job.Budget.MaxIntents, contract.Policy{Version: job.ResultContractVersion, GraphRPC: job.GraphRPC})
 	if err != nil {
 		return 0, nil, b.Err(422, err.Error())
+	}
+	if parsed.Outcome == "continue" || parsed.Outcome == "incomplete" {
+		return 0, nil, b.Err(422, "Continuing or incomplete worker output cannot be applied as a successful result")
 	}
 	call := func(fn action, fields map[string]any) (any, error) {
 		q := &request{fields: fields}

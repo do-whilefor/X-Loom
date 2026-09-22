@@ -94,6 +94,8 @@ type session struct {
 	RepairReason           string                   `json:"repair_reason,omitempty"`
 	RepairPrompt           string                   `json:"repair_prompt,omitempty"`
 	RepairPending          bool                     `json:"repair_pending,omitempty"`
+	ContinuationCount      int                      `json:"continuation_count,omitempty"`
+	ContinuationSequence   uint64                   `json:"continuation_sequence,omitempty"`
 }
 
 func (s *session) validate(i executionIdentity) error {
@@ -107,8 +109,11 @@ func (s *session) validate(i executionIdentity) error {
 	if !bytes.Equal(a, b) || s.RunID != i.RunID || s.Kind != i.Kind || s.StartedAt.IsZero() {
 		return errors.New("session task identity or immutable input mismatch")
 	}
-	if s.RepairCount < 0 || s.RepairCount > maxOutputRepairs || (s.RepairCount > 0 && !s.Repairing) || (s.Repairing && (s.RepairCount == 0 || s.RepairPrompt == "")) {
+	if s.RepairCount < 0 || s.RepairCount > maxOutputRepairs || (s.Repairing && (s.RepairCount == 0 || s.RepairPrompt == "")) || (!s.Repairing && (s.RepairPending || s.RepairPrompt != "")) {
 		return errors.New("invalid saved result-repair state")
+	}
+	if s.ContinuationCount < 0 || s.ContinuationCount > maxContinuations {
+		return errors.New("invalid saved continuation count")
 	}
 	if s.RecoveryCount < 0 || s.RecoveryCount > maxRunRecoveries {
 		return errors.New("invalid saved recovery count")

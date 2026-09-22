@@ -169,6 +169,10 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	enc := json.NewEncoder(o.Output)
 	var logErr error
 	emit := func(e agent.Event) {
+		if e.Type == "tool_end" && e.Error == "" {
+			// The next settled tool-result save makes this progress durable.
+			state.ContinuationCount = 0
+		}
 		if state.Repairing && e.Type == "message_end" && e.Message != nil && e.Message.Role == "assistant" {
 			state.RepairPending = false
 		}
@@ -205,6 +209,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		if process.Cancelled(o.RunDir) {
 			return Result{}, context.Canceled
 		}
+		r = checkedResult(j, r)
 		if r.Status == "failed" && r.FailureKind == "" {
 			r.FailureKind = "execution"
 		}
@@ -226,11 +231,17 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	infrastructureResume := false
 	if state.Result != nil {
 		last, ok := lastAssistant(state.History)
+		parsed, parseErr := parseOutput(j, state.Result.Conclude, state.Result.Text)
 		if state.Result.Retryable {
 			infrastructureResume = true
 			state.Result = nil
-		} else if state.Result.Status == "success" && ok && truncated(last) {
+		} else if state.Result.Status == "success" && (parseErr != nil || parsed.Outcome == "continue" || (ok && truncated(last))) {
+			if !ok {
+				return finish(checkedResult(j, *state.Result))
+			}
 			state.Result = nil
+		} else if state.Result.Status == "success" && parsed.Outcome == "incomplete" {
+			return finish(checkedResult(j, *state.Result))
 		} else {
 			return *state.Result, enc.Encode(state.Result)
 		}
@@ -401,6 +412,27 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		}
 		return instruction, nil
 	}
+	continueExecution := func() (string, error) {
+		last, ok := lastAssistant(l.History)
+		if !ok || last.Sequence == 0 {
+			return "", errors.New("continuation requires a durable assistant message")
+		}
+		if state.ContinuationSequence != last.Sequence {
+			if state.ContinuationCount >= maxContinuations {
+				return "", &outputFailure{Reason: "continuation_exhausted", Detail: "repeated continue responses made no successful tool progress"}
+			}
+			state.ContinuationCount++
+			state.ContinuationSequence = last.Sequence
+		}
+		state.Repairing, state.RepairPending, l.Repairing = false, false, false
+		state.RepairReason, state.RepairPrompt, l.RepairPrompt = "", "", ""
+		// Persist consumption before the follow-up instruction. Recovery can
+		// then reissue that instruction without replaying tools or buying turns.
+		if err := save(l.History); err != nil {
+			return "", err
+		}
+		return "Continue the unfinished work in this same execution. Tools are enabled. The original task deadline still applies. Use completed only when the assigned task is finished; otherwise continue working or report incomplete with the remaining work and blocker.", nil
+	}
 	l.OnTurnEnd = func(turnCtx context.Context, l *agent.Loop, m agent.Message) (context.Context, string, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
@@ -408,7 +440,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		hasCalls := hasToolCalls(m)
 		problem := outputProblem(j, l.Concluding, m)
 		needsResult := !hasCalls || truncated(m) || l.Concluding || l.Repairing
-		if !l.Concluding && j.Kind != "reason" && (shouldConclude() || (needsResult && problem != nil)) {
+		if !l.Concluding && j.Kind != "reason" && (shouldConclude() || (j.ResultContractVersion == 0 && needsResult && problem != nil)) {
 			next, err := startConclusion()
 			if err != nil {
 				return nil, "", err
@@ -422,6 +454,16 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		if needsResult && problem != nil {
 			instruction, err := startRepair(turnCtx, problem)
 			return turnCtx, instruction, err
+		}
+		if needsResult {
+			parsed, err := parseOutput(j, l.Concluding, m.Text())
+			if err != nil {
+				return nil, "", err
+			}
+			if parsed.Outcome == "continue" {
+				instruction, err := continueExecution()
+				return turnCtx, instruction, err
+			}
 		}
 		return turnCtx, "", nil
 	}
@@ -490,12 +532,12 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	} else if last, ok := lastAssistant(l.History); ok && prompt == "" && !awaitingInstructionResponse(l.History) {
 		if !hasToolCalls(last) || truncated(last) || state.Repairing {
 			// A model turn may have been saved immediately before the worker crashed.
-			if problem := outputProblem(j, l.Concluding, last); problem == nil {
-				return finish(Result{Type: "result", Status: "success", Text: last.Text(), Conclude: l.Concluding})
-			}
 			runCtx, prompt, err = l.OnTurnEnd(runCtx, l, last)
 			if err != nil {
 				return finish(Result{Type: "result", Status: "failed", Text: last.Text(), Conclude: l.Concluding, Error: err.Error()})
+			}
+			if prompt == "" {
+				return finish(Result{Type: "result", Status: "success", Text: last.Text(), Conclude: l.Concluding})
 			}
 		}
 	}
@@ -564,6 +606,10 @@ func mock(j Job) Result {
 			data["intents"] = []any{map[string]any{"from": []string{"origin"}, "description": "Mock exploration"}}
 		}
 	}
-	raw, _ := json.Marshal(map[string]any{"accepted": true, "data": data})
+	response := map[string]any{"accepted": true, "data": data}
+	if j.ResultContractVersion == 1 && j.Kind != "reason" {
+		response["outcome"] = "completed"
+	}
+	raw, _ := json.Marshal(response)
 	return Result{Type: "result", Status: "success", Text: string(raw)}
 }

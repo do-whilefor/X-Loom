@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"text/template"
 	"xloom/internal/board"
+	"xloom/internal/config"
 )
 
 //go:embed prompts/*.md
@@ -68,7 +69,12 @@ func taskTemplate(j Job, conclude bool) (string, error) {
 		return "", err
 	}
 	var body bytes.Buffer
-	if err = t.Execute(&body, j.Budget); err != nil {
+	data := struct {
+		config.Task
+		ResultContractVersion int
+		GraphRPC              bool
+	}{j.Budget, j.ResultContractVersion, j.GraphRPC}
+	if err = t.Execute(&body, data); err != nil {
 		return "", err
 	}
 	return body.String() + scenarioPrompt(j), nil

@@ -22,22 +22,23 @@ const (
 )
 
 type Job struct {
-	RunID            string                 `json:"run_id"`
-	PreviousRunID    string                 `json:"previous_run_id,omitempty"`
-	GraphRPC         bool                   `json:"graph_rpc,omitempty"`
-	EnvironmentID    string                 `json:"environment_id,omitempty"`
-	DecisionRevision int64                  `json:"decision_revision,omitempty"`
-	Decision         *board.DecisionContext `json:"decision,omitempty"`
-	DecisionTrigger  string                 `json:"decision_trigger,omitempty"`
-	DecisionTriggers []string               `json:"decision_triggers,omitempty"`
-	DecisionRepeated bool                   `json:"decision_repeated,omitempty"`
-	Kind             string                 `json:"kind"`
-	WorkerType       string                 `json:"worker_type"`
-	Graph            board.Graph            `json:"graph"`
-	State            *board.State           `json:"state,omitempty"`
-	Intent           *board.Intent          `json:"intent,omitempty"`
-	Budget           config.Task            `json:"budget"`
-	Workspace        string                 `json:"workspace"`
+	RunID                 string                 `json:"run_id"`
+	PreviousRunID         string                 `json:"previous_run_id,omitempty"`
+	GraphRPC              bool                   `json:"graph_rpc,omitempty"`
+	ResultContractVersion int                    `json:"result_contract_version,omitempty"`
+	EnvironmentID         string                 `json:"environment_id,omitempty"`
+	DecisionRevision      int64                  `json:"decision_revision,omitempty"`
+	Decision              *board.DecisionContext `json:"decision,omitempty"`
+	DecisionTrigger       string                 `json:"decision_trigger,omitempty"`
+	DecisionTriggers      []string               `json:"decision_triggers,omitempty"`
+	DecisionRepeated      bool                   `json:"decision_repeated,omitempty"`
+	Kind                  string                 `json:"kind"`
+	WorkerType            string                 `json:"worker_type"`
+	Graph                 board.Graph            `json:"graph"`
+	State                 *board.State           `json:"state,omitempty"`
+	Intent                *board.Intent          `json:"intent,omitempty"`
+	Budget                config.Task            `json:"budget"`
+	Workspace             string                 `json:"workspace"`
 }
 type Result struct {
 	Type         string           `json:"type"`

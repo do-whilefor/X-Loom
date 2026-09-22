@@ -10,6 +10,7 @@ import (
 )
 
 const maxOutputRepairs = 2
+const maxContinuations = 3
 
 type outputFailure struct {
 	Reason string
@@ -61,10 +62,32 @@ func outputProblem(j Job, concluding bool, m agent.Message) *outputFailure {
 	if hasToolCalls(m) {
 		return &outputFailure{Reason: "unexpected_tool_call", Detail: "a final result is required; tool calls cannot supply a result during pure-output repair"}
 	}
-	if _, err := contract.Parse(m.Text(), j.Kind, concluding, j.Graph.OpenCount(), j.Budget.MaxIntents); err != nil {
+	if _, err := parseOutput(j, concluding, m.Text()); err != nil {
 		return &outputFailure{Reason: "invalid_contract", Detail: err.Error()}
 	}
 	return nil
+}
+
+func parseOutput(j Job, concluding bool, text string) (contract.Result, error) {
+	return contract.ParseWithPolicy(text, j.Kind, concluding, j.Graph.OpenCount(), j.Budget.MaxIntents, contract.Policy{Version: j.ResultContractVersion, GraphRPC: j.GraphRPC})
+}
+
+// A terminal result can be persisted or replayed only after applying the same
+// immutable job contract used at the live model boundary.
+func checkedResult(j Job, r Result) Result {
+	if r.Status != "success" {
+		return r
+	}
+	parsed, err := parseOutput(j, r.Conclude, r.Text)
+	if err != nil {
+		r.Status, r.FailureKind, r.Error = "failed", "result_contract", err.Error()
+	} else if parsed.Outcome == "incomplete" {
+		r.Status, r.FailureKind, r.Error = "failed", "incomplete", parsed.Reason
+	} else if parsed.Outcome == "continue" {
+		r.Status, r.FailureKind, r.Error = "failed", "result_contract", "continue is not a terminal result"
+	}
+	r.Retryable = false
+	return r
 }
 
 func repairInstruction(j Job, concluding bool, attempt int, problem *outputFailure) (string, error) {
@@ -76,7 +99,14 @@ func repairInstruction(j Job, concluding bool, attempt int, problem *outputFailu
 		return "", err
 	}
 	reason, _ := json.Marshal(problem.Error())
-	prompt := fmt.Sprintf("Result-format repair %d/%d in the same session. All tools are disabled. The previous response cannot be submitted: %s. Produce one short, complete JSON object satisfying the task contract below; do not append a suffix to the earlier response or place an earlier invalid JSON object before the repaired one. Use only the existing evidence. Do not repeat actions, invent facts, force accepted:true, or declare completion without its required proof. If no supported factual result is available, return {\"accepted\":false,\"reason\":\"...\"}. A truncated response must be rewritten more briefly, not trusted as a complete answer.\n<result_contract>\n%s\n</result_contract>\n", attempt, maxOutputRepairs, reason, contractText)
+	fallback := "If no supported factual result is available, return {\"accepted\":false,\"reason\":\"...\"}."
+	if j.ResultContractVersion == 1 && j.Kind != "reason" {
+		fallback = "An unfinished accepted task must report incomplete with remaining work and its blocker, not completed or rejected merely to satisfy JSON formatting."
+		if !concluding {
+			fallback += " If further execution can finish the task, report continue; the runtime will restore tools in this same run under the original deadline."
+		}
+	}
+	prompt := fmt.Sprintf("Result-format repair %d/%d in the same session. All tools are disabled. The previous response cannot be submitted: %s. Produce one short, complete JSON object satisfying the task contract below; do not append a suffix to the earlier response or place an earlier invalid JSON object before the repaired one. Use only the existing evidence. Do not repeat actions, invent facts, force accepted:true, or declare completion without its required proof. %s A truncated response must be rewritten more briefly, not trusted as a complete answer.\n<result_contract>\n%s\n</result_contract>\n", attempt, maxOutputRepairs, reason, fallback, contractText)
 	if j.Kind == "reason" {
 		graph, err := jobContextView(j)
 		if err != nil {
