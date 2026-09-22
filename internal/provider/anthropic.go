@@ -11,9 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"xloom/internal/agent"
@@ -153,27 +155,26 @@ func (p *Anthropic) generate(ctx context.Context, messages []agent.Message, tool
 		req.Header.Set("x-opencode-session", p.sessionID)
 		res, err = client.Do(req)
 		if err != nil {
-			return agent.Message{}, &agent.ModelError{Kind: agent.ErrorTransport, Err: err}
+			if attempt >= 2 || ctx.Err() != nil || !retryableTransport(err) {
+				return agent.Message{}, &agent.ModelError{Kind: agent.ErrorTransport, Err: err}
+			}
+		} else {
+			if res.StatusCode >= 200 && res.StatusCode < 300 {
+				break
+			}
+			status := res.StatusCode
+			body, _ := io.ReadAll(io.LimitReader(res.Body, 8192))
+			res.Body.Close()
+			classified := classifyEndpointError(status, body)
+			if classified.Kind == agent.ErrorContextOverflow {
+				return agent.Message{}, classified
+			}
+			if attempt >= 2 || (status != 429 && status < 500) {
+				return agent.Message{}, classified
+			}
 		}
-		if res.StatusCode >= 200 && res.StatusCode < 300 {
-			break
-		}
-		status := res.StatusCode
-		body, _ := io.ReadAll(io.LimitReader(res.Body, 8192))
-		res.Body.Close()
-		classified := classifyEndpointError(status, body)
-		if classified.Kind == agent.ErrorContextOverflow {
-			return agent.Message{}, classified
-		}
-		if attempt >= 2 || (status != 429 && status < 500) {
-			return agent.Message{}, classified
-		}
-		timer := time.NewTimer(time.Duration(1<<attempt) * time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return agent.Message{}, ctx.Err()
-		case <-timer.C:
+		if err := waitRetry(ctx, attempt); err != nil {
+			return agent.Message{}, err
 		}
 	}
 	defer res.Body.Close()
@@ -221,6 +222,29 @@ func (p *Anthropic) generate(ctx context.Context, messages []agent.Message, tool
 		}
 	}
 	return message, streamErr
+}
+
+func retryableTransport(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var network net.Error
+	return errors.As(err, &network) && (network.Timeout() || network.Temporary())
+}
+
+func waitRetry(ctx context.Context, attempt int) error {
+	timer := time.NewTimer(time.Duration(1<<attempt) * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
 }
 
 func classifyEndpointError(status int, body []byte) *agent.ModelError {
