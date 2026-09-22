@@ -12,7 +12,8 @@ tasks:
     timeout: 0
     conclude_timeout: 60
   reason:
-    timeout: 120
+    # Maximum reasoning can span several model requests and graph reads.
+    timeout: 300
     max_intents: 3
   explore:
     timeout: 0

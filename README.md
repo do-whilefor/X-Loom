@@ -44,9 +44,21 @@ docker build -f container/Dockerfile -t xloom-worker:dev .
 
 ### 4. 启动
 
+确认本机 `dispatch.yaml` 中的 `container.image` 与已构建的 Worker 镜像标签一致
+（上述命令为 `xloom-worker:dev`）；修改示例文件不会自动更新已有配置。
+
+先检查配置和真实模型接入，再启动服务：
+
 ```bash
-docker compose up -d
+docker compose config --quiet
+docker compose run --rm --no-deps dispatcher dispatch \
+  --config /etc/xloom/dispatch.yaml --startup-healthcheck-only
+docker compose up -d --no-build --wait server dispatcher
+docker compose ps
 ```
+
+模型检查会发送一次小型真实请求。Web 可访问只说明 Server 已启动；还需要 Dispatcher
+持续运行，才能调度项目并动态创建 Worker。
 
 访问：
 
