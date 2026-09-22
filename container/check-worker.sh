@@ -8,6 +8,8 @@ test "$(getent passwd kali | cut -d: -f6)" = /home/kali
 test "$(readlink -f /home/kali/workspace)" = /workspace
 test "$TZ" = Asia/Shanghai
 test "$PYTHONUNBUFFERED" = 1
+test -s /etc/ssl/certs/ca-certificates.crt
+dpkg-query -W -f '${Status}\n' ca-certificates | grep -Fx 'install ok installed' >/dev/null
 for tool in bash curl wget rg fd python python3 pip pip3 jq git cat ps ip dig unzip zip sudo; do
     command -v "$tool" >/dev/null
 done

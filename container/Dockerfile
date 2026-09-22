@@ -8,16 +8,22 @@ ARG KALI_MIRROR=
 ENV TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1
 
+# 在第一次 APT 请求前，从已有控制镜像提供 CA，避免 HTTPS 源的冷启动依赖。
+# 随后安装 Kali 的 ca-certificates 接管证书更新；不关闭 TLS 或 APT 签名校验。
+COPY --from=application /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
 # 可选镜像源只替换 URI，保留套件、组件和签名校验配置。
-# 安装 ca-certificates 前使用 HTTP；软件包仍由 Kali keyring 验证。
 RUN if [ -n "$KALI_MIRROR" ]; then \
-        case "$KALI_MIRROR" in http://?*) ;; *) echo 'KALI_MIRROR must start with http://' >&2; exit 1 ;; esac; \
+        case "$KALI_MIRROR" in http://?*|https://?*) ;; *) echo 'KALI_MIRROR must start with http:// or https://' >&2; exit 1 ;; esac; \
         awk -v mirror="$KALI_MIRROR" '$1 == "URIs:" {$0 = "URIs: " mirror} {print}' \
             /etc/apt/sources.list.d/kali.sources > /tmp/kali.sources \
         && mv /tmp/kali.sources /etc/apt/sources.list.d/kali.sources; \
     fi \
-    && apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    && apt-get -o Acquire::https::CaInfo=/etc/ssl/certs/ca-certificates.crt \
+        -o APT::Update::Error-Mode=any -o Acquire::Retries=2 update \
+    && DEBIAN_FRONTEND=noninteractive apt-get \
+        -o Acquire::https::CaInfo=/etc/ssl/certs/ca-certificates.crt \
+        -o Acquire::Retries=2 install -y --no-install-recommends \
         bash ca-certificates curl wget ripgrep fd-find \
         python3 python3-pip python3-venv jq git coreutils procps \
         iproute2 dnsutils unzip zip sudo tzdata \

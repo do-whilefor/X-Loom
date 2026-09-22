@@ -26,19 +26,24 @@ docker compose --profile images build worker-image
 
 ### apt 镜像源
 
-镜像默认使用 Kali 官方源。官方源不可用时可显式指定镜像源，缺省留空表示行为不变：
+镜像默认使用 Kali 官方源。官方源不可用时可显式切换到中科大 USTC 的 HTTPS 镜像源，
+缺省留空表示行为不变：
 
 ```bash
 docker build -f container/Dockerfile \
-  --build-arg KALI_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/kali \
+  --build-arg KALI_MIRROR=https://mirrors.ustc.edu.cn/kali \
   -t xloom-worker:dev .
 ```
 
 该参数只改写 `sources.list.d/kali.sources` 的 `URIs` 字段，套件、组件与签名配置保持不变。
 
-必须使用 `http://`。基础 Kali 镜像为精简镜像，在执行该替换时尚未安装
-`ca-certificates`，`https://` 源会因无法校验证书而失败；官方默认源本身也是 http。
-包完整性由 apt 的 `Signed-By`（kali-archive-keyring）校验，不依赖传输层加密。
+支持 `http://` 和 `https://`。固定的裸 Kali 镜像缺少 CA 证书；Dockerfile 在首次
+APT 请求前从控制镜像复制 CA 证书包，并用 `Acquire::https::CaInfo` 显式指定路径，
+再正常安装 Kali 的 `ca-certificates`。
+因此 HTTPS 源不再依赖先用 HTTP 安装证书，也不会关闭 TLS 证书校验或 APT 签名校验。
+自定义 `XLOOM_IMAGE` 必须同时提供 X-Loom 二进制和 `/etc/ssl/certs/ca-certificates.crt`。
+
+APT 索引下载失败会使构建失败，避免把使用旧索引的警告误判为成功；临时下载错误最多重试两次。
 
 镜像自检。`check-worker.sh` 已随镜像分发到 `/usr/local/share/xloom/`，可直接离线运行，并顺带验证镜像自身的 ENTRYPOINT：
 

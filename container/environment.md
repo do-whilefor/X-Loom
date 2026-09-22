@@ -5,6 +5,7 @@
 - `/workspace/.xloom/runs/<run-id>` 保存单次执行的任务、会话和工具输出。
 - 默认用户为 root，以兼容 Dispatcher 写入的私有任务文件。保留 `kali` 用户和免密码 sudo，便于手动使用。
 - 时区为 `Asia/Shanghai`，Python 输出不缓冲。
+- 首次 APT 请求前从控制镜像提供 CA 证书，支持 HTTPS 镜像源；构建完成后由 Kali 的 `ca-certificates` 管理证书。
 
 ## 基础工具
 
