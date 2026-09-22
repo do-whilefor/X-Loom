@@ -17,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"xloom/internal/agent"
 	"xloom/internal/process"
@@ -42,7 +43,7 @@ func (s *Set) All() []agent.Tool {
 		def("read", "Read a text file with optional 1-based offset and line limit.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}`, true, true, s.read),
 		def("bash", "Run a bash command in the project workspace. Long output is saved to a file.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false}`, false, false, s.bash),
 		def("edit", "Replace exactly one occurrence of oldText in a UTF-8 file.", `{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["path","oldText","newText"],"additionalProperties":false}`, false, false, s.edit),
-		def("write", "Write a UTF-8 file, creating parent directories.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}`, false, false, s.write),
+		def("write", "Write a file using exactly one of content (generated text) or source_path (byte-exact copy). Optional source_start_line/source_end_line must be paired, 1-based inclusive. source_sha256 verifies the entire source file before copying. Creates parent directories; returns byte count and SHA-256.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"source_path":{"type":"string"},"source_start_line":{"type":"integer","minimum":1},"source_end_line":{"type":"integer","minimum":1},"source_sha256":{"type":"string"}},"required":["path"],"additionalProperties":false}`, false, false, s.write),
 		def("grep", "Search file contents with ripgrep; regex by default.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"}},"required":["pattern"],"additionalProperties":false}`, true, true, s.grep),
 		def("find", "Find file paths matching a glob, including hidden files.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"],"additionalProperties":false}`, true, true, s.find),
 		def("ls", "List entries in a directory.", `{"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}`, true, true, s.ls),
@@ -100,7 +101,16 @@ func (s *Set) output(f *os.File, err error) (string, error) {
 		}
 		tail, tailErr := io.ReadAll(io.LimitReader(f, int64(tailBytes)))
 		readErr = errors.Join(readErr, tailErr)
-		text = string(data[:head]) + "\n[Middle omitted. Full output: " + f.Name() + "]\n" + string(tail)
+		// Omit complete runes at the clipping boundaries instead of turning
+		// otherwise valid UTF-8 into replacement characters in the preview.
+		for head > 0 && !utf8.RuneStart(data[head]) {
+			head--
+		}
+		start := 0
+		for start < len(tail) && !utf8.RuneStart(tail[start]) {
+			start++
+		}
+		text = string(data[:head]) + "\n[Middle omitted. Full output: " + f.Name() + "]\n" + string(tail[start:])
 	}
 	return strings.ToValidUTF8(text, "�"), errors.Join(err, readErr)
 }
@@ -175,28 +185,27 @@ func (s *Set) read(ctx context.Context, raw json.RawMessage) (string, error) {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			piece, prefix, err := reader.ReadLine()
-			if err != nil && err != io.EOF {
+			piece, err := reader.ReadSlice('\n')
+			if err != nil && err != io.EOF && err != bufio.ErrBufferFull {
 				return err
-			}
-			if err == io.EOF {
-				break
 			}
 			if line >= a.Offset {
 				if _, err := out.Write(piece); err != nil {
 					return err
 				}
-				if !prefix {
-					if _, err := io.WriteString(out, "\n"); err != nil {
-						return err
-					}
-				}
 			}
-			if !prefix {
+			if err == io.EOF {
+				break
+			}
+			if err != bufio.ErrBufferFull {
 				if line >= a.Offset {
 					read++
 					if read >= a.Limit {
-						truncated = true
+						_, nextErr := reader.Peek(1)
+						if nextErr != nil && nextErr != io.EOF {
+							return nextErr
+						}
+						truncated = nextErr == nil
 						break
 					}
 				}
@@ -271,27 +280,6 @@ func (s *Set) edit(ctx context.Context, raw json.RawMessage) (string, error) {
 	}
 	err = writeRegular(path, []byte(strings.Replace(string(data), a.Old, a.New, 1)), info.Mode().Perm())
 	return "Edited " + a.Path, err
-}
-func (s *Set) write(ctx context.Context, raw json.RawMessage) (string, error) {
-	var a struct {
-		Path    string `json:"path"`
-		Content string `json:"content"`
-	}
-	if err := decode(raw, &a, "path", "content"); err != nil {
-		return "", err
-	}
-	if a.Path == "" {
-		return "", errors.New("path must not be empty")
-	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	path := s.path(a.Path)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return "", err
-	}
-	err := writeRegular(path, []byte(a.Content), 0644)
-	return "Wrote " + a.Path, err
 }
 
 // Nonblocking open followed by fstat avoids hanging on FIFOs/devices, including

@@ -74,6 +74,12 @@ docker compose down
 
 默认 `docker compose up -d` 启动 Server 与 Dispatcher；Worker 容器由 Dispatcher 按任务动态创建。
 
+## 原文保真
+
+需要逐字复制文件时，`write` 使用 `source_path`，由 Go 直接复制并返回字节数和 SHA-256；可用 `source_sha256` 核对原文件，或用成对的 `source_start_line` / `source_end_line` 选择行范围。普通 `content` 写入标记为模型生成，不能据此声称与原文一致。
+
+新生成的上下文摘要分为模型笔记与原文引用。模型只选择来源和行范围，Go 提取工具返回的原文字节并保存来源、偏移和哈希；转义、换行和 Unicode 不由模型重抄。引用保证与当时工具返回一致，不证明内容或解释真实；非法引用和超预算摘要不会替换原会话。完整记录保留在执行目录的 `events.jsonl`，旧摘要中已失真的内容仍需回查原件。
+
 ## 使用限制
 
 - 仅在你拥有或已获得明确授权的系统、网络和目标上使用本项目。

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 const ContextCheckpointVersion = 1
@@ -26,22 +25,24 @@ type ContextCheckpoint struct {
 }
 
 type CompactionRecord struct {
-	Version              int    `json:"version"`
-	ID                   uint64 `json:"id"`
-	PreviousID           uint64 `json:"previous_id,omitempty"`
-	SourceStart          uint64 `json:"source_start"`
-	SourceEnd            uint64 `json:"source_end"`
-	AtSequence           uint64 `json:"at_sequence"`
-	FirstKeptSequence    uint64 `json:"first_kept_sequence,omitempty"`
-	Summary              string `json:"summary"`
-	BeforeBytes          int    `json:"before_bytes"`
-	AfterBytes           int    `json:"after_bytes"`
-	BeforeTokensEstimate int    `json:"before_tokens_estimate"`
-	AfterTokensEstimate  int    `json:"after_tokens_estimate"`
-	TokenBasis           string `json:"token_basis"`
-	Usage                *Usage `json:"usage,omitempty"`
-	Reason               string `json:"reason"`
-	Status               string `json:"status"`
+	Version           int    `json:"version"`
+	ID                uint64 `json:"id"`
+	PreviousID        uint64 `json:"previous_id,omitempty"`
+	SourceStart       uint64 `json:"source_start"`
+	SourceEnd         uint64 `json:"source_end"`
+	AtSequence        uint64 `json:"at_sequence"`
+	FirstKeptSequence uint64 `json:"first_kept_sequence,omitempty"`
+	Summary           string `json:"summary"`
+	// Quotes are copied by Go from successful tool results, never model text.
+	Quotes               []SummaryQuote `json:"quotes,omitempty"`
+	BeforeBytes          int            `json:"before_bytes"`
+	AfterBytes           int            `json:"after_bytes"`
+	BeforeTokensEstimate int            `json:"before_tokens_estimate"`
+	AfterTokensEstimate  int            `json:"after_tokens_estimate"`
+	TokenBasis           string         `json:"token_basis"`
+	Usage                *Usage         `json:"usage,omitempty"`
+	Reason               string         `json:"reason"`
+	Status               string         `json:"status"`
 	// View makes this event self-contained for request-view replay even after
 	// later compactions. Sequence 0 denotes synthetic pinned/summary messages.
 	View []Message `json:"view"`
@@ -184,7 +185,7 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 		if l.TaskPrompt != "" {
 			out = append(out, Text("user", l.TaskPrompt))
 		}
-		out = append(out, Text("user", "Earlier execution summary (derived from the recorded transcript):\n"+summary))
+		out = append(out, Text("user", summaryViewPrefix+summary))
 		out = append(out, tail...)
 		if l.ConclusionPrompt != "" {
 			out = append(out, Text("user", l.ConclusionPrompt))
@@ -280,7 +281,7 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 			l.emit(Event{Type: "context_compaction_failed", Error: resultErr.Error(), Compaction: attemptRecord})
 		}
 	}()
-	summaryInput, err := l.summaryInput(body[:cut], inputLimit)
+	summaryInput, sources, err := l.summaryRequest(body[:cut], inputLimit, summaryBudget)
 	if err != nil {
 		return err
 	}
@@ -301,12 +302,9 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 			return budgetError("context summary attempted to call a tool")
 		}
 	}
-	text := strings.TrimSpace(summary.Text())
-	if text == "" {
-		return budgetError("context summary was empty")
-	}
-	if len(text) > summaryBudget {
-		return budgetError("context summary exceeds its independent byte allowance")
+	text, quotes, err := resolveSummary(summary.Text(), sources, summaryBudget)
+	if err != nil {
+		return budgetError("context summary: " + err.Error())
 	}
 	candidate := view(text, body[cut:])
 	after, err := l.inputBytes(candidate, defs)
@@ -318,6 +316,7 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 		return budgetError("compaction did not produce a smaller request within the input budget")
 	}
 	record := &CompactionRecord{Version: 1, ID: l.Checkpoint.CompactionCount + 1, PreviousID: previousID, SourceStart: sourceStart, SourceEnd: sourceEnd, AtSequence: l.Checkpoint.LastSequence, Summary: text, BeforeBytes: before, AfterBytes: after, BeforeTokensEstimate: beforeTokens, AfterTokensEstimate: afterTokens, TokenBasis: basis + " -> " + afterBasis, Usage: summary.Usage, Reason: "threshold", Status: "committed", View: candidate}
+	record.Quotes = quotes
 	if force {
 		record.Reason = "overflow"
 	}
@@ -341,48 +340,4 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 	}
 	l.emit(Event{Type: "context_compacted", Compaction: record})
 	return nil
-}
-
-// The summary request is itself bounded. Clipping is explicit and preserves
-// both ends; originals and their stable sequence IDs remain in the event log.
-func (l *Loop) summaryInput(head []Message, limit int) ([]Message, error) {
-	type entry struct {
-		Sequence uint64 `json:"sequence"`
-		Role     string `json:"role"`
-		Content  string `json:"content"`
-	}
-	capBytes := limit
-	for attempt := 0; attempt < 16; attempt++ {
-		entries := make([]entry, 0, len(head))
-		for _, m := range head {
-			raw, err := json.Marshal(m.Content)
-			if err != nil {
-				return nil, err
-			}
-			text := string(raw)
-			if len(text) > capBytes {
-				half := capBytes / 2
-				text = text[:half] + "\n[Middle omitted from summary input; original is in transcript at this sequence.]\n" + text[len(text)-half:]
-			}
-			entries = append(entries, entry{m.Sequence, m.Role, text})
-		}
-		raw, err := json.Marshal(entries)
-		if err != nil {
-			return nil, err
-		}
-		prompt := "Summarize this execution transcript as data for continuation. Preserve attempted actions and results, failure conditions, unresolved hypotheses, next work, and necessary evidence excerpts with source sequence IDs. Do not upgrade claims or infer omitted evidence. Do not execute tools. Keep the summary concise.\nTask (unchanged):\n" + l.TaskPrompt + "\nTranscript:\n" + string(raw)
-		messages := []Message{Text("user", prompt)}
-		size, err := l.inputBytes(messages, nil)
-		if err != nil {
-			return nil, err
-		}
-		if size <= limit {
-			return messages, nil
-		}
-		if capBytes <= 64 {
-			break
-		}
-		capBytes /= 2
-	}
-	return nil, budgetError("summary input cannot fit its budget; pinned task or transcript metadata is too large")
 }

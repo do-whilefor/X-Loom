@@ -49,6 +49,7 @@ func Prompt(j Job, conclude bool, runDir string) (string, error) {
 			return "", err
 		}
 		context += "The complete original legacy graph is retained at " + path + ". Use read_graph pages for current shared state. Submit important verified Fact or Finding evidence through graph_action while working; this does not finish the Step or project. Select evidence files and necessary line ranges; the runtime retains originals and extracts exact excerpts.\n"
+		context += "For byte-exact file output, use write with source_path instead of retyping content; source_sha256 can bind the expected original. Generated content and memory notes are interpretations, not verified copies or facts.\n"
 	}
 	body, err := taskTemplate(j, conclude)
 	if err != nil {
