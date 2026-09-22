@@ -7,10 +7,11 @@ RUN go mod download
 COPY . .
 
 FROM source AS test
-RUN go test -race ./... && go vet ./...
+# Dependencies are downloaded above; checks must not contact external services.
+RUN --network=none go test -race -count=1 ./... && go vet ./...
 
 FROM test AS build
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/xloom ./cmd/xloom
+RUN --network=none CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/xloom ./cmd/xloom
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl bash ripgrep \

@@ -74,6 +74,20 @@ docker compose down
 
 默认 `docker compose up -d` 启动 Server 与 Dispatcher；Worker 容器由 Dispatcher 按任务动态创建。
 
+## 测试与 CI
+
+GitHub Actions 会在推送代码、提交 PR 或手动触发时，在新的 Linux 环境中检出对应提交，执行单元测试、Mock 集成测试、竞态检查、`go vet` 和程序编译。
+
+下载源码后，在项目根目录运行同一套检查（需要 Docker）：
+
+```bash
+docker build --target build --progress=plain .
+```
+
+无需创建 `.env` 或 `dispatch.yaml`，也无需启动项目、准备 Worker 镜像或提供模型密钥。检查使用已提交的测试及代码内合成的数据；模型响应由 Mock 提供。拉取基础镜像、安装工具和下载 Go 依赖需要联网，之后测试、静态检查及编译阶段禁用外网。CI 不调用真实模型，不发布镜像，也不部署服务。
+
+GitHub CI 使用根目录 Dockerfile 指定的 Go 1.26，在 Linux amd64 上检查；本地命令默认使用 Docker 主机架构。这不代表已验证 Go 1.23 的最低版本兼容性或其他架构。本地专用的真实模型、Docker 联调及参考源码验收脚本不属于这套 CI。
+
 ## 原文保真
 
 需要逐字复制文件时，`write` 使用 `source_path`，由 Go 直接复制并返回字节数和 SHA-256；可用 `source_sha256` 核对原文件，或用成对的 `source_start_line` / `source_end_line` 选择行范围。普通 `content` 写入标记为模型生成，不能据此声称与原文一致。

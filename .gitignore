@@ -11,10 +11,11 @@
 /DEVELOPMENT*.md
 /VALIDATION*.md
 
-# ---- 测试仅在本地维护，不随源码发布 ----
-tests/
-testdata/
-*_test.go
+# ---- Go 单元测试随源码提交；本地验收目录只开放已审查的 Mock 测试 ----
+/tests/*
+!/tests/integration/
+/tests/integration/*
+!/tests/integration/fidelity_test.go
 *.test.*
 *.spec.*
 
