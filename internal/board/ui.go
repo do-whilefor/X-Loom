@@ -2,7 +2,7 @@ package board
 
 import "encoding/json"
 
-// Keep optional presentation metadata outside Cairn's projects table so both
+// Keep optional scenario metadata outside Cairn's projects table so both
 // legacy schemas and clients continue to work without inventing a scenario.
 const projectMetadataSchema = `CREATE TABLE IF NOT EXISTS xloom_project_metadata(
  project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,

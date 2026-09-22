@@ -128,13 +128,16 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 	}}
 	if j.Kind == "reason" {
 		o.Tools = []agent.Tool{read, action}
-		return nil
+	} else {
+		if o.Tools == nil {
+			set := tools.Set{Dir: j.Workspace, RunDir: o.RunDir}
+			o.Tools = set.All()
+		}
+		o.Tools = append(o.Tools, read, action)
 	}
-	if o.Tools == nil {
-		set := tools.Set{Dir: j.Workspace, RunDir: o.RunDir}
-		o.Tools = set.All()
+	if j.Graph.Project.Scenario == "pentest" {
+		o.Tools = append(o.Tools, cvssTool())
 	}
-	o.Tools = append(o.Tools, read, action)
 	return nil
 }
 

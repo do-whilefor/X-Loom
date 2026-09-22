@@ -1,4 +1,4 @@
-// Package web embeds the X-Loom workspace and the classic Cairn interface.
+// Package web embeds the X-Loom workspace.
 package web
 
 import (
@@ -9,5 +9,5 @@ import (
 //go:embed static
 var assets embed.FS
 
-// Files contains locally bundled assets, preserving the classic static URLs.
+// Files contains the workspace's locally bundled static assets.
 var Files, _ = fs.Sub(assets, "static")

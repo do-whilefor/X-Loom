@@ -14,6 +14,9 @@ import (
 //go:embed prompts/*.md
 var prompts embed.FS
 
+//go:embed prompts/pentest.md
+var pentestPolicy string
+
 func Prompt(j Job, conclude bool, runDir string) (string, error) {
 	if j.Kind != "bootstrap" && j.Kind != "explore" && j.Kind != "reason" {
 		return "", errors.New("unknown task")
@@ -67,8 +70,16 @@ func taskTemplate(j Job, conclude bool) (string, error) {
 	if err = t.Execute(&body, j.Budget); err != nil {
 		return "", err
 	}
-	return body.String(), nil
+	return body.String() + scenarioPrompt(j), nil
 }
+
+func scenarioPrompt(j Job) string {
+	if j.Graph.Project.Scenario == "pentest" {
+		return "\n" + pentestPolicy
+	}
+	return ""
+}
+
 func intentContext(j Job) string {
 	if j.Intent == nil {
 		return ""

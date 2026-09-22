@@ -4,7 +4,7 @@
 
 仅支持 Linux。
 
-系统已接入会话、上下文压缩与 FGS 状态扩展。Web 首页展示真实项目、FGS 状态、事件与执行摘要；经典 Cairn 管理页保留在 `/static/legacy.html`。
+系统已接入会话、上下文压缩与 FGS 状态扩展。Web 仅保留 X-Loom 工作台，展示真实项目、FGS 状态、事件与执行摘要；原 Cairn 经典管理页及其专用资源已移除。
 
 ## 目录
 
@@ -20,9 +20,10 @@ internal/worker     执行、会话、预算与收尾；prompts/ 为任务模板
 internal/agent      两层循环、消息、事件、工具接口与上下文压缩
 internal/provider   Anthropic 兼容请求和流式协议
 internal/tools      read/bash/edit/write/grep/find/ls
+internal/cvss       CVSS 3.1 Base 向量校验与确定性评分
 internal/process    Linux 执行取消与子进程清理
 container           Kali Worker 镜像、环境说明和镜像检查脚本
-web/static          X-Loom 工作台、经典 Cairn 管理页与本地静态资源
+web/static          X-Loom 工作台与本地静态资源
 ```
 
 `process` 供 Worker 生命周期和 shell 工具共用，避免重复实现 Linux 进程取消。
@@ -87,6 +88,9 @@ set +a
 
 ## 配置与行为
 
+- Web 的三种项目场景为 CTF（`ctf`）、渗透测试（`pentest`）、代码审计（`audit`），执行阶段仍为 `bootstrap/reason/explore`。渗透测试场景会在规划、执行、收尾和格式修复中加载证据过滤规则；指纹、配置、暴露面和未经动态证实的风险先作为线索，只有稳定复现安全边界失效及实际影响后才报告漏洞。原始观察仍可保留为 Fact，待验证推断使用 Finding `candidate`。
+- 渗透测试执行提供 `cvss31` 工具，输入 `{"vector":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}`，返回规范化向量、9.8 分、`CRITICAL` 及计算过程字段。算法按本地参考计算器的行为用 Go 实现，遵循 [FIRST CVSS 3.1 Base 公式与舍入规则](https://www.first.org/cvss/v3.1/specification-document)，无需 Node.js。八项指标必须有证据依据，分数不证明漏洞成立；证据不足或收尾时尚无计算结果则标注未评分。规则位于任务模板，不增加全局系统提示词；CTF、代码审计和未分类项目不加载该工具或规则。
+- 过滤规则来自本地 `refer/过滤.txt`，已内嵌于 Worker；运行和构建无需 `refer/`。过滤是模型的判定要求，不能机械验证语义或保证模型零误报；计算器只校验向量并计算分数。评分及其依据写入现有 Finding 或结果描述，Web、图导出和时间线沿用现有记录展示。
 - 交付配置使用 `.env` 中的 StepFun 地址与 `step-5-preview`，通过 Anthropic 兼容消息协议请求；凭据只从环境注入。旧配置可以继续显式指定其他兼容端点和模型。
 - 默认请求 `thinking.type=enabled` 与 `output_config.effort=max`；`XLOOM_REASONING_EFFORT` 可选 `low/high/max`。响应中的 `thinking:""` 是需要原样重放的思考块，不是强度配置。默认最大输出为 32768 token，可用 `XLOOM_MAX_OUTPUT_TOKENS` 调整；思考强度、输出上限和时间预算分别管理。
 - 上下文压缩默认在估算输入超过 920000 token（`XLOOM_CONTEXT_TOKENS`）或请求输入超过 8 MiB（`XLOOM_CONTEXT_BYTES=8388608`）时触发，任一阈值超过即压缩。92 万是预留输出空间后的输入额度，不是摘要的输出额度，也不会自动随模型窗口或最大输出调整；切换模型时应按实际窗口重新配置。token 数优先根据 Provider usage 加新增内容估算，无有效 usage 时按请求字节数除以 3 估算，因此不是精确 tokenizer 计数；字节阈值提供独立保护。
