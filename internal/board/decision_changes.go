@@ -10,7 +10,7 @@ type StateChange struct {
 // bodies and past execution inputs are unnecessary: current FGS records supply
 // the knowledge, including corrections and the status of abandoned plans.
 func (t *Tx) StateChanges(project string, after, through int64) ([]StateChange, error) {
-	if _, err := t.Load(project); err != nil {
+	if err := t.RequireProject(project); err != nil {
 		return nil, err
 	}
 	if after < 0 || through < after {

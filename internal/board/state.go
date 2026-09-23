@@ -947,7 +947,7 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 }
 
 func (t *Tx) StateEvents(project string, after int64) ([]StateEvent, error) {
-	if _, err := t.Load(project); err != nil {
+	if err := t.RequireProject(project); err != nil {
 		return nil, err
 	}
 	rows, err := t.Query("SELECT event FROM xloom_state_events WHERE project_id=? AND revision>? ORDER BY revision LIMIT 1000", project, after)

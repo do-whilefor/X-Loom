@@ -283,27 +283,43 @@ func (t *Tx) Load(id string) (Graph, error) {
 	if err != nil {
 		return g, err
 	}
-	for n := range g.Intents {
-		rows, err = t.Query("SELECT fact_id FROM intent_sources WHERE project_id=? AND intent_id=? ORDER BY rowid", id, g.Intents[n].ID)
-		if err != nil {
+	intentIndex := make(map[string]int, len(g.Intents))
+	for n, intent := range g.Intents {
+		intentIndex[intent.ID] = n
+	}
+	rows, err = t.Query("SELECT intent_id,fact_id FROM intent_sources WHERE project_id=? ORDER BY rowid", id)
+	if err != nil {
+		return g, err
+	}
+	for rows.Next() {
+		var intent, fact string
+		if err = rows.Scan(&intent, &fact); err != nil {
+			rows.Close()
 			return g, err
 		}
-		for rows.Next() {
-			var fid string
-			if err = rows.Scan(&fid); err != nil {
-				rows.Close()
-				return g, err
-			}
-			g.Intents[n].From = append(g.Intents[n].From, fid)
+		if n, ok := intentIndex[intent]; ok {
+			g.Intents[n].From = append(g.Intents[n].From, fact)
 		}
-		err = rows.Err()
-		rows.Close()
-		if err != nil {
-			return g, err
-		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return g, err
 	}
 	return g, nil
 }
+
+func (t *Tx) RequireProject(project string) error {
+	var exists bool
+	if err := t.QueryRow("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?)", project).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return Err(404, "Project not found")
+	}
+	return nil
+}
+
 func (t *Tx) Save(g Graph) error {
 	p := g.Project
 	if p.Scenario != "" && !ValidScenario(p.Scenario) {
