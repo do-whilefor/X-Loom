@@ -413,6 +413,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		return !state.ExecutionDeadline.IsZero() && !o.Now().Before(state.ExecutionDeadline)
 	}
 	l.BeforeRequest = func(turnCtx context.Context, loop *agent.Loop) (context.Context, error) {
+		if o.decision != nil {
+			o.decision.beforeRequest(loop)
+		}
 		concludeAtBoundary := func() error {
 			next, err := startConclusion()
 			if err != nil {

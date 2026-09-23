@@ -22,12 +22,14 @@ type DecisionBatch struct {
 	Actions         []DecisionAction `json:"actions"`
 }
 type DecisionReceipt struct {
-	Committed      bool                `json:"committed"`
-	StateVersion   string              `json:"state_version,omitempty"`
-	Results        []StateActionResult `json:"results"`
-	ChangedActions int                 `json:"changed_actions,omitempty"`
-	IDs            map[string]string   `json:"ids"`
-	Completed      bool                `json:"completed"`
+	Committed        bool                `json:"committed"`
+	StateVersion     string              `json:"state_version,omitempty"`
+	Results          []StateActionResult `json:"results"`
+	ChangedActions   int                 `json:"changed_actions,omitempty"`
+	IDs              map[string]string   `json:"ids"`
+	Completed        bool                `json:"completed"`
+	ValidationScope  string              `json:"validation_scope,omitempty"`
+	CompletionReview *CompletionReview   `json:"completion_review,omitempty"`
 }
 
 // CheckDirectDecisionWrite keeps old jobs' protocol while fencing all writes
@@ -295,6 +297,12 @@ func (t *Tx) decisionBatch(project string, fence ExecutionFence, batch DecisionB
 			}
 			return out, fmt.Errorf("decision action %d (%s): %w", n+1, action.Op, actionErr)
 		}
+		if !commit && action.Op == "complete" {
+			out.CompletionReview, err = buildCompletionReview(state, batch.ExpectedVersion, payload, MaxCompletionReviewBytes)
+			if err != nil {
+				return out, err
+			}
+		}
 		out.Results = append(out.Results, result)
 		if !result.Unchanged {
 			out.ChangedActions++
@@ -307,11 +315,13 @@ func (t *Tx) decisionBatch(project string, fence ExecutionFence, batch DecisionB
 	if err != nil {
 		return out, err
 	}
-	out.StateVersion, out.Completed = DecisionStateVersion(state), state.Graph.Project.Status == "completed"
+	out.StateVersion = DecisionStateVersion(state)
 	if !commit {
+		out.ValidationScope = "protocol_only"
 		return out, nil
 	}
 	out.Committed = true
+	out.Completed = state.Graph.Project.Status == "completed"
 	response, err := json.Marshal(out)
 	if err != nil {
 		return out, err

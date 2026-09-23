@@ -453,9 +453,10 @@ func (s *Scheduler) configureGraphHandler() {
 				method, body = "GET", nil
 			}
 			err := s.Client.Do(ctx, method, base+"/state/decisions/"+op, body, &result, &lease)
-			// Commit and recovery need only a compact acknowledgement; large
-			// projected entities must not make a successful commit undeliverable.
-			if result.Committed {
+			// Commit and recovery need only a compact acknowledgement. Completion
+			// previews retain the authoritative review instead of repeating every
+			// projected entity, which could exceed the graph bridge frame.
+			if result.Committed || result.CompletionReview != nil {
 				result.Results = nil
 			}
 			return result, err

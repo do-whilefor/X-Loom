@@ -11,12 +11,11 @@ import (
 	"xloom/internal/board"
 )
 
-// This verifies prompt delivery and retained requirements, not whether a model
-// correctly applies the distinction between a finished Step and its root goal.
-func TestDecideFirstRequestDistinguishesStepAndRootCompletion(t *testing.T) {
+// Preserve original requirements in the real request without encoding a
+// particular benchmark's negative observation as a special prompt rule.
+func TestDecideFirstRequestPreservesOriginalRequirements(t *testing.T) {
 	const origin = "Observe synthetic samples A, B and C under the original calibration."
 	const goal = "Obtain an actual measurement for each of samples A, B and C."
-	const distinction = "A supported negative observation can finish that Step. Accounting for a missing result does not satisfy a root requirement to obtain that result; execution failure is not an observation."
 	const rootRoute = "goal actions cannot achieve or withdraw the root id:goal; use the project completion contract."
 	for _, mode := range []string{"legacy", "v2"} {
 		t.Run(mode, func(t *testing.T) {
@@ -49,8 +48,8 @@ func TestDecideFirstRequestDistinguishesStepAndRootCompletion(t *testing.T) {
 					t.Fatalf("unexpected initial request: calls=%d messages=%d", calls, len(history))
 				}
 				prompt := history[0].Text()
-				if strings.Count(prompt, distinction) != 1 || !strings.Contains(prompt, origin) || !strings.Contains(prompt, goal) {
-					t.Fatal("first request lost the Step/root distinction or original user requirements")
+				if !strings.Contains(prompt, origin) || !strings.Contains(prompt, goal) {
+					t.Fatal("first request lost original user requirements")
 				}
 				foundRootRoute := false
 				for _, definition := range definitions {

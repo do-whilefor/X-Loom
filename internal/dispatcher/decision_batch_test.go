@@ -80,8 +80,19 @@ func (r *batchProtocolRunner) Run(ctx context.Context, _ config.Worker, job work
 		if err != nil {
 			return worker.Result{}, err
 		}
-		if preview.(board.DecisionReceipt).Committed {
+		previewReceipt := preview.(board.DecisionReceipt)
+		if previewReceipt.Committed || previewReceipt.Completed || previewReceipt.ValidationScope != "protocol_only" {
 			return worker.Result{}, errors.New("preview published the plan")
+		}
+		if len(actions) != 0 && actions[len(actions)-1].Op == "complete" {
+			review := previewReceipt.CompletionReview
+			if review == nil || review.Acceptance != "not_checked" || review.StateVersion != batch.ExpectedVersion || len(review.UserInputs) != 2 || len(review.FactRecords) != len(review.From) || len(review.FactRecords) == 0 {
+				return worker.Result{}, fmt.Errorf("completion preview lost authoritative review at the graph bridge: %+v", review)
+			}
+		} else if previewReceipt.CompletionReview != nil {
+			return worker.Result{}, errors.New("ordinary planning preview unexpectedly added completion review")
+		} else if len(previewReceipt.Results) != len(actions) {
+			return worker.Result{}, errors.New("ordinary planning preview lost its projected results")
 		}
 		committed, err := r.graph(ctx, job, worker.GraphRequest{Op: "decision_commit", Batch: batch})
 		if err != nil {
@@ -91,7 +102,7 @@ func (r *batchProtocolRunner) Run(ctx context.Context, _ config.Worker, job work
 			return worker.Result{}, errors.New("commit did not return a durable receipt")
 		}
 		compact := committed.(board.DecisionReceipt)
-		if compact.Results != nil || compact.ChangedActions != len(actions) {
+		if compact.Results != nil || compact.ChangedActions != len(actions) || compact.CompletionReview != nil || compact.ValidationScope != "" {
 			return worker.Result{}, fmt.Errorf("compact commit lost changed-action count: got %+v; want %d", compact, len(actions))
 		}
 		saved, err := r.graph(ctx, job, worker.GraphRequest{Op: "decision_receipt"})
@@ -99,7 +110,7 @@ func (r *batchProtocolRunner) Run(ctx context.Context, _ config.Worker, job work
 			return worker.Result{}, err
 		}
 		receipt := saved.(board.DecisionReceipt)
-		if !receipt.Committed || receipt.Results != nil || receipt.ChangedActions != compact.ChangedActions {
+		if !receipt.Committed || receipt.Results != nil || receipt.ChangedActions != compact.ChangedActions || receipt.CompletionReview != nil || receipt.ValidationScope != "" {
 			return worker.Result{}, fmt.Errorf("compact recovery receipt differs from commit: %+v", receipt)
 		}
 		if r.afterCommit != nil {

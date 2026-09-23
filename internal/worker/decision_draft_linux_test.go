@@ -70,7 +70,12 @@ func TestDecisionDraftRejectsRootGoalWithoutConsumingDraftOrKey(t *testing.T) {
 					if request.Op != "decision_preview" && request.Op != "decision_commit" {
 						t.Fatalf("unexpected request %q", request.Op)
 					}
-					raw, err := json.Marshal(board.DecisionReceipt{Committed: request.Op == "decision_commit", StateVersion: wantVersion})
+					receipt := board.DecisionReceipt{Committed: request.Op == "decision_commit", StateVersion: wantVersion}
+					if request.Op == "decision_preview" {
+						receipt.ValidationScope = "protocol_only"
+						receipt.CompletionReview = &board.CompletionReview{StateVersion: wantVersion, Acceptance: "not_checked"}
+					}
+					raw, err := json.Marshal(receipt)
 					return string(raw), err
 				}}
 				if seeded {
@@ -104,6 +109,9 @@ func TestDecisionDraftRejectsRootGoalWithoutConsumingDraftOrKey(t *testing.T) {
 				}
 				wantActions = append([]board.DecisionAction(nil), draft.actions...)
 				for _, op := range []string{"preview", "commit"} {
+					if op == "commit" {
+						draft.beforeRequest(&agent.Loop{})
+					}
 					if _, err := draft.action(ctx, draftTestAction(op, op, `{}`), "later-version"); err != nil {
 						t.Fatal(err)
 					}

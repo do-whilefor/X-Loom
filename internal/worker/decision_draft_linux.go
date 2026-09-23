@@ -1,12 +1,14 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"regexp"
 	"strings"
 
+	"xloom/internal/agent"
 	"xloom/internal/board"
 )
 
@@ -22,12 +24,30 @@ type decisionDraft struct {
 	uncertain    bool
 	reread       bool
 	overviewRead bool
+	reviewData   string
+	reviewReady  bool
 	request      func(context.Context, GraphRequest) (string, error)
 }
 
 func (d *decisionDraft) invalidate() {
 	d.keys, d.actions, d.version = nil, nil, ""
+	d.reviewData, d.reviewReady = "", false
 	d.reread, d.overviewRead = true, false
+}
+
+// A tool result is not yet a model observation. Keep the authoritative review
+// through compaction and allow completion only from a subsequent request.
+// The private draft and review are deliberately discarded together on resume.
+func (d *decisionDraft) beforeRequest(loop *agent.Loop) {
+	loop.ContextData = nil
+	if d.reviewData != "" {
+		loop.ContextData = []string{d.reviewData}
+		d.reviewReady = true
+	}
+}
+
+func (d *decisionDraft) completes() bool {
+	return len(d.actions) > 0 && d.actions[len(d.actions)-1].Op == "complete"
 }
 
 func (d *decisionDraft) observeRead(section string) {
@@ -82,8 +102,15 @@ func (d *decisionDraft) action(ctx context.Context, a board.StateAction, current
 	switch a.Op {
 	case "reset":
 		d.keys, d.actions, d.version = nil, nil, ""
+		d.reviewData, d.reviewReady = "", false
 		return `{"draft":true,"reset":true}`, nil
 	case "preview", "commit":
+		if a.Op == "commit" && d.completes() && !d.reviewReady {
+			return "", errors.New("completion requires preview and a subsequent model request to review its evidence before commit; draft unchanged")
+		}
+		if a.Op == "preview" {
+			d.reviewData, d.reviewReady = "", false
+		}
 		if d.version == "" {
 			d.version = currentVersion
 		}
@@ -105,6 +132,16 @@ func (d *decisionDraft) action(ctx context.Context, a board.StateAction, current
 		if err = json.Unmarshal([]byte(raw), &receipt); err != nil {
 			return "", err
 		}
+		if a.Op == "preview" && d.completes() {
+			if receipt.CompletionReview == nil || receipt.ValidationScope != "protocol_only" || receipt.CompletionReview.StateVersion != d.version || receipt.CompletionReview.Acceptance != "not_checked" {
+				return "", errors.New("completion preview omitted its evidence review; completion remains unreviewed")
+			}
+			review, err := json.Marshal(receipt.CompletionReview)
+			if err != nil {
+				return "", err
+			}
+			d.reviewData = "<completion_review>\n" + string(review) + "\n</completion_review>"
+		}
 		if a.Op == "commit" {
 			if !receipt.Committed {
 				return "", errors.New("commit returned no committed receipt")
@@ -125,6 +162,17 @@ func (d *decisionDraft) action(ctx context.Context, a board.StateAction, current
 	}
 	if a.Op == "goal" && payload["id"] == "goal" {
 		return "", errors.New("root goal cannot be changed by goal actions; use complete with supporting facts and proof; draft unchanged")
+	}
+	if a.Op == "complete" {
+		var completion struct {
+			From        []string `json:"from"`
+			Description string   `json:"description"`
+		}
+		decoder := json.NewDecoder(bytes.NewReader(a.Payload))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&completion); err != nil || len(completion.From) == 0 || strings.TrimSpace(completion.Description) == "" {
+			return "", errors.New("complete payload requires only from:[fact IDs] and description:proof; draft unchanged")
+		}
 	}
 	if a.Op == "step" && payload["action"] == "add" {
 		from, _ := payload["from"].([]any)
@@ -149,6 +197,9 @@ func (d *decisionDraft) action(ctx context.Context, a board.StateAction, current
 			return draftReply(item), nil
 		}
 	}
+	if d.completes() {
+		return "", errors.New("complete must be the last action; reset before changing the proposed completion; draft unchanged")
+	}
 	if len(d.actions) >= 64 {
 		return "", errors.New("at most 64 draft actions are allowed")
 	}
@@ -156,6 +207,7 @@ func (d *decisionDraft) action(ctx context.Context, a board.StateAction, current
 		d.version = currentVersion
 	}
 	d.keys, d.actions = append(d.keys, a.IdempotencyKey), append(d.actions, item)
+	d.reviewData, d.reviewReady = "", false
 	return draftReply(item), nil
 }
 
