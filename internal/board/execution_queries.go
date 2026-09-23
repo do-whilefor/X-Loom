@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // ExecutionSummary is the scheduling identity and immutable input boundary.
@@ -265,4 +266,46 @@ func (t *Tx) CheckExecutions(q ExecutionCheckQuery) (ExecutionCheck, error) {
 		out.AutomaticRetryID = candidate.ID
 	}
 	return out, nil
+}
+
+// Scheduling needs only admission and retry grants for the current page's
+// Execute candidates. Registration still verifies their leases and identity.
+func (t *Tx) ScheduleExecutionChecks(project, namespace string, intents []Intent) (map[string]ExecutionCheck, error) {
+	checks := make(map[string]ExecutionCheck, len(intents))
+	if len(intents) == 0 {
+		return checks, nil
+	}
+	values := make([]string, len(intents))
+	args := make([]any, 0, 3*len(intents)+2)
+	for n, i := range intents {
+		kind := "explore"
+		if i.Description == "bootstrap" && i.Creator == "dispatcher.bootstrap" && len(i.From) == 1 && i.From[0] == "origin" {
+			kind = "bootstrap"
+		}
+		values[n] = "(?,?,?)"
+		args = append(args, kind, i.ID, kind+":"+i.ID)
+	}
+	args = append(args, namespace, project)
+	rows, err := t.Query(`WITH candidates(kind,intent,retry_key) AS (VALUES `+strings.Join(values, ",")+`),
+	registry AS (SELECT rowid AS sequence,* FROM xloom_executions WHERE namespace=? AND project_id=?)
+	SELECT c.retry_key,
+	EXISTS(SELECT 1 FROM registry e WHERE e.kind=c.kind AND e.intent=c.intent AND `+pendingExecutionSQL+`),
+	COALESCE((SELECT e.id FROM registry e WHERE e.kind=c.kind AND e.intent=c.intent AND e.status='retry_requested' ORDER BY e.created_at DESC,e.sequence DESC LIMIT 1),''),
+	EXISTS(SELECT 1 FROM registry e WHERE e.kind=c.kind AND e.retry_key=c.retry_key AND e.status NOT IN ('retry_requested','retried'))
+	FROM candidates c`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var check ExecutionCheck
+		var tried bool
+		if err := rows.Scan(&key, &check.Pending, &check.PreviousRunID, &tried); err != nil {
+			return nil, err
+		}
+		check.Blocked = check.Pending || (tried && check.PreviousRunID == "")
+		checks[key] = check
+	}
+	return checks, rows.Err()
 }

@@ -23,6 +23,13 @@ func (s *Server) schedulingInput(t *b.Tx, _ *request, r *http.Request) (int, any
 		offset = n
 	}
 	p, err := t.ScheduleInput(r.PathValue("pid"), offset, r.URL.Query().Get("expected_version"))
+	if err == nil && r.URL.Query().Has("namespace") {
+		var namespace string
+		namespace, err = executionNamespace(r)
+		if err == nil {
+			p.ExecutionChecks, err = t.ScheduleExecutionChecks(p.Project.ID, namespace, p.Intents)
+		}
+	}
 	return 200, p, err
 }
 

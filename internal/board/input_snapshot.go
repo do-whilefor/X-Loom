@@ -100,18 +100,19 @@ func DecisionRetryKey(g Graph, revision int64) string {
 // SchedulePage contains runtime metadata only. Node descriptions, evidence,
 // hints and historical Jobs never cross the daily scheduling boundary.
 type SchedulePage struct {
-	Project          Project  `json:"project"`
-	FactCount        int      `json:"fact_count"`
-	HintCount        int      `json:"hint_count"`
-	OpenCount        int      `json:"open_count"`
-	Initial          bool     `json:"initial"`
-	Revision         int64    `json:"revision"`
-	DecisionRevision int64    `json:"decision_revision"`
-	StateVersion     string   `json:"state_version"`
-	RetryKey         string   `json:"retry_key"`
-	Intents          []Intent `json:"intents"`
-	Steps            []Step   `json:"steps"`
-	NextOffset       int      `json:"next_offset,omitempty"`
+	Project          Project                   `json:"project"`
+	FactCount        int                       `json:"fact_count"`
+	HintCount        int                       `json:"hint_count"`
+	OpenCount        int                       `json:"open_count"`
+	Initial          bool                      `json:"initial"`
+	Revision         int64                     `json:"revision"`
+	DecisionRevision int64                     `json:"decision_revision"`
+	StateVersion     string                    `json:"state_version"`
+	RetryKey         string                    `json:"retry_key"`
+	Intents          []Intent                  `json:"intents"`
+	Steps            []Step                    `json:"steps"`
+	NextOffset       int                       `json:"next_offset,omitempty"`
+	ExecutionChecks  map[string]ExecutionCheck `json:"execution_checks,omitempty"`
 }
 
 func (t *Tx) ScheduleInput(project string, offset int, expected string) (SchedulePage, error) {

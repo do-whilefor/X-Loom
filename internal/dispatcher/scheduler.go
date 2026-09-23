@@ -464,7 +464,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		if !bootstrap(*i) {
 			continue
 		}
-		check, err := s.executionCheck(ctx, g, "bootstrap", i, "")
+		check, err := s.candidateCheck(ctx, input, g, "bootstrap", i)
 		if err != nil {
 			return false, err
 		}
@@ -515,7 +515,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		if boot.Worker != nil {
 			return false, nil
 		}
-		check, err := s.executionCheck(ctx, g, "bootstrap", boot, "")
+		check, err := s.candidateCheck(ctx, input, g, "bootstrap", boot)
 		if err != nil {
 			return false, err
 		}
@@ -539,7 +539,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		if i.To != nil || i.ConcludedAt != nil || i.Worker != nil || bootstrap(*i) || stepState[i.ID].Status == "abandoned" || len(stepState[i.ID].InvalidSources) > 0 {
 			continue
 		}
-		check, err := s.executionCheck(ctx, g, "explore", i, "")
+		check, err := s.candidateCheck(ctx, input, g, "explore", i)
 		if err != nil {
 			return false, err
 		}

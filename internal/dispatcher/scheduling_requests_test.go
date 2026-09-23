@@ -29,7 +29,7 @@ func TestDispatchCandidateRequestCounts(t *testing.T) {
 	}
 	reason.Store(0)
 	retryTicks(t, s, 1)
-	if got := explore.Load(); got != 1 {
+	if got := explore.Load(); got != 0 {
 		t.Fatalf("chosen Execute checks = %d", got)
 	}
 	t.Logf("candidate checks: initial Decide=1, chosen Execute=%d", explore.Load())

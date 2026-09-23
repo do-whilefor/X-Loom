@@ -104,6 +104,48 @@ func TestExecuteCheckOmitsDecisionBoundary(t *testing.T) {
 	})
 }
 
+func TestScheduleExecutionChecksMatchIndividualAdmission(t *testing.T) {
+	s := executionQueryStore(t)
+	executionQueryTx(t, s, func(tx *Tx) {
+		intents := []Intent{{ID: "new"}, {ID: "pending"}, {ID: "failed"}, {ID: "granted"}, {ID: "foreign"}, {ID: "old-round"}, {ID: "boot", Description: "bootstrap", Creator: "dispatcher.bootstrap", From: []string{"origin"}}}
+		for _, e := range []Execution{
+			{ID: "p", Kind: "explore", Intent: "pending", RetryKey: "another-key", Status: "result_pending"},
+			{ID: "f", Kind: "explore", Intent: "failed", RetryKey: "explore:failed", Status: "failed"},
+			{ID: "g0", Kind: "explore", Intent: "granted", RetryKey: "explore:granted", Status: "failed"},
+			{ID: "g1", Kind: "explore", Intent: "granted", RetryKey: "other-key", Status: "retry_requested"},
+			{ID: "g2", Kind: "explore", Intent: "granted", RetryKey: "third-key", Status: "retry_requested"},
+			{ID: "other", Namespace: "elsewhere", Kind: "explore", Intent: "foreign", RetryKey: "explore:foreign", Status: "running"},
+			{ID: "old", Kind: "explore", Intent: "old-round", RetryKey: "explore:old-round", Status: "running"},
+			{ID: "b", Kind: "bootstrap", Intent: "boot", RetryKey: "bootstrap:boot", Status: "failed"},
+		} {
+			putQueryExecution(t, tx, e, 0, "")
+		}
+		checks, err := tx.ScheduleExecutionChecks("p", "ns", intents)
+		if err != nil || len(checks) != len(intents) {
+			t.Fatalf("checks=%+v err=%v", checks, err)
+		}
+		for _, i := range intents {
+			kind := "explore"
+			if i.ID == "boot" {
+				kind = "bootstrap"
+			}
+			key := kind + ":" + i.ID
+			want, err := tx.CheckExecutions(ExecutionCheckQuery{ProjectID: "p", Namespace: "ns", Generation: 1, Kind: kind, Intent: i.ID, RetryKey: key})
+			got := checks[key]
+			if err != nil || got.Pending != want.Pending || got.Blocked != want.Blocked || got.PreviousRunID != want.PreviousRunID {
+				t.Fatalf("%s batch=%+v individual=%+v err=%v", key, got, want, err)
+			}
+		}
+		if checks["explore:granted"].PreviousRunID != "g2" {
+			t.Fatal("lost retry-grant tie ordering")
+		}
+		checks, err = tx.ScheduleExecutionChecks("p", "ns", nil)
+		if err != nil || len(checks) != 0 {
+			t.Fatalf("empty page=%+v err=%v", checks, err)
+		}
+	})
+}
+
 func TestExecutionCheckPreservesGrantsPendingAndAttemptAllowance(t *testing.T) {
 	s := executionQueryStore(t)
 	executionQueryTx(t, s, func(tx *Tx) {

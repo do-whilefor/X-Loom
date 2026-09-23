@@ -94,6 +94,15 @@ func (s *Scheduler) executionCheck(ctx context.Context, g board.Graph, kind stri
 	return check, err
 }
 
+func (s *Scheduler) candidateCheck(ctx context.Context, input board.SchedulePage, g board.Graph, kind string, intent *board.Intent) (board.ExecutionCheck, error) {
+	if check, ok := input.ExecutionChecks[kind+":"+intent.ID]; ok {
+		return check, nil
+	}
+	// Older servers and a bootstrap created after the page was read have no
+	// candidate entry. Preserve their existing targeted query path.
+	return s.executionCheck(ctx, g, kind, intent, "")
+}
+
 func (s *Scheduler) restoreDecisionBoundary(project string, latest *board.ExecutionSummary) {
 	if latest == nil || latest.Generation != s.generations[project] {
 		return
