@@ -75,6 +75,7 @@ type session struct {
 	DecisionMetrics        *DecisionMetrics         `json:"decision_metrics,omitempty"`
 	Replan                 *ReplanObservation       `json:"replan,omitempty"`
 	GraphVersion           string                   `json:"graph_version,omitempty"`
+	DecisionConflict       string                   `json:"decision_conflict,omitempty"`
 	ExecuteUpdates         *executeUpdateState      `json:"execute_updates,omitempty"`
 	RecoveryCount          int                      `json:"recovery_count"`
 	Phase                  string                   `json:"phase"`

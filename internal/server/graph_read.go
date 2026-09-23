@@ -33,6 +33,14 @@ func (s *Server) graphRead(t *b.Tx, q *request, r *http.Request) (int, any, erro
 	if err = guard(t, state.Graph, r); err != nil {
 		return 0, nil, err
 	}
+	// An unversioned overview explicitly refreshes a planner's read view.
+	// Continuations and detail pages retain it even while other work publishes
+	// evidence, so collecting a consistent input does not chase a moving graph.
+	refresh := (read.Section == "" || read.Section == "overview") && read.ExpectedVersion == "" && read.ByteOffset == nil
+	state, err = t.DecisionReadState(state, decisionFence(r), refresh)
+	if err != nil {
+		return 0, nil, err
+	}
 	page, err := worker.GraphPage(state, read)
 	if err != nil {
 		status := http.StatusUnprocessableEntity

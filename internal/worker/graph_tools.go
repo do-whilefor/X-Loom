@@ -48,6 +48,9 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 		return result, nil
 	}
 	request := func(ctx context.Context, r GraphRequest) (string, error) {
+		if o.decisionConflict != nil && *o.decisionConflict != "" && r.Op != "decision_receipt" {
+			return "", errors.New(*o.decisionConflict)
+		}
 		frozen := r.Op == "read_snapshot"
 		if frozen && j.InputSnapshot != nil {
 			r.ExpectedVersion = j.InputSnapshot.StateVersion
@@ -109,7 +112,7 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 			return raw, err
 		}
 		if batchDecision(j) && o.decisionEmit != nil {
-			operation := decisionOperation{Op: r.Op, ElapsedMS: time.Since(started).Milliseconds(), Failed: err != nil, StateChanged: err != nil && strings.Contains(err.Error(), "state_changed")}
+			operation := decisionOperation{Op: r.Op, ElapsedMS: time.Since(started).Milliseconds(), Failed: err != nil, StateChanged: graphStateConflict(err)}
 			if err == nil && (r.Op == "decision_commit" || r.Op == "decision_receipt") {
 				var receipt board.DecisionReceipt
 				if json.Unmarshal([]byte(raw), &receipt) == nil && receipt.Committed && len(receipt.StateVersion) == 64 {
@@ -127,8 +130,11 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 			}
 			o.decisionEmit(operation.event())
 		}
-		if err != nil && o.decision != nil && strings.Contains(err.Error(), "state_changed") {
+		if o.decision != nil && graphStateConflict(err) {
 			o.decision.invalidate()
+			if o.decisionConflict != nil && (r.Op == "decision_preview" || r.Op == "decision_commit") {
+				*o.decisionConflict = err.Error()
+			}
 		}
 		if r.Op == "decision_preview" {
 			return raw, err
@@ -168,13 +174,16 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 	}
 	if o.decision != nil {
 		allowed = append(allowed, "complete", "preview", "commit", "reset")
-		description += " Actions are private drafts until commit. Keys for draft actions are letters/digits/underscore/hyphen, start with a letter, at most 64 characters. New goal/step returns $key: use this alias in later reference fields. complete payload {from:[fact IDs],description:proof} must be last; first explicitly abandon unnecessary active Steps and withdraw only auxiliary subgoals. preview validates without publishing; commit publishes the entire batch and ends this run; reset discards uncommitted draft. preview/commit/reset use payload {}. After state_changed read affected evidence and restage; do not blindly resubmit. InvalidSources mark premises requiring review, never silently assume they remain effective."
+		description += " Actions are private drafts until commit. Keys for draft actions are letters/digits/underscore/hyphen, start with a letter, at most 64 characters. New goal/step returns $key: use this alias in later reference fields. complete payload {from:[fact IDs],description:proof} must be last; first explicitly abandon unnecessary active Steps and withdraw only auxiliary subgoals. preview validates without publishing; commit publishes the entire batch and ends this run; reset discards uncommitted draft. preview/commit/reset use payload {}. A state_changed conflict at preview/commit ends this attempt for replanning from fresh input. InvalidSources mark premises requiring review, never silently assume they remain effective."
 	} else if j.Kind != "reason" && j.ResultContractVersion >= 2 {
 		description += " Reuse a published evidence Fact in the final completed.data.fact_id to finish this Step without duplicating observations."
 	}
 	description += " Use a stable idempotency_key (1-128 bytes); reuse it only for the exact same action. A result_omitted receipt still confirms success; use read_graph to retrieve the entity and its paginated support instead of repeating the write. The server validates leases, evidence and project state."
 	schema, _ := json.Marshal(map[string]any{"type": "object", "properties": map[string]any{"op": map[string]any{"type": "string", "enum": allowed}, "idempotency_key": map[string]any{"type": "string", "minLength": 1, "maxLength": 128}, "payload": map[string]any{"type": "object"}}, "required": []string{"op", "idempotency_key", "payload"}, "additionalProperties": false})
 	action := agent.Tool{Definition: agent.Definition{Name: "graph_action", Description: description, Schema: schema}, Execute: func(ctx context.Context, raw json.RawMessage) (string, error) {
+		if o.decisionConflict != nil && *o.decisionConflict != "" {
+			return "", errors.New(*o.decisionConflict)
+		}
 		var a board.StateAction
 		if err := json.Unmarshal(raw, &a); err != nil {
 			return "", err
@@ -220,6 +229,27 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 		o.Tools = append(o.Tools, frozen)
 	}
 	return nil
+}
+
+// The bridge preserves ProtocolError's HTTP status and JSON detail in its
+// error string. A user-supplied alias or validation message mentioning
+// state_changed is not evidence that a transaction was rejected as stale.
+func graphStateConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	if strings.HasPrefix(message, "state_changed:") {
+		return true
+	}
+	const prefix = "board HTTP 409: "
+	if !strings.HasPrefix(message, prefix) {
+		return false
+	}
+	var response struct {
+		Detail string `json:"detail"`
+	}
+	return json.Unmarshal([]byte(strings.TrimPrefix(message, prefix)), &response) == nil && strings.HasPrefix(response.Detail, "state_changed:")
 }
 
 func graphRPC(parent context.Context, runDir string, output io.Writer, r GraphRequest) (string, error) {

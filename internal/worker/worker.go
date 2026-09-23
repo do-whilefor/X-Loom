@@ -33,6 +33,7 @@ type Options struct {
 	ReplanShadow        bool
 	decision            *decisionDraft
 	decisionEmit        agent.Emit
+	decisionConflict    *string
 	graphRequest        func(context.Context, GraphRequest) (string, error)
 }
 
@@ -296,6 +297,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		o.Provider = p
 	}
 	o.GraphVersion = &state.GraphVersion
+	o.decisionConflict = &state.DecisionConflict
 	if err := ConfigureRuntimeTools(j, &o); err != nil {
 		return Result{}, err
 	}
@@ -305,6 +307,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		}
 		if o.decision.committed {
 			return finish(Result{Type: "result", Status: "success", Text: committedDecisionText})
+		}
+		if state.DecisionConflict != "" {
+			return finish(Result{Type: "result", Status: "failed", FailureKind: "state_changed", Error: state.DecisionConflict})
 		}
 		if resuming {
 			o.decision.invalidate()
@@ -413,6 +418,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		return !state.ExecutionDeadline.IsZero() && !o.Now().Before(state.ExecutionDeadline)
 	}
 	l.BeforeRequest = func(turnCtx context.Context, loop *agent.Loop) (context.Context, error) {
+		if state.DecisionConflict != "" {
+			return nil, errors.New(state.DecisionConflict)
+		}
 		if o.decision != nil {
 			o.decision.beforeRequest(loop)
 		}
@@ -506,6 +514,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	l.OnTurnEnd = func(turnCtx context.Context, l *agent.Loop, m agent.Message) (context.Context, string, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
+		}
+		if state.DecisionConflict != "" {
+			return nil, "", errors.New(state.DecisionConflict)
 		}
 		hasCalls := hasToolCalls(m)
 		if o.decision != nil {
@@ -666,6 +677,12 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 			r.Retryable = false
 			r.FailureKind = "recovery_exhausted"
 		}
+	}
+	if state.DecisionConflict != "" && o.decision != nil && !o.decision.committed {
+		// A rejected transaction has no uncertain writes to recover. Let the
+		// scheduler coalesce changed input into a new run with its own budget,
+		// instead of spending this run's remainder on repeated model refreshes.
+		r.Status, r.FailureKind, r.Error, r.Retryable = "failed", "state_changed", state.DecisionConflict, false
 	}
 	if logErr != nil {
 		return r, logErr

@@ -18,7 +18,7 @@ const executionSchema = `CREATE TABLE IF NOT EXISTS xloom_executions(
 CREATE TABLE IF NOT EXISTS xloom_paused_executions(
  project_id TEXT NOT NULL,execution_id TEXT NOT NULL,
  PRIMARY KEY(project_id,execution_id),
- FOREIGN KEY(project_id,execution_id) REFERENCES xloom_executions(project_id,id) ON DELETE CASCADE);` + inputSnapshotSchema
+ FOREIGN KEY(project_id,execution_id) REFERENCES xloom_executions(project_id,id) ON DELETE CASCADE);` + inputSnapshotSchema + decisionReadSchema
 
 // Execution contains no backend environment or model credentials. Job is the
 // immutable input supplied to the Worker, not a newly loaded project snapshot.

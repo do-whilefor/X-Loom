@@ -122,7 +122,7 @@ func (d *decisionDraft) action(ctx context.Context, a board.StateAction, current
 		if err != nil {
 			// A definitive version conflict did not apply any writes. Force the
 			// model to read new information and rebuild, not just change a hash.
-			if strings.Contains(err.Error(), "state_changed") {
+			if graphStateConflict(err) {
 				d.uncertain = false
 				d.invalidate()
 			}
