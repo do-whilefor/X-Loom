@@ -8,6 +8,8 @@
 /docs/
 /design/
 /tpm/
+
+# ---- 开发计划与验收记录仅保留本地 ----
 /DEVELOPMENT*.md
 /VALIDATION*.md
 
