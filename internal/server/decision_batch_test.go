@@ -187,13 +187,13 @@ func TestDecisionCanWithdrawAuxiliaryPlanAndCompleteAtomically(t *testing.T) {
 		t.Fatal("invalid replacement left the original task abandoned")
 	}
 	preview := f.decision("preview", batch, http.StatusOK)
-	if !preview.Completed || preview.Committed || !reflect.DeepEqual(before, f.state()) {
+	if preview.Completed || preview.Committed || preview.ValidationScope != "protocol_only" || preview.CompletionReview == nil || !reflect.DeepEqual(before, f.state()) {
 		t.Fatal("completion preview changed formal work")
 	}
 	// A preview's proposed cancellation must not revoke the executing lease.
 	f.request("POST", f.base()+"/intents/"+step.ID+"/heartbeat", map[string]string{"worker": "existing-executor"}, false, http.StatusOK, nil)
 	committed := f.decision("commit", batch, http.StatusOK)
-	if !committed.Completed || !committed.Committed {
+	if !committed.Completed || !committed.Committed || committed.ValidationScope != "" || committed.CompletionReview != nil {
 		t.Fatal("root completion and withdrawal were not committed together")
 	}
 	state := f.state()

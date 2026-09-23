@@ -30,6 +30,10 @@ func TestGraphReadValidatesRequestsAndFencesContinuations(t *testing.T) {
 	}
 	read.ExpectedVersion = page.StateVersion
 	f.request("POST", f.base()+"/hints", map[string]string{"creator": "user", "content": "A newer observation"}, false, http.StatusCreated, nil)
+	f.request("POST", f.base()+"/state/read", read, true, http.StatusOK, nil)
+	// The registered legacy inline decision input is also stable until an
+	// explicit overview refresh replaces its read view.
+	f.request("POST", f.base()+"/state/read", worker.GraphRequest{RequestID: read.RequestID, Op: read.Op, Section: "overview"}, true, http.StatusOK, nil)
 	f.request("POST", f.base()+"/state/read", read, true, http.StatusConflict, nil)
 	read.ExpectedVersion = ""
 	f.request("PUT", f.base()+"/status", map[string]string{"status": "stopped"}, false, http.StatusOK, nil)

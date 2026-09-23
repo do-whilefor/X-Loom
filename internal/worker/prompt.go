@@ -37,7 +37,9 @@ func Prompt(j Job, conclude bool, runDir string) (string, error) {
 		context += "All tools are disabled. Use only this frozen input and existing evidence. Do not open files.\n"
 	} else if j.Kind == "reason" {
 		context += "Plan from the supplied changes and evidence. Read missing support or conflicting evidence by ids first; widen to pages when relevant evidence cannot be located. Do not reread supplied evidence merely because other items were omitted. Omission is not proof of absence or completion.\n"
-		if j.Decision != nil {
+		if j.Decision != nil && j.Decision.Version == 2 {
+			context += "Graph reads use a stable decision view; overview refreshes it, while detail pages retain it. Writes check current state. After a read conflict, refresh overview and re-read affected evidence. A refreshed version alone does not validate earlier conclusions.\n"
+		} else if j.Decision != nil {
 			context += "Graph pages and writes are version checked. After state_changed, read overview and re-read affected evidence before deciding. A refreshed version alone does not validate earlier conclusions.\n"
 		}
 		if !j.GraphRPC {

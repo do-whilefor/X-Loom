@@ -33,6 +33,8 @@ type Options struct {
 	ReplanShadow        bool
 	decision            *decisionDraft
 	decisionEmit        agent.Emit
+	decisionConflict    *string
+	graphRequest        func(context.Context, GraphRequest) (string, error)
 }
 
 func Execute(ctx context.Context, jobPath string, output io.Writer) error {
@@ -158,6 +160,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		resuming = true
 	} else if !os.IsNotExist(readErr) {
 		return Result{}, readErr
+	}
+	if err := validateExecuteUpdateState(j, &state); err != nil {
+		return Result{}, err
 	}
 	var checkpoint *journalCheckpoint
 	if resuming {
@@ -292,6 +297,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		o.Provider = p
 	}
 	o.GraphVersion = &state.GraphVersion
+	o.decisionConflict = &state.DecisionConflict
 	if err := ConfigureRuntimeTools(j, &o); err != nil {
 		return Result{}, err
 	}
@@ -301,6 +307,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		}
 		if o.decision.committed {
 			return finish(Result{Type: "result", Status: "success", Text: committedDecisionText})
+		}
+		if state.DecisionConflict != "" {
+			return finish(Result{Type: "result", Status: "failed", FailureKind: "state_changed", Error: state.DecisionConflict})
 		}
 		if resuming {
 			o.decision.invalidate()
@@ -322,7 +331,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	}
 	l = &agent.Loop{Provider: o.Provider, Tools: o.Tools, History: state.History, Concluding: state.Concluding, Repairing: state.Repairing, RepairPrompt: state.RepairPrompt, Emit: emit, Checkpoint: state.ContextCheckpoint, SaveState: func(history []agent.Message, _ *agent.ContextCheckpoint) error {
 		return save(history)
-	}, ContextBytes: o.ContextBytes, ContextTokens: o.ContextTokens, ContextTargetTokens: o.ContextTargetTokens, ObserveRequests: j.Kind == "reason", TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt}
+	}, ContextBytes: o.ContextBytes, ContextTokens: o.ContextTokens, ContextTargetTokens: o.ContextTargetTokens, ObserveRequests: true, TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt, ContextData: state.ExecuteUpdates.contextData()}
 	if o.decision != nil {
 		l.StopResult = o.decision.result
 	}
@@ -408,6 +417,41 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		}
 		return !state.ExecutionDeadline.IsZero() && !o.Now().Before(state.ExecutionDeadline)
 	}
+	l.BeforeRequest = func(turnCtx context.Context, loop *agent.Loop) (context.Context, error) {
+		if state.DecisionConflict != "" {
+			return nil, errors.New(state.DecisionConflict)
+		}
+		if o.decision != nil {
+			o.decision.beforeRequest(loop)
+		}
+		concludeAtBoundary := func() error {
+			next, err := startConclusion()
+			if err != nil {
+				return err
+			}
+			turnCtx = next
+			return loop.AppendInstruction(loop.ConclusionPrompt)
+		}
+		if shouldConclude() {
+			if err := concludeAtBoundary(); err != nil {
+				return nil, err
+			}
+		}
+		if err := refreshExecutionUpdates(turnCtx, j, o.graphRequest, &state, loop, save); err != nil {
+			return nil, err
+		}
+		// A slow graph read cannot buy another exploration turn. Enter the same
+		// bounded conclusion used by settled tool turns, then record deferral.
+		if shouldConclude() {
+			if err := concludeAtBoundary(); err != nil {
+				return nil, err
+			}
+			if err := refreshExecutionUpdates(turnCtx, j, o.graphRequest, &state, loop, save); err != nil {
+				return nil, err
+			}
+		}
+		return turnCtx, nil
+	}
 	prepareRepairHistory := func() error {
 		if err := l.RepairHistory(); err != nil {
 			return err
@@ -470,6 +514,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	l.OnTurnEnd = func(turnCtx context.Context, l *agent.Loop, m agent.Message) (context.Context, string, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
+		}
+		if state.DecisionConflict != "" {
+			return nil, "", errors.New(state.DecisionConflict)
 		}
 		hasCalls := hasToolCalls(m)
 		if o.decision != nil {
@@ -630,6 +677,12 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 			r.Retryable = false
 			r.FailureKind = "recovery_exhausted"
 		}
+	}
+	if state.DecisionConflict != "" && o.decision != nil && !o.decision.committed {
+		// A rejected transaction has no uncertain writes to recover. Let the
+		// scheduler coalesce changed input into a new run with its own budget,
+		// instead of spending this run's remainder on repeated model refreshes.
+		r.Status, r.FailureKind, r.Error, r.Retryable = "failed", "state_changed", state.DecisionConflict, false
 	}
 	if logErr != nil {
 		return r, logErr

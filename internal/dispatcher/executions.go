@@ -453,19 +453,22 @@ func (s *Scheduler) configureGraphHandler() {
 				method, body = "GET", nil
 			}
 			err := s.Client.Do(ctx, method, base+"/state/decisions/"+op, body, &result, &lease)
-			// Commit and recovery need only a compact acknowledgement; large
-			// projected entities must not make a successful commit undeliverable.
-			if result.Committed {
+			// Commit and recovery need only a compact acknowledgement. Completion
+			// previews retain the authoritative review instead of repeating every
+			// projected entity, which could exceed the graph bridge frame.
+			if result.Committed || result.CompletionReview != nil {
 				result.Results = nil
 			}
 			return result, err
-		case "read_graph", "read_snapshot":
+		case "read_graph", "read_snapshot", "read_updates":
 			// Bound the HTTP response too: a current FGS may exceed the client
 			// limit even though the requested graph/evidence page is small.
 			var page json.RawMessage
 			path := base + "/state/read"
 			if request.Op == "read_snapshot" {
 				path = base + "/executions/" + url.PathEscape(j.RunID) + "/input/read"
+			} else if request.Op == "read_updates" {
+				path = base + "/executions/" + url.PathEscape(j.RunID) + "/updates"
 			}
 			err := s.Client.Do(ctx, "POST", path, request, &page, &lease)
 			return page, err

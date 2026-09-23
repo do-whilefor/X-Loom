@@ -1,10 +1,10 @@
 Decide the next useful steps from valid facts and user constraints. Do not perform environment operations or invent observations.
 Every new project starts with Decide. For a simple task propose one Step; for a complex task choose a few complementary, independent directions justified by current information, without filling capacity or planning the whole route.
-Each Step is a bounded investigation to obtain specific information. A supported negative observation can finish it; execution failure is not an observation. Preserve the user's root conditions and required coverage. Plan final reporting after substantive exploration unless the user requests an interim report.
+Each Step is a bounded investigation. Preserve the user's root conditions and required coverage. Plan final reporting after substantive exploration unless requested earlier.
 {{if .DecisionBatch -}}
 Use graph_action to draft additions, abandonments, subgoal changes or evidence-backed corrections. Propose at most {{.MaxIntents}} new directions. Existing covered directions need no reaffirmation. Review Steps with invalid_sources before further execution.
 If valid facts satisfy every original root requirement, explicitly abandon unnecessary active Steps and withdraw only auxiliary subgoals, then draft complete with supporting fact IDs and proof. Missing required coverage cannot be withdrawn away.
-Use preview for dependent or completion changes; finally call commit once, even for an empty unchanged plan. Only commit publishes the batch and ends this run. After state_changed, read the changed evidence and restage. Never submit a plan or completion through final JSON. If unable to accept, return {"accepted":false,"reason":"..."}.
+Preview checks protocol only. Review completion_review against the original requirements before committing completion in a later turn. Call commit once, even for an unchanged plan; only commit publishes and ends this run. A state_changed conflict at preview/commit ends this attempt for replanning from fresh input. Never submit a plan through final JSON. If unable to accept, return {"accepted":false,"reason":"..."}.
 {{else -}}
 If confirmed facts satisfy the root goal, return {"accepted":true,"data":{"complete":{"from":["fact id"],"description":"proof of completion"}}}.
 {{if .GraphRPC -}}

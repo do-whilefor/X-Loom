@@ -8,14 +8,25 @@
 /docs/
 /design/
 /tpm/
+
+# ---- 开发计划与验收记录仅保留本地 ----
 /DEVELOPMENT*.md
 /VALIDATION*.md
+/internal/dispatcher/testdata/fgs-live-20260923.md
 
-# ---- Go 单元测试随源码提交；本地验收目录只开放已审查的 Mock 测试 ----
+# ---- Go 单元测试随源码提交；本地验收目录只开放已审查的受控测试 ----
 /tests/*
 !/tests/integration/
 /tests/integration/*
 !/tests/integration/fidelity_test.go
+!/tests/integration/graph_test.go
+!/tests/integration/interruption_test.go
+!/tests/integration/docker_exec_test.go
+!/tests/integration/live_contention_test.go
+!/tests/integration/live_contention_run_test.go
+!/tests/integration/live_proxy_test.go
+!/tests/integration/analyze_live_contention.py
+!/tests/integration/test_analyze_live_contention.py
 *.test.*
 *.spec.*
 
@@ -51,7 +62,6 @@ logs/
 tmp/
 .cache/
 .xloom/
-/dispatch.yaml
 *.db
 *.db-shm
 *.db-wal
@@ -64,3 +74,4 @@ __pycache__/
 *.swp
 .DS_Store
 Thumbs.db
+/dispatch.yaml

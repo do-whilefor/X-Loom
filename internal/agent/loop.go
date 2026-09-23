@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 type Loop struct {
@@ -26,6 +27,14 @@ type Loop struct {
 	TaskPrompt       string
 	ConclusionPrompt string
 	RepairPrompt     string
+	// ContextData retains bounded runtime task data verbatim during compaction.
+	// Callers persist and restore it separately from task and phase instructions.
+	ContextData []string
+	// BeforeRequest prepares external task data at a settled history boundary,
+	// before compaction and each normal model request. Summary requests and an
+	// immediate context-overflow retry reuse that boundary without calling it.
+	// A non-nil replacement context bounds subsequent work.
+	BeforeRequest func(context.Context, *Loop) (context.Context, error)
 	// OnTurnEnd runs at a settled model/tool boundary. A returned prompt keeps
 	// the same session running; a replacement context bounds subsequent turns.
 	OnTurnEnd func(context.Context, *Loop, Message) (context.Context, string, error)
@@ -51,6 +60,10 @@ func (l *Loop) emit(e Event) {
 	if l.Emit != nil {
 		l.mu.Lock()
 		defer l.mu.Unlock()
+		switch e.Type {
+		case "agent_start", "agent_end", "turn_start", "turn_end", "model_call_start", "model_call_end", "tool_start", "tool_end":
+			e.At = time.Now().UTC().Format(time.RFC3339Nano)
+		}
 		l.Emit(e)
 	}
 }
@@ -128,6 +141,15 @@ func (l *Loop) Run(ctx context.Context, prompt string) (string, error) {
 			if s, ok := queued(l.Steering); ok {
 				if err := l.append(Text("user", s)); err != nil {
 					return last, err
+				}
+			}
+			if l.BeforeRequest != nil {
+				next, err := l.BeforeRequest(ctx, l)
+				if err != nil {
+					return last, err
+				}
+				if next != nil {
+					ctx = next
 				}
 			}
 			if err := l.compact(ctx); err != nil {

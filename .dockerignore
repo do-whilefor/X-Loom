@@ -10,7 +10,6 @@ AGENTS.md
 !.env.example
 .cache
 .xloom
-dispatch.yaml
 __pycache__
 build
 bin
@@ -21,3 +20,4 @@ tpm
 *.db
 *.db-shm
 *.db-wal
+dispatch.yaml
