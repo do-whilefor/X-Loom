@@ -256,7 +256,11 @@ func (s *Scheduler) recoverExecutions(ctx context.Context, states map[string]str
 		if err != nil {
 			var pe *ProtocolError
 			if errors.As(err, &pe) && (pe.Status == 403 || pe.Status == 404 || pe.Status == 409) {
-				s.terminal(t, "failed", worker.Result{Status: "failed", FailureKind: "session_invalid", Error: err.Error()})
+				failure := "session_invalid"
+				if pe.Status == 409 && strings.Contains(pe.Detail, "Dispatcher recovery allowance exhausted") {
+					failure = "recovery_exhausted"
+				}
+				s.terminal(t, "failed", worker.Result{Status: "failed", FailureKind: failure, Error: err.Error()})
 				continue
 			}
 			return err

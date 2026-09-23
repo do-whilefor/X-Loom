@@ -437,9 +437,9 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 	case "fact":
 		id, result, err = t.addStateFact(&s, &d, fence, action.Payload)
 	case "fact_relation":
-		id, result, err = t.addFactRelation(s, &d, fence, action.Payload)
+		id, result, changed, err = t.addFactRelation(s, &d, fence, action.Payload)
 	case "finding":
-		id, result, err = t.upsertFinding(s, &d, fence, action.Payload)
+		id, result, changed, err = t.upsertFinding(s, &d, fence, action.Payload)
 	case "goal":
 		id, result, changed, err = t.changeGoal(s, &d, action.Payload)
 	case "step":
@@ -526,7 +526,7 @@ func (t *Tx) addStateFact(s *State, d *stateData, fence ExecutionFence, raw json
 	return id, f, t.Save(s.Graph)
 }
 
-func (t *Tx) addFactRelation(s State, d *stateData, fence ExecutionFence, raw json.RawMessage) (string, any, error) {
+func (t *Tx) addFactRelation(s State, d *stateData, fence ExecutionFence, raw json.RawMessage) (string, any, bool, error) {
 	var input struct {
 		Kind   string `json:"kind"`
 		Source string `json:"source"`
@@ -534,19 +534,24 @@ func (t *Tx) addFactRelation(s State, d *stateData, fence ExecutionFence, raw js
 		Reason string `json:"reason"`
 	}
 	if err := decodeAction(raw, &input); err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 	if !slices.Contains([]string{"supersedes", "refutes", "narrows"}, input.Kind) || !required(input.Reason, 8192) || input.Source == input.Target {
-		return "", nil, Err(422, "invalid fact relation")
+		return "", nil, false, Err(422, "invalid fact relation")
 	}
 	if err := s.ValidateFactSources([]string{input.Source}, true); err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 	if err := s.Graph.ValidateSources([]string{input.Target}); err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 	if input.Target == "origin" {
-		return "", nil, Err(403, "user input cannot be rewritten as a fact relation")
+		return "", nil, false, Err(403, "user input cannot be rewritten as a fact relation")
+	}
+	for _, relation := range d.FactRelations {
+		if relation.Kind == input.Kind && relation.Source == input.Source && relation.Target == input.Target && relation.Reason == input.Reason {
+			return input.Target, relation, false, nil
+		}
 	}
 	// Relations point from old target to its new corrective source. Reject
 	// cycles so an observation can never invalidate itself through a chain.
@@ -568,31 +573,43 @@ func (t *Tx) addFactRelation(s State, d *stateData, fence ExecutionFence, raw js
 		return false
 	}
 	if reaches(input.Source) {
-		return "", nil, Err(409, "fact relation would create a cycle")
+		return "", nil, false, Err(409, "fact relation would create a cycle")
 	}
 	relation := FactRelation{Kind: input.Kind, Source: input.Source, Target: input.Target, Reason: input.Reason, RunID: fence.Run, CreatedAt: t.Now}
 	d.FactRelations = append(d.FactRelations, relation)
-	return input.Target, relation, nil
+	return input.Target, relation, true, nil
 }
 
-func (t *Tx) upsertFinding(s State, d *stateData, fence ExecutionFence, raw json.RawMessage) (string, any, error) {
+func (t *Tx) upsertFinding(s State, d *stateData, fence ExecutionFence, raw json.RawMessage) (string, any, bool, error) {
 	var input struct {
-		Claim    string        `json:"claim"`
-		Scope    string        `json:"scope"`
-		Status   string        `json:"status"`
-		Sources  []string      `json:"sources"`
-		Evidence []EvidenceRef `json:"evidence"`
-		Reason   string        `json:"reason"`
+		Claim          string          `json:"claim"`
+		Scope          string          `json:"scope"`
+		Status         string          `json:"status"`
+		Sources        []string        `json:"sources"`
+		Evidence       []EvidenceRef   `json:"evidence"`
+		Reason         string          `json:"reason"`
+		ReplaceSupport json.RawMessage `json:"replace_support"`
 	}
 	if err := decodeAction(raw, &input); err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 	if !required(input.Claim, 16384) || !required(input.Scope, 4096) || !slices.Contains([]string{"candidate", "verified", "refuted"}, input.Status) || len(input.Reason) > 8192 {
-		return "", nil, Err(422, "finding requires claim, scope and candidate/verified/refuted status")
+		return "", nil, false, Err(422, "finding requires claim, scope and candidate/verified/refuted status")
 	}
-	if len(input.Sources) > 0 || input.Status != "candidate" {
+	replaceSupport := false
+	switch string(bytes.TrimSpace(input.ReplaceSupport)) {
+	case "", "false":
+	case "true":
+		replaceSupport = true
+	default:
+		return "", nil, false, Err(422, "replace_support must be a boolean")
+	}
+	if replaceSupport && !required(input.Reason, 8192) {
+		return "", nil, false, Err(422, "replacing finding support requires a reason")
+	}
+	if len(input.Sources) > 0 || input.Status != "candidate" || replaceSupport {
 		if err := s.ValidateFactSources(input.Sources, true); err != nil {
-			return "", nil, err
+			return "", nil, false, err
 		}
 	}
 	allowed := []EvidenceRef{}
@@ -602,10 +619,10 @@ func (t *Tx) upsertFinding(s State, d *stateData, fence ExecutionFence, raw json
 		}
 	}
 	if err := validateEvidence(input.Evidence, fence.Run, allowed, false); err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 	if input.Status != "candidate" && len(allowed)+len(input.Evidence) == 0 {
-		return "", nil, Err(422, "verified or refuted findings require retained evidence excerpts")
+		return "", nil, false, Err(422, "verified or refuted findings require retained evidence excerpts")
 	}
 	claim, scope := strings.Join(strings.Fields(input.Claim), " "), strings.TrimSpace(input.Scope)
 	key, _ := json.Marshal([]string{claim, scope})
@@ -615,10 +632,16 @@ func (t *Tx) upsertFinding(s State, d *stateData, fence ExecutionFence, raw json
 	index := -1
 	for n, old := range d.Findings {
 		if old.ID == id {
-			finding.Sources, finding.Evidence, finding.CreatedAt = old.Sources, old.Evidence, old.CreatedAt
+			finding.CreatedAt = old.CreatedAt
+			if !replaceSupport {
+				finding.Sources, finding.Evidence = append([]string{}, old.Sources...), append([]EvidenceRef{}, old.Evidence...)
+			}
 			index = n
 			break
 		}
+	}
+	if replaceSupport && index < 0 {
+		return "", nil, false, Err(409, "support replacement requires an existing finding")
 	}
 	for _, source := range input.Sources {
 		if !slices.Contains(finding.Sources, source) {
@@ -630,12 +653,32 @@ func (t *Tx) upsertFinding(s State, d *stateData, fence ExecutionFence, raw json
 			finding.Evidence = append(finding.Evidence, ref)
 		}
 	}
+	finding.SupportValid = len(finding.Sources) > 0 && s.ValidateFactSources(finding.Sources, true) == nil
 	if index >= 0 {
+		old := d.Findings[index]
+		if old.Status == finding.Status && old.Reason == finding.Reason && sameSupportSet(old.Sources, finding.Sources) && sameSupportSet(old.Evidence, finding.Evidence) {
+			old.SupportValid = finding.SupportValid
+			return id, old, false, nil
+		}
+		// Explicit replacement updates current support only. Earlier immutable
+		// action events retain the previous sources and evidence references.
 		d.Findings[index] = finding
 	} else {
 		d.Findings = append(d.Findings, finding)
 	}
-	return id, finding, nil
+	return id, finding, true, nil
+}
+
+func sameSupportSet[T comparable](a, b []T) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, item := range a {
+		if !slices.Contains(b, item) {
+			return false
+		}
+	}
+	return true
 }
 
 func (t *Tx) stateID(project, kind, prefix string) (string, error) {

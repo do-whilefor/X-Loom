@@ -90,11 +90,21 @@ func (s *Server) executionAction(t *b.Tx, q *request, r *http.Request) (int, any
 		return 0, nil, err
 	}
 	op := r.PathValue("execution_op")
-	// retry is an explicit project-management operation, never exposed as a
-	// Worker tool. It enables one subsequent attempt, retaining the old record.
+	// Retry is a project-management operation, never a Worker tool. Automatic
+	// Decide recovery has a separate server-enforced bound; human retry remains
+	// explicit. Both retain the old record and enable one subsequent attempt.
 	if op == "retry" {
 		if r.Header.Get("X-Xloom-Run") != "" {
 			return 0, nil, b.Err(403, "retry authorization is a project-management operation")
+		}
+		if value, exists := q.fields["automatic"]; exists {
+			automatic, ok := value.(bool)
+			if !ok {
+				return 0, nil, b.Err(422, "automatic must be a boolean")
+			}
+			if automatic {
+				return 200, map[string]string{"previous_run_id": e.ID}, t.RequestAutomaticDecisionRetry(e)
+			}
 		}
 		if e.Status != "failed" && e.Status != "rejected" && e.Status != "cancelled" {
 			return 0, nil, b.Err(409, "Only failed, rejected or cancelled executions can be retried")

@@ -436,6 +436,11 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 	if g.Project.Status != "active" {
 		return false, nil
 	}
+	if !localReason {
+		if err := s.automaticDecisionRetry(ctx, &g); err != nil {
+			return false, err
+		}
+	}
 	// A failed bootstrap may already have handed planning to Decide. Explicit
 	// retry still refers to that same Step, even after normal steps were added.
 	// Drain current project work first, then run the authorized initialization
