@@ -80,6 +80,8 @@ docker compose down
 
 示例 Worker 只启用 `reason`、`explore`；配置缺少 `reason` 能力会报错。需要继续处理历史 bootstrap 项目时，将 `bootstrap` 加回 Worker 的 `task_types`，并添加 `tasks.bootstrap: {timeout: 0, conclude_timeout: 60}`。
 
+CTF 模式内置 TSEC flag 提交说明：仅依据证据、高置信时提交，禁止把 `/api/submit` 用于试猜、枚举或爆破；提交成功必须由接口响应明确确认。使用比赛环境提供的 `TSEC_SERVER_HOST` 和 `TSEC_AGENT_TOKEN`。规则随新建执行的提示词保存，升级前已经保存的旧会话提示词不会自动替换。
+
 ## 黑板与提交协议
 
 - 新版实时 Decide 使用 `decision.version: 2`：`graph_action` 暂存本轮计划，`preview` 校验，`commit` 一次提交。新增 Goal／Step 可通过 `$key` 在同批次中引用；最多 64 项，任何一项非法则整批不生效。提交后本轮立即结束。

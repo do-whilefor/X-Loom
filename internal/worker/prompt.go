@@ -18,6 +18,9 @@ var prompts embed.FS
 //go:embed prompts/pentest.md
 var pentestPolicy string
 
+//go:embed prompts/ctf.md
+var ctfPolicy string
+
 func Prompt(j Job, conclude bool, runDir string) (string, error) {
 	if j.Kind != "bootstrap" && j.Kind != "explore" && j.Kind != "reason" {
 		return "", errors.New("unknown task")
@@ -82,8 +85,11 @@ func taskTemplate(j Job, conclude bool) (string, error) {
 }
 
 func scenarioPrompt(j Job) string {
-	if j.Graph.Project.Scenario == "pentest" {
+	switch j.Graph.Project.Scenario {
+	case "pentest":
 		return "\n" + pentestPolicy
+	case "ctf":
+		return "\n" + ctfPolicy
 	}
 	return ""
 }
