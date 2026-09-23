@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +47,155 @@ func TestDecisionDraftStagesAliasesWithoutPublishing(t *testing.T) {
 	step.Payload = json.RawMessage(`{"action":"abandon","id":"some-other-step","reason":"Replaced action"}`)
 	if _, err := draft.action(ctx, step, "original"); err == nil || len(draft.actions) != 2 {
 		t.Fatal("a reused draft key changed the already staged plan")
+	}
+}
+
+func TestDecisionDraftRejectsRootGoalWithoutConsumingDraftOrKey(t *testing.T) {
+	for _, transition := range []string{"achieve", "withdraw", "add"} {
+		for _, seeded := range []bool{false, true} {
+			name := transition + "/empty"
+			if seeded {
+				name = transition + "/existing_draft"
+			}
+			t.Run(name, func(t *testing.T) {
+				ctx := context.Background()
+				var operations []string
+				var wantActions []board.DecisionAction
+				wantVersion := "corrected-version"
+				draft := &decisionDraft{request: func(_ context.Context, request GraphRequest) (string, error) {
+					operations = append(operations, request.Op)
+					if request.Batch == nil || request.Batch.ExpectedVersion != wantVersion || !reflect.DeepEqual(request.Batch.Actions, wantActions) {
+						t.Fatalf("request changed the corrected draft or version: %+v", request)
+					}
+					if request.Op != "decision_preview" && request.Op != "decision_commit" {
+						t.Fatalf("unexpected request %q", request.Op)
+					}
+					raw, err := json.Marshal(board.DecisionReceipt{Committed: request.Op == "decision_commit", StateVersion: wantVersion})
+					return string(raw), err
+				}}
+				if seeded {
+					if _, err := draft.action(ctx, draftTestAction("step", "retained", `{"action":"abandon","id":"i-old","reason":"The completed investigation is no longer needed"}`), "original-version"); err != nil {
+						t.Fatal(err)
+					}
+					wantVersion = "original-version"
+				}
+				beforeVersion := draft.version
+				beforeKeys := append([]string(nil), draft.keys...)
+				beforeActions, _ := json.Marshal(draft.actions)
+				invalid := draftTestAction("goal", "finish", `{"action":"`+transition+`","id":"goal","reason":"Root requirement met","condition":"Root condition","sources":["f001"]}`)
+				if _, err := draft.action(ctx, invalid, "invalid-version"); err == nil || !strings.Contains(err.Error(), "root goal") || !strings.Contains(err.Error(), "use complete") || !strings.Contains(err.Error(), "draft unchanged") {
+					t.Fatalf("illegal root action was not rejected with recovery guidance: %v", err)
+				}
+				afterActions, _ := json.Marshal(draft.actions)
+				if len(operations) != 0 || draft.version != beforeVersion || !reflect.DeepEqual(draft.keys, beforeKeys) || string(afterActions) != string(beforeActions) || draft.uncertain || draft.committed {
+					t.Fatalf("illegal root action consumed or changed the existing draft: %+v operations=%v", draft, operations)
+				}
+				// The failed action must not reserve its key or bind an empty draft
+				// to its version. A corrected completion needs no reset or restaging.
+				if _, err := draft.action(ctx, draftTestAction("complete", "finish", `{"from":["f001"],"description":"The retained evidence satisfies the original requirement"}`), "corrected-version"); err != nil {
+					t.Fatalf("the rejected key could not be reused for complete: %v", err)
+				}
+				if draft.version != wantVersion || len(draft.actions) != len(beforeKeys)+1 || draft.actions[len(draft.actions)-1].Op != "complete" || draft.keys[len(draft.keys)-1] != "finish" {
+					t.Fatalf("corrected completion lost the prior draft or version: %+v", draft)
+				}
+				retained, _ := json.Marshal(draft.actions[:len(beforeKeys)])
+				if len(beforeKeys) > 0 && string(retained) != string(beforeActions) {
+					t.Fatal("correcting the root action rewrote an earlier legal action")
+				}
+				wantActions = append([]board.DecisionAction(nil), draft.actions...)
+				for _, op := range []string{"preview", "commit"} {
+					if _, err := draft.action(ctx, draftTestAction(op, op, `{}`), "later-version"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if strings.Join(operations, ",") != "decision_preview,decision_commit" || !draft.committed || draft.uncertain {
+					t.Fatalf("corrected plan did not preview and commit once: %+v operations=%v", draft, operations)
+				}
+			})
+		}
+	}
+}
+
+func TestDecisionDraftAllowsSubgoalsWithRootParentAndGoalAlias(t *testing.T) {
+	draft := &decisionDraft{request: func(context.Context, GraphRequest) (string, error) {
+		t.Fatal("staging subgoals made a server request")
+		return "", nil
+	}}
+	for _, action := range []board.StateAction{
+		draftTestAction("goal", "goal", `{"action":"add","parent_id":"goal","condition":"Check one auxiliary condition"}`),
+		draftTestAction("goal", "achieve-child", `{"action":"achieve","id":"$goal","reason":"Auxiliary condition verified","sources":["f001"]}`),
+		draftTestAction("goal", "withdraw-child", `{"action":"withdraw","id":"g001","reason":"This auxiliary direction is no longer needed"}`),
+	} {
+		if _, err := draft.action(context.Background(), action, "original-version"); err != nil {
+			t.Fatalf("legal child goal was rejected as a root change: %v", err)
+		}
+	}
+	if len(draft.actions) != 3 || draft.actions[0].Ref != "goal" || draft.version != "original-version" {
+		t.Fatalf("root-parent or alias handling changed the child draft: %+v", draft)
+	}
+}
+
+func TestDecisionDraftRejectsRootGoalSourceWithoutConsumingDraftOrKey(t *testing.T) {
+	for _, from := range []string{`["goal"]`, `["origin","goal"]`, `["goal","f001"]`} {
+		for _, seeded := range []bool{false, true} {
+			name := from + "/empty"
+			if seeded {
+				name = from + "/existing_draft"
+			}
+			t.Run(name, func(t *testing.T) {
+				ctx := context.Background()
+				var operations []string
+				var wantActions []board.DecisionAction
+				wantVersion := "corrected-version"
+				draft := &decisionDraft{request: func(_ context.Context, request GraphRequest) (string, error) {
+					operations = append(operations, request.Op)
+					if request.Batch == nil || request.Batch.ExpectedVersion != wantVersion || !reflect.DeepEqual(request.Batch.Actions, wantActions) {
+						t.Fatalf("request changed the corrected draft or version: %+v", request)
+					}
+					raw, err := json.Marshal(board.DecisionReceipt{Committed: request.Op == "decision_commit", StateVersion: wantVersion})
+					return string(raw), err
+				}}
+				if seeded {
+					if _, err := draft.action(ctx, draftTestAction("goal", "retained", `{"action":"add","parent_id":"goal","condition":"Check one auxiliary condition"}`), "original-version"); err != nil {
+						t.Fatal(err)
+					}
+					wantVersion = "original-version"
+				}
+				beforeVersion := draft.version
+				beforeKeys := append([]string(nil), draft.keys...)
+				beforeActions, _ := json.Marshal(draft.actions)
+				invalid := draftTestAction("step", "probe", `{"action":"add","goal_id":"goal","from":`+from+`,"description":"Inspect the service"}`)
+				if _, err := draft.action(ctx, invalid, "invalid-version"); err == nil || !strings.Contains(err.Error(), "use goal_id") || !strings.Contains(err.Error(), "from accepts evidence") || !strings.Contains(err.Error(), "origin is allowed") || !strings.Contains(err.Error(), "draft unchanged") {
+					t.Fatalf("root goal source was not rejected with recovery guidance: %v", err)
+				}
+				afterActions, _ := json.Marshal(draft.actions)
+				if len(operations) != 0 || draft.version != beforeVersion || !reflect.DeepEqual(draft.keys, beforeKeys) || string(afterActions) != string(beforeActions) || draft.uncertain || draft.committed {
+					t.Fatalf("invalid source consumed or changed the existing draft: %+v operations=%v", draft, operations)
+				}
+				// Root goal binding and origin evidence remain valid, and fixing
+				// from must not require resetting the draft or choosing a new key.
+				corrected := draftTestAction("step", "probe", `{"action":"add","goal_id":"goal","from":["origin","f001"],"description":"Inspect the service"}`)
+				if _, err := draft.action(ctx, corrected, "corrected-version"); err != nil {
+					t.Fatalf("the rejected key could not be reused for a corrected Step: %v", err)
+				}
+				if draft.version != wantVersion || len(draft.actions) != len(beforeKeys)+1 || draft.actions[len(draft.actions)-1].Ref != "probe" || draft.keys[len(draft.keys)-1] != "probe" {
+					t.Fatalf("corrected Step lost the prior draft or version: %+v", draft)
+				}
+				retained, _ := json.Marshal(draft.actions[:len(beforeKeys)])
+				if len(beforeKeys) > 0 && string(retained) != string(beforeActions) {
+					t.Fatal("correcting the source rewrote an earlier legal action")
+				}
+				wantActions = append([]board.DecisionAction(nil), draft.actions...)
+				for _, op := range []string{"preview", "commit"} {
+					if _, err := draft.action(ctx, draftTestAction(op, op, `{}`), "later-version"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if strings.Join(operations, ",") != "decision_preview,decision_commit" || !draft.committed || draft.uncertain {
+					t.Fatalf("corrected plan did not preview and commit once: %+v operations=%v", draft, operations)
+				}
+			})
+		}
 	}
 }
 

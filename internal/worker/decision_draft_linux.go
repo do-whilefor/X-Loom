@@ -123,6 +123,17 @@ func (d *decisionDraft) action(ctx context.Context, a board.StateAction, current
 	if json.Unmarshal(a.Payload, &payload) != nil || payload == nil {
 		return "", errors.New("draft payload must be an object")
 	}
+	if a.Op == "goal" && payload["id"] == "goal" {
+		return "", errors.New("root goal cannot be changed by goal actions; use complete with supporting facts and proof; draft unchanged")
+	}
+	if a.Op == "step" && payload["action"] == "add" {
+		from, _ := payload["from"].([]any)
+		for _, source := range from {
+			if source == "goal" {
+				return "", errors.New("step from cannot include root goal; use goal_id to bind the target; from accepts evidence (origin is allowed); draft unchanged")
+			}
+		}
+	}
 	canonical, _ := json.Marshal(payload)
 	item := board.DecisionAction{Op: a.Op, Payload: canonical}
 	if (a.Op == "goal" || a.Op == "step") && payload["action"] == "add" {
