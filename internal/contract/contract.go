@@ -97,7 +97,12 @@ func Parse(output, kind string, conclude bool, openIntents, maxIntents int) (Res
 	if err != nil {
 		return Result{}, err
 	}
+	return parseObject(m, kind, conclude, openIntents, maxIntents)
+}
+
+func parseObject(m map[string]json.RawMessage, kind string, conclude bool, openIntents, maxIntents int) (Result, error) {
 	data := m
+	var err error
 	var accepted bool
 	wrapped := false
 	if raw, ok := m["accepted"]; ok && json.Unmarshal(raw, &accepted) == nil && string(raw) != "null" {

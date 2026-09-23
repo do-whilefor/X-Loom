@@ -17,20 +17,16 @@ func ParseWithPolicy(output, kind string, conclude bool, openIntents, maxIntents
 	if policy.Version < 0 || policy.Version > 2 {
 		return Result{}, fmt.Errorf("unsupported result contract version %d", policy.Version)
 	}
+	m, err := Extract(output)
+	if err != nil {
+		return Result{}, err
+	}
 	if policy.Version == 0 {
-		m, err := Extract(output)
-		if err != nil {
-			return Result{}, err
-		}
 		if _, exists := m["outcome"]; exists {
 			return Result{}, errors.New("outcome requires result contract version 1; legacy jobs cannot mix result protocols")
 		}
 	}
 	if policy.Version >= 1 && (kind == "explore" || kind == "bootstrap") {
-		m, err := Extract(output)
-		if err != nil {
-			return Result{}, err
-		}
 		var accepted bool
 		if raw := m["accepted"]; len(raw) == 0 || string(raw) == "null" || json.Unmarshal(raw, &accepted) != nil {
 			return Result{}, errors.New("accepted must be true or false")
@@ -66,18 +62,18 @@ func ParseWithPolicy(output, kind string, conclude bool, openIntents, maxIntents
 			if kind == "bootstrap" && conclude {
 				// A budget boundary changes which effects are allowed, not the
 				// evidence required to claim that the assigned work is complete.
-				if _, err := Parse(output, kind, false, openIntents, maxIntents); err != nil {
+				if _, err := parseObject(m, kind, false, openIntents, maxIntents); err != nil {
 					return Result{}, err
 				}
 			}
-			r, err := Parse(output, kind, conclude, openIntents, maxIntents)
+			r, err := parseObject(m, kind, conclude, openIntents, maxIntents)
 			r.Outcome = outcome
 			return r, err
 		default:
 			return Result{}, fmt.Errorf("unknown execution outcome %q", outcome)
 		}
 	}
-	r, err := Parse(output, kind, conclude, openIntents, maxIntents)
+	r, err := parseObject(m, kind, conclude, openIntents, maxIntents)
 	if err == nil && kind == "reason" && policy.GraphRPC && len(r.Intents) > 0 {
 		return Result{}, errors.New("live graph jobs must create steps through graph_action; final intent/intents would submit a second plan; return decided after committed decisions")
 	}
