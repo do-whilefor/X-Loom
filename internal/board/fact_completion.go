@@ -86,16 +86,8 @@ func (t *Tx) ConcludeEvidenceStep(project string, fence ExecutionFence, factID s
 			return Conclusion{}, err
 		}
 		result := Conclusion{Fact: Fact{ID: fact.ID, Description: fact.Description}, Intent: *i}
-		d, revision, decision, err := t.stateData(project)
+		revision, err := t.advanceStateRevision(project, true)
 		if err != nil {
-			return Conclusion{}, err
-		}
-		raw, err := json.Marshal(d)
-		if err != nil {
-			return Conclusion{}, err
-		}
-		revision++
-		if _, err = t.Exec("INSERT INTO xloom_state(project_id,data,revision,decision_revision) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET data=excluded.data,revision=excluded.revision,decision_revision=excluded.decision_revision", project, string(raw), revision, decision+1); err != nil {
 			return Conclusion{}, err
 		}
 		payload, _ := json.Marshal(map[string]string{"fact_id": factID})

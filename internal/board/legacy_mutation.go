@@ -38,15 +38,7 @@ func (t *Tx) SaveLegacyMutation(g Graph, op, id, run string, payload, result any
 	if DecisionStateVersion(State{Graph: before}) == DecisionStateVersion(State{Graph: after}) {
 		return nil
 	}
-	d, revision, decision, err := t.stateData(g.Project.ID)
-	if err != nil {
-		return err
-	}
-	revision++
-	if decisionChange {
-		decision++
-	}
-	data, err := json.Marshal(d)
+	revision, err := t.advanceStateRevision(g.Project.ID, decisionChange)
 	if err != nil {
 		return err
 	}
@@ -60,9 +52,6 @@ func (t *Tx) SaveLegacyMutation(g Graph, op, id, run string, payload, result any
 	}
 	event, err := json.Marshal(StateEvent{Revision: revision, Op: op, ID: id, RunID: run, CreatedAt: t.Now, Payload: input, Result: output})
 	if err != nil {
-		return err
-	}
-	if _, err = t.Exec("INSERT INTO xloom_state(project_id,data,revision,decision_revision) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET data=excluded.data,revision=excluded.revision,decision_revision=excluded.decision_revision", g.Project.ID, string(data), revision, decision); err != nil {
 		return err
 	}
 	_, err = t.Exec("INSERT INTO xloom_state_events(project_id,revision,event) VALUES(?,?,?)", g.Project.ID, revision, string(event))

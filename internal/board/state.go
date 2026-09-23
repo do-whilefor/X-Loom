@@ -331,11 +331,10 @@ func executionFailureDescription(status string, raw json.RawMessage) string {
 }
 
 func (t *Tx) recordExecutionFailure(e Execution, status string, failure json.RawMessage) error {
-	d, revision, decision, err := t.stateData(e.ProjectID)
+	d, _, _, err := t.stateData(e.ProjectID)
 	if err != nil {
 		return err
 	}
-	revision++
 	triggerDecision := true
 	for _, step := range d.Steps {
 		if step.ID == e.Intent && step.Status == "abandoned" {
@@ -344,20 +343,29 @@ func (t *Tx) recordExecutionFailure(e Execution, status string, failure json.Raw
 			triggerDecision = false
 		}
 	}
-	if triggerDecision {
-		decision++
-	}
-	raw, err := json.Marshal(d)
+	revision, err := t.advanceStateRevision(e.ProjectID, triggerDecision)
 	if err != nil {
-		return err
-	}
-	if _, err = t.Exec("INSERT INTO xloom_state(project_id,data,revision,decision_revision) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET data=excluded.data,revision=excluded.revision,decision_revision=excluded.decision_revision", e.ProjectID, string(raw), revision, decision); err != nil {
 		return err
 	}
 	detail, _ := json.Marshal(map[string]any{"run_id": e.ID, "status": status, "reason": executionFailureDescription(status, failure), "result": failure})
 	event, _ := json.Marshal(StateEvent{Revision: revision, Op: "execution_failed", ID: e.Intent, RunID: e.Lease, CreatedAt: t.Now, Payload: detail, Result: detail})
 	_, err = t.Exec("INSERT INTO xloom_state_events(project_id,revision,event) VALUES(?,?,?)", e.ProjectID, revision, string(event))
 	return err
+}
+
+// Event-only changes preserve metadata byte-for-byte, including unknown fields
+// retained by older databases. The surrounding transaction owns the event too.
+func (t *Tx) advanceStateRevision(project string, decisionChange bool) (int64, error) {
+	increment := 0
+	if decisionChange {
+		increment = 1
+	}
+	var revision int64
+	err := t.QueryRow(`INSERT INTO xloom_state(project_id,data,revision,decision_revision)
+		VALUES(?,'{"goals":[],"steps":[],"facts":[],"findings":[],"fact_relations":[]}',1,?)
+		ON CONFLICT(project_id) DO UPDATE SET revision=revision+1,decision_revision=decision_revision+excluded.decision_revision
+		RETURNING revision`, project, increment).Scan(&revision)
+	return revision, err
 }
 
 func (s State) ValidateFactSources(ids []string, requireObservation bool) error {
