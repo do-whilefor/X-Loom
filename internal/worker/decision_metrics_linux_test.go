@@ -96,6 +96,128 @@ func TestDecisionMetricsReplayJournalReceipts(t *testing.T) {
 	}
 }
 
+func TestLegacySessionMetricsRecoverFromJournal(t *testing.T) {
+	t.Setenv("XLOOM_MOCK_REASON", "")
+	j, dir := scenarioJob(t, "", "reason"), t.TempDir()
+	j.WorkerType, j.Intent, j.Graph.Intents = "mock", nil, nil
+	identity, err := identityFor(j, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := openJournal(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := agent.Usage{InputTokens: 19, OutputTokens: 7, CacheReadTokens: 3}
+	for _, event := range []agent.Event{
+		{Type: "model_call_start", Request: &agent.RequestObservation{Kind: "turn", InputBytes: 80}},
+		{Type: "model_call_end", Request: &agent.RequestObservation{Kind: "turn", Usage: &usage}},
+		(decisionOperation{Op: "draft", Actions: 2}).event(),
+		(decisionOperation{Op: "decision_commit", Failed: true}).event(),
+		(decisionOperation{Op: "decision_receipt", Committed: true, Actions: 2}).event(),
+		(decisionOperation{Op: "decision_receipt", Committed: true, Actions: 2}).event(),
+	} {
+		if err := journal.append(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	started := time.Now().UTC()
+	saved := session{SchemaVersion: sessionSchemaVersion, Identity: identity, RunID: j.RunID, Kind: j.Kind, StartedAt: started}
+	if err := saved.save(dir, journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readSession := func() map[string]json.RawMessage {
+		t.Helper()
+		raw, err := os.ReadFile(filepath.Join(dir, "session.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			t.Fatal(err)
+		}
+		return fields
+	}
+	legacy := readSession()
+	legacy["decision_metrics"] = json.RawMessage(`{"version":1,"model_calls":999,"usage":{"input_tokens":999},"committed_actions":999}`)
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicSessionFile(dir, raw); err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{RunDir: dir, Now: func() time.Time { return started }}
+	result, err := Run(context.Background(), j, opts)
+	if err != nil || result.Status != "success" || result.Metrics == nil {
+		t.Fatalf("legacy session did not recover: result=%+v err=%v", result, err)
+	}
+	m := result.Metrics
+	if m.ModelCalls != 1 || m.CompletedCalls != 1 || m.UsageCalls != 1 || m.Usage != usage || m.DraftCalls != 1 || m.DraftActions != 2 || m.CommitFailures != 1 || m.ReceiptCalls != 2 || !m.Committed || m.CommittedActions != 2 {
+		t.Fatalf("journal observations were replaced or counted twice: %+v", m)
+	}
+	current := readSession()
+	if _, ok := current["decision_metrics"]; ok {
+		t.Fatal("saved session retained the unused top-level metrics copy")
+	}
+	var persisted Result
+	if err := json.Unmarshal(current["result"], &persisted); err != nil || !reflect.DeepEqual(persisted.Metrics, result.Metrics) {
+		t.Fatalf("final result metrics changed when saved: %+v, %v", persisted.Metrics, err)
+	}
+	replayed, err := Run(context.Background(), j, opts)
+	if err != nil || !reflect.DeepEqual(replayed.Metrics, result.Metrics) {
+		t.Fatalf("terminal recovery changed final metrics: %+v, %v", replayed.Metrics, err)
+	}
+}
+
+func TestJournalRejectsInvalidCheckpoints(t *testing.T) {
+	for _, mode := range []string{"checksum", "short_log", "record_boundary", "malformed_record", "unbound"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			journal, err := openJournal(dir, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := journal.append(agent.Event{Type: "model_call_start", Request: &agent.RequestObservation{Kind: "turn"}}); err != nil {
+				t.Fatal(err)
+			}
+			checkpoint := journal.checkpoint()
+			if err := journal.file.Close(); err != nil {
+				t.Fatal(err)
+			}
+			saved, want := &checkpoint, ""
+			switch mode {
+			case "checksum":
+				checkpoint.SHA256 = strings.Repeat("0", 64)
+				want = "checksum mismatch"
+			case "short_log":
+				checkpoint.Offset++
+				want = "shorter than its committed checkpoint"
+			case "record_boundary":
+				checkpoint.Offset--
+				want = "not at a record boundary"
+			case "malformed_record":
+				if err := os.WriteFile(filepath.Join(dir, "events.jsonl"), []byte(strings.Repeat("!", int(checkpoint.Offset)-1)+"\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				want = "invalid complete event record"
+			case "unbound":
+				saved, want = nil, "without a bound session"
+			}
+			recovered, err := openJournal(dir, saved)
+			if recovered != nil {
+				recovered.file.Close()
+			}
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("invalid journal was not rejected: got %v, want %q", err, want)
+			}
+		})
+	}
+}
+
 type decisionMetricsOutput func([]byte) (int, error)
 
 func (write decisionMetricsOutput) Write(raw []byte) (int, error) { return write(raw) }
