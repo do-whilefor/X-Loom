@@ -76,7 +76,9 @@ type Tool struct {
 	Execute  func(context.Context, json.RawMessage) (string, error)
 }
 type Event struct {
-	Type       string              `json:"type"`
+	Type string `json:"type"`
+	// At timestamps lifecycle boundaries; token deltas remain compact.
+	At         string              `json:"at,omitempty"`
 	Text       string              `json:"text,omitempty"`
 	ToolID     string              `json:"tool_id,omitempty"`
 	ToolName   string              `json:"tool_name,omitempty"`

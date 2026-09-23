@@ -22,6 +22,11 @@
 !/tests/integration/graph_test.go
 !/tests/integration/interruption_test.go
 !/tests/integration/docker_exec_test.go
+!/tests/integration/live_contention_test.go
+!/tests/integration/live_contention_run_test.go
+!/tests/integration/live_proxy_test.go
+!/tests/integration/analyze_live_contention.py
+!/tests/integration/test_analyze_live_contention.py
 *.test.*
 *.spec.*
 

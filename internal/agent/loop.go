@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 type Loop struct {
@@ -59,6 +60,10 @@ func (l *Loop) emit(e Event) {
 	if l.Emit != nil {
 		l.mu.Lock()
 		defer l.mu.Unlock()
+		switch e.Type {
+		case "agent_start", "agent_end", "turn_start", "turn_end", "model_call_start", "model_call_end", "tool_start", "tool_end":
+			e.At = time.Now().UTC().Format(time.RFC3339Nano)
+		}
 		l.Emit(e)
 	}
 }

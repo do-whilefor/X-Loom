@@ -331,7 +331,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	}
 	l = &agent.Loop{Provider: o.Provider, Tools: o.Tools, History: state.History, Concluding: state.Concluding, Repairing: state.Repairing, RepairPrompt: state.RepairPrompt, Emit: emit, Checkpoint: state.ContextCheckpoint, SaveState: func(history []agent.Message, _ *agent.ContextCheckpoint) error {
 		return save(history)
-	}, ContextBytes: o.ContextBytes, ContextTokens: o.ContextTokens, ContextTargetTokens: o.ContextTargetTokens, ObserveRequests: j.Kind == "reason", TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt, ContextData: state.ExecuteUpdates.contextData()}
+	}, ContextBytes: o.ContextBytes, ContextTokens: o.ContextTokens, ContextTargetTokens: o.ContextTargetTokens, ObserveRequests: true, TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt, ContextData: state.ExecuteUpdates.contextData()}
 	if o.decision != nil {
 		l.StopResult = o.decision.result
 	}
