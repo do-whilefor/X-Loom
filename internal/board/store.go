@@ -336,14 +336,21 @@ func (t *Tx) Save(g Graph) error {
 		}
 	}
 	for _, i := range g.Intents {
-		_, err = t.Exec(`INSERT INTO intents(id,project_id,to_fact_id,description,creator,worker,last_heartbeat_at,created_at,concluded_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id,project_id) DO UPDATE SET to_fact_id=excluded.to_fact_id,worker=excluded.worker,last_heartbeat_at=excluded.last_heartbeat_at,concluded_at=excluded.concluded_at`, i.ID, p.ID, i.To, i.Description, i.Creator, i.Worker, i.Heartbeat, i.CreatedAt, i.ConcludedAt)
-		if err != nil {
+		if err = t.saveIntent(p.ID, i); err != nil {
 			return err
 		}
-		for _, fid := range i.From {
-			if _, err = t.Exec("INSERT OR IGNORE INTO intent_sources(intent_id,project_id,fact_id) VALUES(?,?,?)", i.ID, p.ID, fid); err != nil {
-				return err
-			}
+	}
+	return nil
+}
+
+func (t *Tx) saveIntent(project string, i Intent) error {
+	_, err := t.Exec(`INSERT INTO intents(id,project_id,to_fact_id,description,creator,worker,last_heartbeat_at,created_at,concluded_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id,project_id) DO UPDATE SET to_fact_id=excluded.to_fact_id,worker=excluded.worker,last_heartbeat_at=excluded.last_heartbeat_at,concluded_at=excluded.concluded_at`, i.ID, project, i.To, i.Description, i.Creator, i.Worker, i.Heartbeat, i.CreatedAt, i.ConcludedAt)
+	if err != nil {
+		return err
+	}
+	for _, fid := range i.From {
+		if _, err = t.Exec("INSERT OR IGNORE INTO intent_sources(intent_id,project_id,fact_id) VALUES(?,?,?)", i.ID, project, fid); err != nil {
+			return err
 		}
 	}
 	return nil

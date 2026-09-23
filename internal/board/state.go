@@ -595,7 +595,8 @@ func (t *Tx) addStateFact(s *State, d *stateData, fence ExecutionFence, raw json
 	f := FactRecord{ID: id, Description: strings.TrimSpace(input.Description), Scope: strings.TrimSpace(input.Scope), ObservedAt: observed.UTC().Format(time.RFC3339Nano), Evidence: input.Evidence, Status: "valid", RunID: fence.Run, SourceStepID: fence.Intent}
 	d.Facts = append(d.Facts, f)
 	s.Graph.Facts = append(s.Graph.Facts, Fact{ID: id, Description: f.Description})
-	return id, f, t.Save(s.Graph)
+	_, err = t.Exec("INSERT OR IGNORE INTO facts(id,project_id,description) VALUES(?,?,?)", id, s.Graph.Project.ID, f.Description)
+	return id, f, err
 }
 
 func (t *Tx) addFactRelation(s State, d *stateData, fence ExecutionFence, raw json.RawMessage) (string, any, bool, error) {
@@ -887,8 +888,9 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 		}
 		step := Step{ID: id, From: input.From, GoalID: input.GoalID, Description: strings.TrimSpace(input.Description), Status: "open", Priority: input.Priority, CreatedAt: t.Now}
 		d.Steps = append(d.Steps, stepMetadataFrom(step))
-		s.Graph.Intents = append(s.Graph.Intents, Intent{ID: id, From: input.From, Description: step.Description, Creator: fence.Run, CreatedAt: t.Now})
-		return id, step, true, t.Save(s.Graph)
+		intent := Intent{ID: id, From: input.From, Description: step.Description, Creator: fence.Run, CreatedAt: t.Now}
+		s.Graph.Intents = append(s.Graph.Intents, intent)
+		return id, step, true, t.saveIntent(s.Graph.Project.ID, intent)
 	}
 	if !slices.Contains([]string{"priority", "abandon"}, input.Action) || !required(input.Reason, 8192) || input.GoalID != "" || len(input.From) != 0 || input.Description != "" {
 		return "", nil, false, Err(422, "step change requires a reason; existing task inputs are immutable")
