@@ -4,9 +4,61 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
+
+func TestBulkSourceReadUsesProjectIndexAndKeepsProjectsSeparate(t *testing.T) {
+	f := newPlanFixture(t)
+	f.tx(func(tx *Tx) error {
+		if err := tx.Save(Graph{Project: Project{ID: "other", Title: "Other fixture", Status: "active", CreatedAt: tx.Now}}); err != nil {
+			return err
+		}
+		for n := 0; n < 128; n++ {
+			from := []string{}
+			for source := 0; source < 16; source++ {
+				from = append(from, fmt.Sprintf("source%03d", source))
+			}
+			if err := tx.saveIntent("other", Intent{ID: fmt.Sprintf("i%03d", n), From: from, Description: "Unrelated task", Creator: "fixture", CreatedAt: tx.Now}); err != nil {
+				return err
+			}
+		}
+		from := []string{"f002", "origin", "f001"}
+		if err := tx.saveIntent("proj_001", Intent{ID: "i001", From: from, Description: "Target task", Creator: "fixture", CreatedAt: tx.Now}); err != nil {
+			return err
+		}
+		g, err := tx.Load("proj_001")
+		if err != nil {
+			return err
+		}
+		if len(g.Intents) != 1 || !reflect.DeepEqual(g.Intents[0].From, from) {
+			t.Fatalf("other project's same-ID sources leaked: %+v", g.Intents)
+		}
+		rows, err := tx.Query("EXPLAIN QUERY PLAN SELECT intent_id,fact_id FROM intent_sources WHERE project_id=? ORDER BY rowid", "proj_001")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		indexed := false
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				return err
+			}
+			if strings.Contains(detail, "SCAN intent_sources") || strings.Contains(detail, "TEMP B-TREE") {
+				t.Fatalf("project lookup scans or reorders the entire source table: %s", detail)
+			}
+			indexed = indexed || strings.Contains(detail, "SEARCH intent_sources USING INDEX intent_sources_project")
+		}
+		if !indexed {
+			t.Fatal("source lookup did not use the project-leading index")
+		}
+		return rows.Err()
+	})
+}
 
 func TestLoadPreservesInterleavedSourceOrderAndEmptyCollections(t *testing.T) {
 	f := newPlanFixture(t)
