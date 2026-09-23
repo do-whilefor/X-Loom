@@ -445,6 +445,15 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 	if err != nil {
 		return StateActionResult{}, err
 	}
+	return t.stateAction(&s, fence, action)
+}
+
+// A batch owns this snapshot for one transaction and replaces it only after a
+// successful action. Each next action sees the persisted result of its parent.
+func (t *Tx) stateAction(snapshot *State, fence ExecutionFence, action StateAction) (StateActionResult, error) {
+	s := *snapshot
+	project := s.Graph.Project.ID
+	var err error
 	if err = s.Graph.RequireActive(); err != nil {
 		return StateActionResult{}, err
 	}
@@ -489,8 +498,12 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 	if !errors.Is(err, sql.ErrNoRows) {
 		return StateActionResult{}, err
 	}
-	if err = t.CheckDecisionStateVersion(s, fence, action.ExpectedVersion); err != nil {
-		return StateActionResult{}, err
+	// The batch already checked its caller's version under this transaction's
+	// write reservation. Its own successive versions need no Job revalidation.
+	if !t.inDecisionBatch {
+		if err = t.CheckDecisionStateVersion(s, fence, action.ExpectedVersion); err != nil {
+			return StateActionResult{}, err
+		}
 	}
 	d, _, _, err := t.stateData(project)
 	if err != nil {
@@ -565,10 +578,14 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 		return StateActionResult{}, err
 	}
 	if !changed {
+		*snapshot = current
 		return out, nil
 	}
 	event, _ := json.Marshal(StateEvent{Revision: s.Revision, Op: action.Op, ID: id, RunID: fence.Run, CreatedAt: t.Now, Payload: action.Payload, Result: resultJSON})
 	_, err = t.Exec("INSERT INTO xloom_state_events(project_id,revision,event) VALUES(?,?,?)", project, s.Revision, string(event))
+	if err == nil {
+		*snapshot = current
+	}
 	return out, err
 }
 
