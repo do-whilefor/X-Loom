@@ -1,12 +1,70 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"reflect"
 	"testing"
 
 	"xloom/internal/board"
 )
+
+func TestLegacyFinalPlanAcceptsValidSiblingsOfInvalidDirections(t *testing.T) {
+	for name, invalid := range map[string]string{
+		"missing source":    `{"from":["missing"],"description":"Invalid"}`,
+		"duplicate source":  `{"from":["origin","origin"],"description":"Invalid"}`,
+		"null source":       `{"from":["origin",null],"description":"Invalid"}`,
+		"wrong source type": `{"from":["origin",42],"description":"Invalid"}`,
+		"wrong description": `{"from":["origin"],"description":42}`,
+		"empty description": `{"from":["origin"],"description":"  "}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newExecutionProtocolFixture(t)
+			f.register("reason", nil, 0)
+			f.pending(`{"accepted":true,"data":{"intents":[` + invalid + `,{"from":["origin"],"description":"  Valid sibling  "}]}}`)
+			f.apply(http.StatusOK)
+			f.apply(http.StatusOK)
+			state := f.state()
+			if len(state.Steps) != 1 || state.Steps[0].ID != "i001" || state.Steps[0].Description != "Valid sibling" || state.Revision != 1 || len(legacyEvents(f)) != 1 {
+				t.Fatalf("partial acceptance or replay changed: %+v", state)
+			}
+		})
+	}
+}
+
+func TestLegacyFinalPlanSQLFailureRollsBackAllDirectionsAndReceipt(t *testing.T) {
+	f, store := newSnapshotHTTPFixture(t)
+	f.register("reason", nil, 0)
+	f.pending(`{"accepted":true,"data":{"intents":[{"from":["origin"],"description":"First insertion"},{"from":["origin"],"description":"Fail second insertion"}]}}`)
+	before := f.state()
+	if err := store.Do(context.Background(), func(tx *board.Tx) error {
+		_, err := tx.Exec(`CREATE TRIGGER reject_second_direction BEFORE INSERT ON intents WHEN NEW.description='Fail second insertion' BEGIN SELECT RAISE(ABORT,'injected SQL failure'); END`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.apply(http.StatusInternalServerError)
+	if after := f.state(); !reflect.DeepEqual(before, after) || len(legacyEvents(f)) != 0 {
+		t.Fatalf("SQL failure retained partial state or events: %+v", after)
+	}
+	var stored board.Execution
+	f.request("GET", f.base()+"/executions/"+f.run+"?namespace=protocol-test", nil, false, http.StatusOK, &stored)
+	if stored.Status != "result_pending" {
+		t.Fatalf("SQL failure committed receipt: %s", stored.Status)
+	}
+	if err := store.Do(context.Background(), func(tx *board.Tx) error {
+		_, err := tx.Exec(`DROP TRIGGER reject_second_direction`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.apply(http.StatusOK)
+	state := f.state()
+	if len(state.Steps) != 2 || state.Steps[0].ID != "i001" || state.Steps[1].ID != "i002" || state.Revision != 2 {
+		t.Fatalf("SQL rollback lost counter or transaction replay: %+v", state)
+	}
+}
 
 func legacyEvents(f *executionProtocolFixture) []board.StateEvent {
 	f.t.Helper()

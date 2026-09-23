@@ -165,7 +165,7 @@ func (s *Server) executionAction(t *b.Tx, q *request, r *http.Request) (int, any
 		return 200, e, err
 	}
 	if op == "apply" {
-		return s.applyExecution(t, q, r, e)
+		return applyExecution(t, e)
 	}
 	status := q.text("status")
 	switch status {
@@ -215,7 +215,7 @@ func (s *Server) executionAction(t *b.Tx, q *request, r *http.Request) (int, any
 
 // Final business mutations and their receipt commit in the same SQLite
 // transaction. Retrying after a lost HTTP response cannot append duplicates.
-func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execution) (int, any, error) {
+func applyExecution(t *b.Tx, e b.Execution) (int, any, error) {
 	if e.Status == "succeeded" || e.Status == "rejected" {
 		return 200, map[string]string{"status": e.Status}, nil
 	}
@@ -295,14 +295,6 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 		// batch already wrote its receipt; final JSON cannot replace that commit.
 		return 0, nil, b.Err(409, "Decide version 2 requires a committed decision batch")
 	}
-	call := func(fn action, fields map[string]any) (any, error) {
-		q := &request{fields: fields}
-		_, out, err := fn(t, q, r)
-		if q.err != nil {
-			return nil, q.err
-		}
-		return out, err
-	}
 	status := "succeeded"
 	if parsed.Kind == "rejected" {
 		status = "rejected"
@@ -311,11 +303,6 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 		case "intents":
 			created := 0
 			for _, direction := range parsed.Intents {
-				fields := direction.Input()
-				raw, _ := json.Marshal(fields)
-				var plain map[string]any
-				_ = json.Unmarshal(raw, &plain)
-				plain["creator"] = e.Lease
 				// Preserve the legacy partial-batch behavior: invalid directions are
 				// skipped, but SQL errors abort the entire final-result transaction.
 				from := direction.From
@@ -325,7 +312,11 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 				if err = g.ValidateSources(from); err != nil {
 					continue
 				}
-				if _, err = call(s.intent, plain); err != nil {
+				from, desc, validationErr := legacyDirection(direction)
+				if validationErr != nil {
+					continue
+				}
+				if _, _, err = createIntent(t, e.ProjectID, e.Fence(), from, desc, e.Lease, nil); err != nil {
 					var validation *b.APIError
 					if errors.As(err, &validation) && (validation.Status == 400 || validation.Status == 404 || validation.Status == 422) {
 						continue
@@ -338,8 +329,11 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 				return 0, nil, b.Err(422, "Decision created no valid steps")
 			}
 		case "complete":
-			fields := map[string]any{"from": toAny(parsed.Complete.From), "description": parsed.Complete.Description, "worker": e.Lease}
-			if _, err = call(s.complete, fields); err != nil {
+			from, desc, validationErr := legacyDirection(parsed.Complete)
+			if validationErr != nil {
+				return 0, nil, validationErr
+			}
+			if _, _, err = completeProject(t, e.ProjectID, e.Fence(), from, desc, e.Lease); err != nil {
 				return 0, nil, err
 			}
 		case "noop":
@@ -355,13 +349,11 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 			return 0, nil, b.Err(422, "Invalid decision result")
 		}
 	} else {
-		r.SetPathValue("iid", e.Intent)
-		r.SetPathValue("op", "conclude")
 		var out any
 		if job.ResultContractVersion == 2 {
 			out, err = t.ConcludeEvidenceStep(e.ProjectID, e.Fence(), parsed.FactID, parsed.FactPayload)
 		} else {
-			out, err = call(s.intentAction, map[string]any{"description": parsed.Fact, "worker": e.Lease})
+			_, out, err = changeIntent(t, e.ProjectID, e.Intent, e.Fence(), "conclude", e.Lease, parsed.Fact)
 		}
 		if err != nil {
 			return 0, nil, err
@@ -370,8 +362,9 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 			conclusion := out.(b.Conclusion)
 			// The bootstrap lease remains valid after concluding its Intent only
 			// for this final completion operation, never for arbitrary writes.
-			r.URL.Path = "/projects/" + e.ProjectID + "/complete"
-			if _, err = call(s.complete, map[string]any{"from": []any{conclusion.Fact.ID}, "description": parsed.Complete.Description, "worker": e.Lease}); err != nil {
+			fence := e.Fence()
+			fence.AllowConcluded = true
+			if _, _, err = completeProject(t, e.ProjectID, fence, []string{conclusion.Fact.ID}, parsed.Complete.Description, e.Lease); err != nil {
 				return 0, nil, err
 			}
 		}
@@ -381,10 +374,29 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 	}
 	return 200, map[string]string{"status": status}, nil
 }
-func toAny(values []string) []any {
-	out := make([]any, len(values))
-	for n, v := range values {
-		out[n] = v
+
+// Legacy parsing intentionally accepts directions independently. Reapply the
+// HTTP field rules to typed values without serializing them back into a body.
+func legacyDirection(d contract.Direction) ([]string, string, error) {
+	if len(d.From) == 0 {
+		return nil, "", invalidField("from", "must contain at least one fact id")
 	}
-	return out
+	from := make([]string, len(d.From))
+	seen := make(map[string]bool, len(d.From))
+	for n, value := range d.From {
+		id := strings.TrimSpace(value)
+		if id == "" {
+			return nil, "", invalidField("from", "fact ids must not be empty")
+		}
+		if seen[id] {
+			return nil, "", invalidField("from", "duplicate fact ids")
+		}
+		seen[id] = true
+		from[n] = id
+	}
+	desc := strings.TrimSpace(d.Description)
+	if desc == "" {
+		return nil, "", invalidField("description", "must be a non-empty string")
+	}
+	return from, desc, nil
 }

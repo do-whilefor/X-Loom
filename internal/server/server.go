@@ -173,8 +173,11 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 }
 func (r *request) invalid(key, msg string) {
 	if r.err == nil {
-		r.err = &b.APIError{Status: 422, Detail: []any{map[string]any{"loc": []string{"body", key}, "msg": msg, "type": "value_error"}}}
+		r.err = invalidField(key, msg)
 	}
+}
+func invalidField(key, msg string) error {
+	return &b.APIError{Status: 422, Detail: []any{map[string]any{"loc": []string{"body", key}, "msg": msg, "type": "value_error"}}}
 }
 func (r *request) text(key string) string {
 	v, ok := r.fields[key].(string)
@@ -277,8 +280,8 @@ func guard(t *b.Tx, g b.Graph, r *http.Request) error {
 // Unregistered clients without execution headers retain Cairn's ability to
 // reuse a worker name after stopping and reactivating a project. Registered
 // runs and explicitly fenced requests must never revive a revoked identity.
-func guardClaim(t *b.Tx, project, worker string, r *http.Request) error {
-	if r.Header.Get("X-Xloom-Run") == "" {
+func guardClaim(t *b.Tx, project, worker string, fence b.ExecutionFence) error {
+	if fence.Run == "" {
 		var registered bool
 		if err := t.QueryRow("SELECT EXISTS(SELECT 1 FROM xloom_executions WHERE project_id=? AND lease=?)", project, worker).Scan(&registered); err != nil {
 			return err
@@ -433,7 +436,7 @@ func (s *Server) reason(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 		return 0, nil, err
 	}
 	if op == "claim" || op == "heartbeat" {
-		if err := guardClaim(t, g.Project.ID, worker, r); err != nil {
+		if err := guardClaim(t, g.Project.ID, worker, decisionFence(r)); err != nil {
 			return 0, nil, err
 		}
 	}
@@ -496,20 +499,24 @@ func (s *Server) intent(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 	if q.err != nil {
 		return 0, nil, q.err
 	}
-	g, err := t.Load(r.PathValue("pid"))
+	return createIntent(t, r.PathValue("pid"), decisionFence(r), from, desc, creator, worker)
+}
+
+func createIntent(t *b.Tx, project string, fence b.ExecutionFence, from []string, desc, creator string, worker *string) (int, any, error) {
+	g, err := t.Load(project)
 	if err != nil {
 		return 0, nil, err
 	}
 	if err = g.RequireActive(); err != nil {
 		return 0, nil, err
 	}
-	if err = guard(t, g, r); err != nil {
+	if err = t.CheckExecution(g, fence); err != nil {
 		return 0, nil, err
 	}
-	if r.Header.Get("X-Xloom-Run") != "" && r.Header.Get("X-Xloom-Lease") != "reason" {
+	if fence.Run != "" && fence.Lease != "reason" {
 		return 0, nil, b.Err(403, "only Decide can create steps")
 	}
-	if err = t.CheckDirectDecisionWrite(g.Project.ID, b.ExecutionFence{Run: r.Header.Get("X-Xloom-Run"), Lease: r.Header.Get("X-Xloom-Lease")}); err != nil {
+	if err = t.CheckDirectDecisionWrite(g.Project.ID, fence); err != nil {
 		return 0, nil, err
 	}
 	if err = t.CheckDirectDecisionWrite(g.Project.ID, b.ExecutionFence{Run: creator, Lease: "reason"}); err != nil {
@@ -521,7 +528,7 @@ func (s *Server) intent(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 	if worker != nil && *worker != creator {
 		return 0, nil, b.Err(400, "worker must be null or equal to creator")
 	}
-	if r.Header.Get("X-Xloom-Run") != "" || worker != nil {
+	if fence.Run != "" || worker != nil {
 		state, err := t.State(g.Project.ID)
 		if err != nil {
 			return 0, nil, err
@@ -537,8 +544,8 @@ func (s *Server) intent(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 			}
 		}
 	}
-	if r.Header.Get("X-Xloom-Lease") == "reason" && r.Header.Get("X-Xloom-Run") != "" {
-		if err = t.CheckNewStepLimit(g.Project.ID, r.Header.Get("X-Xloom-Run")); err != nil {
+	if fence.Lease == "reason" && fence.Run != "" {
+		if err = t.CheckNewStepLimit(g.Project.ID, fence.Run); err != nil {
 			return 0, nil, err
 		}
 	}
@@ -551,7 +558,7 @@ func (s *Server) intent(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 		i.Heartbeat = b.Ptr(t.Now)
 	}
 	g.Intents = append(g.Intents, i)
-	return 201, i, t.SaveLegacyMutation(g, "step", i.ID, r.Header.Get("X-Xloom-Run"), map[string]any{"action": "add", "from": from, "description": desc}, i)
+	return 201, i, t.SaveLegacyMutation(g, "step", i.ID, fence.Run, map[string]any{"action": "add", "from": from, "description": desc}, i)
 }
 func (s *Server) intentAction(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 	op := r.PathValue("op")
@@ -559,8 +566,9 @@ func (s *Server) intentAction(t *b.Tx, q *request, r *http.Request) (int, any, e
 		return 0, nil, b.Err(404, "Not Found")
 	}
 	worker := q.text("worker")
-	if run := r.Header.Get("X-Xloom-Run"); run != "" {
-		if r.Header.Get("X-Xloom-Lease") == "reason" || run != worker || r.Header.Get("X-Xloom-Intent") != r.PathValue("iid") {
+	fence := decisionFence(r)
+	if fence.Run != "" {
+		if fence.Lease == "reason" || fence.Run != worker || fence.Intent != r.PathValue("iid") {
 			return 0, nil, b.Err(403, "Step operations require the matching Execute identity")
 		}
 	}
@@ -568,27 +576,34 @@ func (s *Server) intentAction(t *b.Tx, q *request, r *http.Request) (int, any, e
 	if op == "conclude" {
 		desc = q.text("description")
 	}
-	g, err := t.Load(r.PathValue("pid"))
+	if q.err != nil {
+		return 0, nil, q.err
+	}
+	return changeIntent(t, r.PathValue("pid"), r.PathValue("iid"), fence, op, worker, desc)
+}
+
+func changeIntent(t *b.Tx, project, intent string, fence b.ExecutionFence, op, worker, desc string) (int, any, error) {
+	g, err := t.Load(project)
 	if err != nil {
 		return 0, nil, err
 	}
 	if err = g.RequireActive(); err != nil {
 		return 0, nil, err
 	}
-	if err = t.StepAvailable(g.Project.ID, r.PathValue("iid")); err != nil {
+	if err = t.StepAvailable(g.Project.ID, intent); err != nil {
 		return 0, nil, err
 	}
 	if op == "heartbeat" {
-		if err := guardClaim(t, g.Project.ID, worker, r); err != nil {
+		if err := guardClaim(t, g.Project.ID, worker, fence); err != nil {
 			return 0, nil, err
 		}
 	}
-	if err = guard(t, g, r); err != nil {
+	if err = t.CheckExecution(g, fence); err != nil {
 		return 0, nil, err
 	}
 	for n := range g.Intents {
 		i := &g.Intents[n]
-		if i.ID != r.PathValue("iid") {
+		if i.ID != intent {
 			continue
 		}
 		if i.To != nil {
@@ -629,26 +644,35 @@ func (s *Server) intentAction(t *b.Tx, q *request, r *http.Request) (int, any, e
 }
 func (s *Server) complete(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 	from, desc, worker := q.sources(), q.text("description"), q.text("worker")
-	g, err := t.Load(r.PathValue("pid"))
+	if q.err != nil {
+		return 0, nil, q.err
+	}
+	fence := decisionFence(r)
+	fence.AllowConcluded = fence.Lease == "bootstrap"
+	return completeProject(t, r.PathValue("pid"), fence, from, desc, worker)
+}
+
+func completeProject(t *b.Tx, project string, fence b.ExecutionFence, from []string, desc, worker string) (int, any, error) {
+	g, err := t.Load(project)
 	if err != nil {
 		return 0, nil, err
 	}
 	if err = g.RequireActive(); err != nil {
 		return 0, nil, err
 	}
-	if err = t.CheckDirectDecisionWrite(g.Project.ID, b.ExecutionFence{Run: r.Header.Get("X-Xloom-Run"), Lease: r.Header.Get("X-Xloom-Lease")}); err != nil {
+	if err = t.CheckDirectDecisionWrite(g.Project.ID, fence); err != nil {
 		return 0, nil, err
 	}
 	if err = t.CheckDirectDecisionWrite(g.Project.ID, b.ExecutionFence{Run: worker, Lease: "reason"}); err != nil {
 		return 0, nil, err
 	}
-	if err = guard(t, g, r); err != nil {
+	if err = t.CheckExecution(g, fence); err != nil {
 		return 0, nil, err
 	}
 	if err = g.ValidateSources(from); err != nil {
 		return 0, nil, err
 	}
-	if r.Header.Get("X-Xloom-Run") != "" && r.Header.Get("X-Xloom-Lease") != "reason" && r.Header.Get("X-Xloom-Lease") != "bootstrap" {
+	if fence.Run != "" && fence.Lease != "reason" && fence.Lease != "bootstrap" {
 		return 0, nil, b.Err(403, "Execute cannot complete the project")
 	}
 	if err = t.ValidateStateCompletion(g.Project.ID, from); err != nil {
