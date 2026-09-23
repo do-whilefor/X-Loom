@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -100,6 +101,10 @@ func (c *Client) ensure(ctx context.Context, id string) (string, error) {
 		State struct {
 			Running bool `json:"Running"`
 		} `json:"State"`
+		HostConfig struct {
+			NetworkMode string   `json:"NetworkMode"`
+			CapAdd      []string `json:"CapAdd"`
+		} `json:"HostConfig"`
 	}
 	err := c.json(ctx, "GET", "/containers/"+url.PathEscape(name)+"/json", nil, &info)
 	if err == nil && (info.Config.Labels["xloom.namespace"] != c.Config.Namespace || info.Config.Labels["xloom.project"] != id) {
@@ -137,6 +142,9 @@ func (c *Client) ensure(ctx context.Context, id string) (string, error) {
 	if !missing && info.Image != desired.ID {
 		return "", fmt.Errorf("project %s container uses image %q but configured worker image %q resolves to %q; preserve and migrate its workspace before recreating the container", id, info.Image, c.Config.Image, desired.ID)
 	}
+	if !missing && (networkMode(info.HostConfig.NetworkMode) != networkMode(c.Config.Network) || !slices.Equal(capabilities(info.HostConfig.CapAdd), capabilities(c.Config.CapAdd))) {
+		return "", fmt.Errorf("project %s container uses network %q and added capabilities %v but configured network is %q and added capabilities are %v; preserve and migrate its workspace before recreating the container", id, info.HostConfig.NetworkMode, info.HostConfig.CapAdd, c.Config.Network, c.Config.CapAdd)
+	}
 	if !info.State.Running {
 		err = c.json(ctx, "POST", "/containers/"+url.PathEscape(name)+"/start", nil, nil)
 		if status(err, 304) {
@@ -145,6 +153,36 @@ func (c *Client) ensure(ctx context.Context, id string) (string, error) {
 	}
 	return name, err
 }
+
+// Docker's Linux default network is bridge. Capability names are insensitive
+// to order, case and the optional CAP_ prefix; ALL subsumes individual names.
+func networkMode(value string) string {
+	if value == "" || value == "default" {
+		return "bridge"
+	}
+	return value
+}
+
+func capabilities(values []string) []string {
+	set := map[string]bool{}
+	for _, value := range values {
+		value = strings.ToUpper(value)
+		if value == "ALL" {
+			return []string{"ALL"}
+		}
+		if !strings.HasPrefix(value, "CAP_") {
+			value = "CAP_" + value
+		}
+		set[value] = true
+	}
+	names := make([]string, 0, len(set))
+	for value := range set {
+		names = append(names, value)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func (c *Client) archive(ctx context.Context, name, target string, data []byte) error {
 	if !strings.HasPrefix(target, "/workspace/.xloom/runs/") || path.Clean(target) != target {
 		return errors.New("invalid run archive path")
