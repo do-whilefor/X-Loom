@@ -33,6 +33,7 @@ type Options struct {
 	ReplanShadow        bool
 	decision            *decisionDraft
 	decisionEmit        agent.Emit
+	graphRequest        func(context.Context, GraphRequest) (string, error)
 }
 
 func Execute(ctx context.Context, jobPath string, output io.Writer) error {
@@ -158,6 +159,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		resuming = true
 	} else if !os.IsNotExist(readErr) {
 		return Result{}, readErr
+	}
+	if err := validateExecuteUpdateState(j, &state); err != nil {
+		return Result{}, err
 	}
 	var checkpoint *journalCheckpoint
 	if resuming {
@@ -322,7 +326,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	}
 	l = &agent.Loop{Provider: o.Provider, Tools: o.Tools, History: state.History, Concluding: state.Concluding, Repairing: state.Repairing, RepairPrompt: state.RepairPrompt, Emit: emit, Checkpoint: state.ContextCheckpoint, SaveState: func(history []agent.Message, _ *agent.ContextCheckpoint) error {
 		return save(history)
-	}, ContextBytes: o.ContextBytes, ContextTokens: o.ContextTokens, ContextTargetTokens: o.ContextTargetTokens, ObserveRequests: j.Kind == "reason", TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt}
+	}, ContextBytes: o.ContextBytes, ContextTokens: o.ContextTokens, ContextTargetTokens: o.ContextTargetTokens, ObserveRequests: j.Kind == "reason", TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt, ContextData: state.ExecuteUpdates.contextData()}
 	if o.decision != nil {
 		l.StopResult = o.decision.result
 	}
@@ -407,6 +411,35 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		default:
 		}
 		return !state.ExecutionDeadline.IsZero() && !o.Now().Before(state.ExecutionDeadline)
+	}
+	l.BeforeRequest = func(turnCtx context.Context, loop *agent.Loop) (context.Context, error) {
+		concludeAtBoundary := func() error {
+			next, err := startConclusion()
+			if err != nil {
+				return err
+			}
+			turnCtx = next
+			return loop.AppendInstruction(loop.ConclusionPrompt)
+		}
+		if shouldConclude() {
+			if err := concludeAtBoundary(); err != nil {
+				return nil, err
+			}
+		}
+		if err := refreshExecutionUpdates(turnCtx, j, o.graphRequest, &state, loop, save); err != nil {
+			return nil, err
+		}
+		// A slow graph read cannot buy another exploration turn. Enter the same
+		// bounded conclusion used by settled tool turns, then record deferral.
+		if shouldConclude() {
+			if err := concludeAtBoundary(); err != nil {
+				return nil, err
+			}
+			if err := refreshExecutionUpdates(turnCtx, j, o.graphRequest, &state, loop, save); err != nil {
+				return nil, err
+			}
+		}
+		return turnCtx, nil
 	}
 	prepareRepairHistory := func() error {
 		if err := l.RepairHistory(); err != nil {

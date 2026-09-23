@@ -13,6 +13,7 @@ func (s *Server) registerExecutionRoutes(m *http.ServeMux) {
 	m.HandleFunc("GET /projects/{pid}/scheduling", s.wrap(s.schedulingInput))
 	m.HandleFunc("POST /projects/{pid}/executions/prepare", s.wrap(s.prepareExecution))
 	m.HandleFunc("POST /projects/{pid}/executions/{rid}/input/read", s.wrap(s.snapshotRead))
+	m.HandleFunc("POST /projects/{pid}/executions/{rid}/updates", s.wrap(s.executionUpdates))
 	m.HandleFunc("GET /executions", s.wrap(s.executions))
 	m.HandleFunc("GET /executions/pending", s.wrap(s.pendingExecutions))
 	m.HandleFunc("GET /projects/{pid}/executions/check", s.wrap(s.executionCheck))

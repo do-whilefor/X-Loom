@@ -19,17 +19,18 @@ const MaxGraphRPCBytes = 128 << 10
 const maxGraphPageBytes = MaxGraphRPCBytes - 1024
 
 type GraphRequest struct {
-	RequestID       string               `json:"request_id"`
-	Op              string               `json:"op"`
-	Section         string               `json:"section,omitempty"`
-	Offset          int                  `json:"offset,omitempty"`
-	ByteOffset      *int                 `json:"byte_offset,omitempty"`
-	RecordVersion   string               `json:"record_version,omitempty"`
-	Limit           int                  `json:"limit,omitempty"`
-	ExpectedVersion string               `json:"expected_version,omitempty"`
-	IDs             []string             `json:"ids,omitempty"`
-	Action          board.StateAction    `json:"action,omitempty"`
-	Batch           *board.DecisionBatch `json:"batch,omitempty"`
+	RequestID       string                     `json:"request_id"`
+	Op              string                     `json:"op"`
+	Section         string                     `json:"section,omitempty"`
+	Offset          int                        `json:"offset,omitempty"`
+	ByteOffset      *int                       `json:"byte_offset,omitempty"`
+	RecordVersion   string                     `json:"record_version,omitempty"`
+	Limit           int                        `json:"limit,omitempty"`
+	ExpectedVersion string                     `json:"expected_version,omitempty"`
+	IDs             []string                   `json:"ids,omitempty"`
+	Action          board.StateAction          `json:"action,omitempty"`
+	Batch           *board.DecisionBatch       `json:"batch,omitempty"`
+	Updates         *board.ExecuteUpdateCursor `json:"updates,omitempty"`
 }
 
 type GraphRequestEvent struct {
@@ -54,6 +55,21 @@ func ValidGraphRequestID(id string) bool {
 func ValidateGraphRequest(j Job, r GraphRequest) error {
 	if !ValidGraphRequestID(r.RequestID) {
 		return errors.New("invalid graph request_id")
+	}
+	if r.Op == "read_updates" {
+		if !j.GraphRPC || j.Kind == "reason" || j.Intent == nil || j.RunID == "" || j.Graph.Project.ID == "" {
+			return errors.New("execution updates require a registered Execute bridge")
+		}
+		if r.Section != "" || r.Offset != 0 || r.ByteOffset != nil || r.Limit != 0 || r.ExpectedVersion != "" || r.RecordVersion != "" || len(r.IDs) != 0 || r.Batch != nil || r.Action.Op != "" {
+			return errors.New("execution updates use the registered dependencies only")
+		}
+		if c := r.Updates; c != nil && (c.ProjectID != j.Graph.Project.ID || c.Generation != j.Graph.Project.Generation || c.StepID != j.Intent.ID || c.RunID != j.RunID || c.Revision < 0) {
+			return errors.New("execution update cursor identity mismatch")
+		}
+		return nil
+	}
+	if r.Updates != nil {
+		return errors.New("update cursor requires read_updates")
 	}
 	if r.Op == "decision_preview" || r.Op == "decision_commit" || r.Op == "decision_receipt" {
 		if j.Kind != "reason" || j.Decision == nil || j.Decision.Version != 2 || !j.GraphRPC {

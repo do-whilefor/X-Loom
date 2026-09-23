@@ -171,11 +171,20 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 	if target <= 0 {
 		return budgetError("input budget is too small for pinned instructions")
 	}
-	// Pinned task and phase instructions are never summarized or truncated.
+	// Runtime task data remains verbatim too. Exclude exact copies from the
+	// summary and tail, and charge the retained data to the same hard budget.
+	pinned := map[string]bool{l.TaskPrompt: true, l.ConclusionPrompt: true, l.RepairPrompt: true}
+	var contextData []string
+	for _, data := range l.ContextData {
+		if data != "" && !pinned[data] {
+			contextData = append(contextData, data)
+			pinned[data] = true
+		}
+	}
 	body := make([]Message, 0, len(l.History))
 	for _, m := range l.History {
 		if m.Role == "user" && len(m.Content) == 1 && m.Content[0].Type == "text" &&
-			(m.Text() == l.TaskPrompt || m.Text() == l.ConclusionPrompt || m.Text() == l.RepairPrompt) {
+			pinned[m.Text()] {
 			continue
 		}
 		body = append(body, m)
@@ -187,6 +196,9 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 		}
 		out = append(out, Text("user", summaryViewPrefix+summary))
 		out = append(out, tail...)
+		for _, data := range contextData {
+			out = append(out, Text("user", data))
+		}
 		if l.ConclusionPrompt != "" {
 			out = append(out, Text("user", l.ConclusionPrompt))
 		}
@@ -201,7 +213,7 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 	}
 	available := target - fixed
 	if available < 64 {
-		return budgetError("pinned task, phase instructions and tool definitions exceed the input budget")
+		return budgetError("pinned task, runtime data, phase instructions and tool definitions exceed the input budget")
 	}
 	summaryBudget := l.SummaryBytes
 	if summaryBudget <= 0 {

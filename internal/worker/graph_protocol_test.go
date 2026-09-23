@@ -15,6 +15,42 @@ import (
 	"xloom/internal/board"
 )
 
+func TestExecuteUpdateRPCKeepsRegisteredScopeAndIdentity(t *testing.T) {
+	job := Job{Kind: "explore", RunID: "run", GraphRPC: true, Intent: &board.Intent{ID: "step"}, Graph: board.Graph{Project: board.Project{ID: "project", Generation: 2}}}
+	request := GraphRequest{RequestID: strings.Repeat("a", 32), Op: "read_updates"}
+	if err := ValidateGraphRequest(job, request); err != nil {
+		t.Fatal(err)
+	}
+	request.Updates = &board.ExecuteUpdateCursor{ProjectID: "project", Generation: 2, StepID: "step", RunID: "run", Revision: 3}
+	if err := ValidateGraphRequest(job, request); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*Job, *GraphRequest){
+		"decide":               func(j *Job, _ *GraphRequest) { j.Kind = "reason" },
+		"offline":              func(j *Job, _ *GraphRequest) { j.GraphRPC = false },
+		"no_step":              func(j *Job, _ *GraphRequest) { j.Intent = nil },
+		"no_run":               func(j *Job, _ *GraphRequest) { j.RunID = "" },
+		"other_run":            func(_ *Job, r *GraphRequest) { r.Updates.RunID = "other" },
+		"other_round":          func(_ *Job, r *GraphRequest) { r.Updates.Generation++ },
+		"negative_revision":    func(_ *Job, r *GraphRequest) { r.Updates.Revision = -1 },
+		"expanded_sources":     func(_ *Job, r *GraphRequest) { r.IDs = []string{"other-fact"} },
+		"section":              func(_ *Job, r *GraphRequest) { r.Section = "facts" },
+		"pagination":           func(_ *Job, r *GraphRequest) { r.Offset = 1 },
+		"mutation":             func(_ *Job, r *GraphRequest) { r.Action.Op = "fact" },
+		"cursor_on_read_graph": func(_ *Job, r *GraphRequest) { r.Op = "read_graph" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			j, r := job, request
+			cursor := *request.Updates
+			r.Updates = &cursor
+			mutate(&j, &r)
+			if err := ValidateGraphRequest(j, r); err == nil {
+				t.Fatal("accepted a request outside the registered Execute update scope")
+			}
+		})
+	}
+}
+
 func checkedGraphPage(t *testing.T, state board.State, request GraphRequest) graphPage {
 	t.Helper()
 	request.RequestID = strings.Repeat("a", 32)

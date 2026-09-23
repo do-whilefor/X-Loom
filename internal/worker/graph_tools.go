@@ -145,6 +145,7 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 		}
 		return raw, err
 	}
+	o.graphRequest = request
 	if batchDecision(j) {
 		o.decision = &decisionDraft{request: request}
 	}
