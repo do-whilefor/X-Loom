@@ -404,7 +404,7 @@ func compactGraphRecord(section string, raw json.RawMessage) (json.RawMessage, e
 		omitted = true
 	}
 	if omitted {
-		record["read_more"], _ = json.Marshal("Omitted support is not absent. Use read_graph with section evidence or sources, ids:[this record's id], offset:0, then follow next_offset until absent. Sources pages apply to Findings.")
+		record["read_more"], _ = json.Marshal("Omitted support is not absent. Use the same read tool with section evidence or sources, ids:[this record's id], offset:0, then follow next_offset until absent. Sources pages apply to Findings.")
 	}
 	return json.Marshal(record)
 }

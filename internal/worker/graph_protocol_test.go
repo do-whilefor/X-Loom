@@ -17,7 +17,10 @@ import (
 
 func checkedGraphPage(t *testing.T, state board.State, request GraphRequest) graphPage {
 	t.Helper()
-	request.RequestID, request.Op = strings.Repeat("a", 32), "read_graph"
+	request.RequestID = strings.Repeat("a", 32)
+	if request.Op == "" {
+		request.Op = "read_graph"
+	}
 	if err := ValidateGraphRequest(Job{}, request); err != nil {
 		t.Fatal(err)
 	}
@@ -212,6 +215,69 @@ func TestGraphDetailsPaginateAccumulatedSourcesAndFenceVersions(t *testing.T) {
 		missing := checkedGraphPage(t, state, GraphRequest{Section: section, IDs: []string{"missing"}})
 		if missing.Total != 0 || !reflect.DeepEqual(missing.MissingIDs, []string{"missing"}) {
 			t.Fatal("unknown detail record was reported as empty existing support")
+		}
+	}
+}
+
+func TestGraphSupportContinuationKeepsReadSource(t *testing.T) {
+	makeState := func(label string) board.State {
+		var evidence []board.EvidenceRef
+		for i := 0; i < 16; i++ {
+			evidence = append(evidence, board.EvidenceRef{RunID: label, Path: fmt.Sprintf("%s/%d.raw", label, i), Excerpt: strings.Repeat(label, 8192/len(label))})
+		}
+		var sources []string
+		for i := 0; i < 600; i++ {
+			sources = append(sources, fmt.Sprintf("%s_%03d_%s", label, i, strings.Repeat("x", 240)))
+		}
+		return board.State{
+			FactRecords: []board.FactRecord{{ID: "fact", Description: label, Evidence: evidence}},
+			Findings:    []board.Finding{{ID: "finding", Claim: label, Evidence: evidence, Sources: sources}},
+		}
+	}
+	// Frozen and current support differ, so continuation must retain the read
+	// tool that supplied the compact record instead of directing it to live data.
+	frozen, live := makeState("frozen"), makeState("current")
+	for _, op := range []string{"read_graph", "read_snapshot"} {
+		for _, tc := range []struct{ section, id, support string }{
+			{"facts", "fact", "evidence"},
+			{"findings", "finding", "evidence"},
+			{"findings", "finding", "sources"},
+		} {
+			t.Run(op+"/"+tc.section+"/"+tc.support, func(t *testing.T) {
+				state := live
+				if op == "read_snapshot" {
+					state = frozen
+				}
+				request := GraphRequest{Op: op, Section: tc.section, IDs: []string{tc.id}, Limit: 50, ExpectedVersion: board.DecisionStateVersion(state)}
+				page := checkedGraphPage(t, state, request)
+				var record map[string]json.RawMessage
+				if len(page.Items) != 1 || json.Unmarshal(page.Items[0], &record) != nil || string(record[tc.support+"_omitted"]) != "true" {
+					t.Fatal("fixture must expose omitted support")
+				}
+				var readMore string
+				if json.Unmarshal(record["read_more"], &readMore) != nil || !strings.Contains(readMore, "same read tool") || strings.Contains(readMore, "read_graph") || strings.Contains(readMore, "read_snapshot") {
+					t.Errorf("support continuation must retain its original read tool: %q", readMore)
+				}
+				request.Section = tc.support
+				var collected []json.RawMessage
+				for {
+					detail := checkedGraphPage(t, state, request)
+					collected = append(collected, detail.Items...)
+					if detail.NextOffset == nil {
+						break
+					}
+					request.Offset = *detail.NextOffset
+				}
+				var expected any = state.Findings[0].Evidence
+				if tc.support == "sources" {
+					expected = state.Findings[0].Sources
+				}
+				got, _ := json.Marshal(collected)
+				want, _ := json.Marshal(expected)
+				if string(got) != string(want) {
+					t.Fatal("support continuation lost or changed the original read's data")
+				}
+			})
 		}
 	}
 }
