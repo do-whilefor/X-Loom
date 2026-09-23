@@ -82,7 +82,7 @@ func (t *Tx) ConcludeEvidenceStep(project string, fence ExecutionFence, factID s
 			return Conclusion{}, Err(409, "Step already concluded")
 		}
 		i.To, i.Worker, i.Heartbeat, i.ConcludedAt = Ptr(factID), Ptr(fence.Run), Ptr(t.Now), Ptr(t.Now)
-		if err = t.Save(s.Graph); err != nil {
+		if _, err = t.Exec("UPDATE intents SET to_fact_id=?,worker=?,last_heartbeat_at=?,concluded_at=? WHERE project_id=? AND id=?", i.To, i.Worker, i.Heartbeat, i.ConcludedAt, project, i.ID); err != nil {
 			return Conclusion{}, err
 		}
 		result := Conclusion{Fact: Fact{ID: fact.ID, Description: fact.Description}, Intent: *i}

@@ -100,3 +100,35 @@ func TestStateNodeFailureRollsBackAllPersistence(t *testing.T) {
 		})
 	}
 }
+
+func TestAbandonWritesOnlyTargetIntentAndRevokesOwner(t *testing.T) {
+	f := newPlanFixture(t)
+	id := f.action("step", "add", stepInput("Observe fixture", []string{"origin"}, "goal", 0)).ID
+	f.tx(func(tx *Tx) error {
+		if _, err := tx.Exec("UPDATE intents SET worker='worker@abandon',last_heartbeat_at=? WHERE project_id='proj_001' AND id=?", tx.Now, id); err != nil {
+			return err
+		}
+		for _, statement := range []string{
+			`CREATE TRIGGER guard_abandon_project BEFORE UPDATE ON projects BEGIN SELECT RAISE(ABORT,'abandon rewrote project'); END`,
+			`CREATE TRIGGER guard_abandon_facts BEFORE INSERT ON facts BEGIN SELECT RAISE(ABORT,'abandon rewrote facts'); END`,
+			`CREATE TRIGGER guard_abandon_sources BEFORE INSERT ON intent_sources BEGIN SELECT RAISE(ABORT,'abandon rewrote sources'); END`,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	f.action("step", "abandon", map[string]any{"action": "abandon", "id": id, "reason": "direction replaced"})
+	state := f.state()
+	if state.Steps[0].Status != "abandoned" || state.Steps[0].Worker != nil || state.Graph.Intents[0].ConcludedAt == nil || state.Graph.Intents[0].Heartbeat == nil {
+		t.Fatalf("abandon lost runtime semantics: %+v", state.Graph.Intents[0])
+	}
+	f.tx(func(tx *Tx) error {
+		revoked, err := tx.RunRevoked("proj_001", "worker@abandon")
+		if err == nil && !revoked {
+			t.Fatal("abandoned owner was not revoked")
+		}
+		return err
+	})
+}

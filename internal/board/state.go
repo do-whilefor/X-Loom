@@ -951,9 +951,9 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 					}
 				}
 				i.Worker, current.Worker, i.ConcludedAt = nil, nil, Ptr(t.Now)
-			}
-			if err := t.Save(s.Graph); err != nil {
-				return "", nil, false, err
+				if _, err := t.Exec("UPDATE intents SET worker=NULL,concluded_at=? WHERE project_id=? AND id=?", t.Now, s.Graph.Project.ID, i.ID); err != nil {
+					return "", nil, false, err
+				}
 			}
 		}
 		found := false

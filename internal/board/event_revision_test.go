@@ -45,6 +45,17 @@ func TestEventOnlyChangesPreserveStoredMetadata(t *testing.T) {
 				if _, err := tx.Exec(`CREATE TRIGGER guard_metadata BEFORE UPDATE OF data ON xloom_state BEGIN SELECT RAISE(ABORT,'event rewrote metadata'); END`); err != nil {
 					return err
 				}
+				if op == "conclusion" {
+					for _, statement := range []string{
+						`CREATE TRIGGER guard_conclusion_project BEFORE UPDATE ON projects BEGIN SELECT RAISE(ABORT,'completion rewrote project'); END`,
+						`CREATE TRIGGER guard_conclusion_facts BEFORE INSERT ON facts BEGIN SELECT RAISE(ABORT,'completion rewrote facts'); END`,
+						`CREATE TRIGGER guard_conclusion_sources BEFORE INSERT ON intent_sources BEGIN SELECT RAISE(ABORT,'completion rewrote sources'); END`,
+					} {
+						if _, err := tx.Exec(statement); err != nil {
+							return err
+						}
+					}
+				}
 				switch op {
 				case "hint":
 					g, err := tx.Load("proj_001")
