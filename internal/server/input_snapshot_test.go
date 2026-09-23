@@ -192,7 +192,7 @@ func TestPrepareSnapshotRejectsClientSuppliedInputAndCrossRoundTemplates(t *test
 }
 
 func TestSnapshotMarkersCannotDowngradeToLegacyRegistrationWithoutSnapshot(t *testing.T) {
-	for _, marker := range []string{"input_view", "preparation_key"} {
+	for _, marker := range []string{"input_snapshot", "input_view", "preparation_key"} {
 		t.Run(marker, func(t *testing.T) {
 			f, _ := newSnapshotHTTPFixture(t)
 			template := snapshotTemplate(f, "explore")
@@ -206,6 +206,15 @@ func TestSnapshotMarkersCannotDowngradeToLegacyRegistrationWithoutSnapshot(t *te
 			}
 			template.Job, _ = json.Marshal(fields)
 			f.request("POST", f.base()+"/executions", template, true, http.StatusUnprocessableEntity, nil)
+			// Presence, including explicit null, cannot be disguised as a legacy
+			// job or enabled with a client-supplied prepared field.
+			fields[marker] = nil
+			template.Job, _ = json.Marshal(fields)
+			raw, _ := json.Marshal(template)
+			var registration map[string]any
+			_ = json.Unmarshal(raw, &registration)
+			registration["prepared"] = true
+			f.request("POST", f.base()+"/executions", registration, true, http.StatusUnprocessableEntity, nil)
 		})
 	}
 }

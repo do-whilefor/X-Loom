@@ -20,9 +20,8 @@ import (
 
 type Server struct{ Store *b.Store }
 type request struct {
-	fields   map[string]any
-	err      error
-	prepared bool // only server-side input preparation can register a snapshot Job
+	fields map[string]any
+	err    error
 }
 type action func(*b.Tx, *request, *http.Request) (int, any, error)
 

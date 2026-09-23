@@ -161,15 +161,7 @@ func (s *Server) prepareExecution(t *b.Tx, q *request, r *http.Request) (int, an
 	if err != nil {
 		return 0, nil, err
 	}
-	raw, err := json.Marshal(e)
-	if err != nil {
-		return 0, nil, err
-	}
-	fields := map[string]any{}
-	if err = json.Unmarshal(raw, &fields); err != nil {
-		return 0, nil, err
-	}
-	return s.executions(t, &request{fields: fields, prepared: true}, r)
+	return s.registerExecution(t, e, r, true)
 }
 
 func preparedDecisionTriggers(state b.State, previous *b.ExecutionSummary, trigger string) []string {
