@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -449,6 +450,24 @@ func (s *Server) reason(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 	case "heartbeat":
 		if lease == nil {
 			return 0, nil, b.Err(409, "Project reason is not currently claimed")
+		}
+		if _, ok := q.fields["expected_version"]; ok {
+			expected := q.text("expected_version")
+			if _, err := hex.DecodeString(expected); len(expected) != 64 || err != nil {
+				q.invalid("expected_version", "must be a 64-character hexadecimal state version")
+			}
+			if q.err != nil {
+				return 0, nil, q.err
+			}
+			state, err := t.State(g.Project.ID)
+			if err != nil {
+				return 0, nil, err
+			}
+			// Lease renewal observes the same shared-content boundary as commit.
+			// Claims and heartbeats alone must not interrupt a valid decision.
+			if expected != b.DecisionStateVersion(state) {
+				return 0, nil, b.Err(409, "state_changed: decision input is no longer current; read the graph before deciding again")
+			}
 		}
 		lease.Heartbeat = t.Now
 	case "release":

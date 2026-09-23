@@ -303,7 +303,14 @@ func (s *Scheduler) runRegistered(ctx context.Context, t *task, stopHeartbeat fu
 				return "interrupted", err
 			}
 			var err error
-			result, err = s.Runner.Run(ctx, t.Worker, t.Job)
+			// Container startup and same-run recovery must not issue a request
+			// against an input already superseded while the run was queued.
+			if t.Job.Kind == "reason" && t.Job.Decision != nil && t.Job.Decision.Version == 2 {
+				err = s.renewLease(ctx, t)
+			}
+			if err == nil {
+				result, err = s.Runner.Run(ctx, t.Worker, t.Job)
+			}
 			if result.Metrics != nil {
 				slog.Info("decision observation", "project", t.Job.Graph.Project.ID, "run", t.Job.RunID, "metrics", result.Metrics)
 			}
@@ -320,11 +327,17 @@ func (s *Scheduler) runRegistered(ctx context.Context, t *task, stopHeartbeat fu
 				if t.Root != nil && t.Root.Err() != nil {
 					return "interrupted", ctx.Err()
 				}
+				if decisionStateChanged(context.Cause(ctx)) {
+					return "interrupted", context.Cause(ctx) // runTask persists after joining the heartbeat.
+				}
 				s.terminal(t, "cancelled", worker.Result{Status: "failed", FailureKind: "hard_cancelled", Error: ctx.Err().Error()})
 				return "cancelled", ctx.Err()
 			}
 			if err != nil {
 				result = worker.Result{Status: "failed", Retryable: true, FailureKind: "transient_infrastructure", Error: err.Error()}
+				if decisionStateChanged(err) {
+					result.FailureKind, result.Retryable = "state_changed", false
+				}
 			}
 			if result.Status == "success" {
 				break
@@ -374,6 +387,17 @@ func (s *Scheduler) runRegistered(ctx context.Context, t *task, stopHeartbeat fu
 		return "rejected", nil
 	}
 	return "success", nil
+}
+
+func decisionStateChanged(err error) bool {
+	var pe *ProtocolError
+	if !errors.As(err, &pe) || pe.Status != 409 {
+		return false
+	}
+	var response struct {
+		Detail string `json:"detail"`
+	}
+	return json.Unmarshal([]byte(pe.Detail), &response) == nil && strings.HasPrefix(response.Detail, "state_changed:")
 }
 
 // A batch commits the graph and its execution result together. Prefer that

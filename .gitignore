@@ -21,6 +21,7 @@
 !/tests/integration/fidelity_test.go
 !/tests/integration/graph_test.go
 !/tests/integration/interruption_test.go
+!/tests/integration/stale_decision_test.go
 !/tests/integration/docker_exec_test.go
 !/tests/integration/live_contention_test.go
 !/tests/integration/live_contention_run_test.go

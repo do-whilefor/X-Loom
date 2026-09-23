@@ -670,15 +670,29 @@ func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, inte
 	s.start(ctx, t)
 	return true, nil
 }
-func (s *Scheduler) runTask(ctx context.Context, t *task) (string, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+func (s *Scheduler) runTask(ctx context.Context, t *task) (outcome string, runErr error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	leaseCtx, stopLease := context.WithCancel(ctx)
 	heartbeatDone := make(chan struct{})
 	go func() { defer close(heartbeatDone); s.heartbeat(leaseCtx, t, cancel) }()
 	defer func() {
 		stopLease()
 		<-heartbeatDone
+		// Invalidation can interrupt startup, a model call, or recovery backoff.
+		// Reconcile once after the heartbeat stops, before releasing this lease.
+		if cause := context.Cause(ctx); outcome != "failed" && outcome != "success" && decisionStateChanged(cause) && (t.Root == nil || t.Root.Err() == nil) {
+			committed, err := s.decisionCommitted(ctx, t)
+			switch {
+			case committed:
+				outcome, runErr = "success", nil
+			case err != nil:
+				outcome, runErr = "interrupted", err
+			default:
+				s.terminal(t, "failed", worker.Result{Status: "failed", FailureKind: "state_changed", Error: cause.Error()})
+				outcome, runErr = "failed", cause
+			}
+		}
 		releaseCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
 		defer c()
 		_ = s.Client.Do(releaseCtx, "POST", s.leasePath(t)+"/release", map[string]string{"worker": t.Lease.Run}, nil, nil)
@@ -700,7 +714,15 @@ func (s *Scheduler) leasePath(t *task) string {
 	}
 	return base + "/intents/" + t.Lease.Intent
 }
-func (s *Scheduler) heartbeat(ctx context.Context, t *task, cancel context.CancelFunc) {
+func (s *Scheduler) renewLease(ctx context.Context, t *task) error {
+	body := map[string]string{"worker": t.Lease.Run}
+	if t.Job.Kind == "reason" && t.Job.Decision != nil && t.Job.Decision.Version == 2 {
+		body["expected_version"] = t.Job.Decision.StateVersion
+	}
+	return s.Client.Do(ctx, "POST", s.leasePath(t)+"/heartbeat", body, nil, &t.Lease)
+}
+
+func (s *Scheduler) heartbeat(ctx context.Context, t *task, cancel context.CancelCauseFunc) {
 	interval := time.Duration(s.Config.Runtime.Interval) * time.Second
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
@@ -718,7 +740,7 @@ func (s *Scheduler) heartbeat(ctx context.Context, t *task, cancel context.Cance
 			// Server into a hard cancellation after only two heartbeat intervals.
 			// Stop before the actual Server lease expires, including queue time.
 			callCtx, c := context.WithDeadline(ctx, last.Add(timeout-interval))
-			err := s.Client.Do(callCtx, "POST", s.leasePath(t)+"/heartbeat", map[string]string{"worker": t.Lease.Run}, nil, &t.Lease)
+			err := s.renewLease(callCtx, t)
 			c()
 			if ctx.Err() != nil {
 				return
@@ -737,11 +759,14 @@ func (s *Scheduler) heartbeat(ctx context.Context, t *task, cancel context.Cance
 					case <-ctx.Done():
 						timer.Stop()
 					case <-timer.C:
-						cancel()
+						cancel(err)
 					}
 					return
 				}
-				cancel()
+				if decisionStateChanged(err) {
+					slog.Info("decision input changed; cancelling stale run", "project", t.Job.Graph.Project.ID, "run", t.Job.RunID)
+				}
+				cancel(err)
 				return
 			}
 		}
