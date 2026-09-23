@@ -505,7 +505,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 	var newest *board.Intent
 	for n := range g.Intents {
 		i := &g.Intents[n]
-		if i.To != nil || i.ConcludedAt != nil || i.Worker != nil || bootstrap(*i) || stepState[i.ID].Status == "abandoned" || s.executionBlocked(g, "explore", i) {
+		if i.To != nil || i.ConcludedAt != nil || i.Worker != nil || bootstrap(*i) || stepState[i.ID].Status == "abandoned" || len(stepState[i.ID].InvalidSources) > 0 || s.executionBlocked(g, "explore", i) {
 			continue
 		}
 		local := false
@@ -568,6 +568,15 @@ func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, inte
 	}
 	w := s.choose(g.Project.ID, kind)
 	if w == nil {
+		if kind == "reason" {
+			configured := false
+			for _, candidate := range s.Config.Workers {
+				configured = configured || slices.Contains(candidate.TaskTypes, kind)
+			}
+			if !configured {
+				return false, errors.New("Decide requires a worker supporting reason")
+			}
+		}
 		return false, nil
 	}
 	var bytes [16]byte
@@ -592,7 +601,7 @@ func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, inte
 	// Worker owns its execution budget and the separate conclusion deadline.
 	// A dispatcher deadline measured from container startup could abort before
 	// a long current turn reaches the boundary where soft conclusion begins.
-	t := &task{Job: worker.Job{RunID: id, Kind: kind, WorkerType: w.Type, Graph: g, Intent: intent, Budget: budget, Workspace: "/workspace", GraphRPC: w.Type != "mock", ResultContractVersion: 1, DecisionRevision: s.stateRevisions[g.Project.ID], EnvironmentID: s.environmentID(*w)}, Worker: *w, Lease: lease}
+	t := &task{Job: worker.Job{RunID: id, Kind: kind, WorkerType: w.Type, Graph: g, Intent: intent, Budget: budget, Workspace: "/workspace", GraphRPC: w.Type != "mock", ResultContractVersion: 2, DecisionRevision: s.stateRevisions[g.Project.ID], EnvironmentID: s.environmentID(*w)}, Worker: *w, Lease: lease}
 	if state, ok := s.states[g.Project.ID]; ok {
 		state.Graph = g
 		t.Job.State = &state

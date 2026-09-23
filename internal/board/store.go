@@ -32,7 +32,8 @@ type Store struct {
 }
 type Tx struct {
 	*sql.Tx
-	Now string
+	Now             string
+	inDecisionBatch bool
 }
 
 func Open(path string) (*Store, error) {

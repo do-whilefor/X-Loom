@@ -51,8 +51,8 @@ func DecisionJobVersion(raw json.RawMessage) (string, error) {
 	if job.Decision == nil {
 		return "", nil
 	}
-	if job.Kind != "reason" || job.Decision.Version != 1 || job.Decision.StateVersion == "" || job.State == nil {
-		return "", Err(422, "decision requires version 1 and a bound state snapshot")
+	if job.Kind != "reason" || (job.Decision.Version != 1 && job.Decision.Version != 2) || job.Decision.StateVersion == "" || job.State == nil {
+		return "", Err(422, "decision requires version 1 or 2 and a bound state snapshot")
 	}
 	version := DecisionStateVersion(*job.State)
 	if job.Decision.StateVersion != version {

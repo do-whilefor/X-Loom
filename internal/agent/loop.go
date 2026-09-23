@@ -29,6 +29,9 @@ type Loop struct {
 	// OnTurnEnd runs at a settled model/tool boundary. A returned prompt keeps
 	// the same session running; a replacement context bounds subsequent turns.
 	OnTurnEnd func(context.Context, *Loop, Message) (context.Context, string, error)
+	// StopResult lets the runtime end immediately after an authoritative tool
+	// commit. Remaining calls are settled without executing more side effects.
+	StopResult func() (string, bool)
 	// A byte budget is an approximation, not a provider token count.
 	ContextBytes int
 	// ContextTokens is an optional input allowance after reserving output space.
@@ -189,6 +192,12 @@ func (l *Loop) Run(ctx context.Context, prompt string) (string, error) {
 				}
 			}
 			l.emit(Event{Type: "turn_end"})
+			if l.StopResult != nil {
+				if result, done := l.StopResult(); done {
+					l.emit(Event{Type: "runtime_result", Text: result})
+					return result, nil
+				}
+			}
 			if err = ctx.Err(); err != nil {
 				return last, err
 			}
@@ -234,7 +243,7 @@ func (l *Loop) Run(ctx context.Context, prompt string) (string, error) {
 }
 func (l *Loop) execute(ctx context.Context, calls []Block, truncated bool) []Block {
 	out := make([]Block, len(calls))
-	parallel := true
+	parallel := l.StopResult == nil
 	find := func(name string) *Tool {
 		for n := range l.Tools {
 			if l.Tools[n].Name == name {
@@ -253,9 +262,15 @@ func (l *Loop) execute(ctx context.Context, calls []Block, truncated bool) []Blo
 		l.emit(Event{Type: "tool_start", ToolID: c.ID, ToolName: c.Name})
 		var text string
 		var err error
+		stopped := false
+		if l.StopResult != nil {
+			_, stopped = l.StopResult()
+		}
 		switch t := find(c.Name); {
 		case truncated:
 			err = errors.New("response was truncated; reissue this tool call with complete arguments")
+		case stopped:
+			err = errors.New("the runtime already committed a terminal result; remaining calls were not executed")
 		case ctx.Err() != nil:
 			err = ctx.Err()
 		case l.Concluding:

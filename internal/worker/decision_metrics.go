@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -31,6 +32,19 @@ type DecisionMetrics struct {
 	GraphActions         int                `json:"graph_actions"`
 	GraphActionSuccesses int                `json:"graph_action_successes"`
 	GraphActionFailures  int                `json:"graph_action_failures"`
+	DraftCalls           int                `json:"draft_calls,omitempty"`
+	DraftFailures        int                `json:"draft_failures,omitempty"`
+	DraftActions         int                `json:"draft_actions,omitempty"`
+	PreviewCalls         int                `json:"preview_calls,omitempty"`
+	PreviewFailures      int                `json:"preview_failures,omitempty"`
+	CommitCalls          int                `json:"commit_calls,omitempty"`
+	CommitFailures       int                `json:"commit_failures,omitempty"`
+	CommitDurationMS     int64              `json:"commit_duration_ms,omitempty"`
+	ReceiptCalls         int                `json:"receipt_calls,omitempty"`
+	ReceiptFailures      int                `json:"receipt_failures,omitempty"`
+	StateChanged         int                `json:"state_changed,omitempty"`
+	Committed            bool               `json:"committed,omitempty"`
+	CommittedActions     int                `json:"committed_actions,omitempty"`
 	Outcome              string             `json:"outcome"`
 	Trigger              string             `json:"trigger,omitempty"`
 	Repeated             bool               `json:"repeated"`
@@ -38,6 +52,23 @@ type DecisionMetrics struct {
 	BaselineViewBytes    int                `json:"baseline_view_bytes,omitempty"`
 	SelectedViewBytes    int                `json:"selected_view_bytes,omitempty"`
 	Replan               *ReplanObservation `json:"replan,omitempty"`
+}
+
+// decisionOperation is emitted by the runtime, never inferred from a successful
+// graph_action tool call: a version 2 action may only have staged a local draft.
+// These events are journaled so recovery retains observed attempts and receipts.
+type decisionOperation struct {
+	Op           string `json:"op"`
+	ElapsedMS    int64  `json:"elapsed_ms"`
+	Failed       bool   `json:"failed"`
+	StateChanged bool   `json:"state_changed"`
+	Committed    bool   `json:"committed"`
+	Actions      int    `json:"actions"`
+}
+
+func (operation decisionOperation) event() agent.Event {
+	raw, _ := json.Marshal(operation)
+	return agent.Event{Type: "decision_operation", Text: string(raw)}
 }
 
 func newDecisionMetrics() DecisionMetrics {
@@ -58,6 +89,15 @@ func (m *DecisionMetrics) observe(event agent.Event) {
 		}
 	}
 	switch event.Type {
+	case "decision_operation":
+		if shadow {
+			return
+		}
+		var operation decisionOperation
+		if json.Unmarshal([]byte(event.Text), &operation) != nil {
+			return
+		}
+		m.observeDecisionOperation(operation)
 	case "model_call_start":
 		if event.Request == nil {
 			return
@@ -119,11 +159,59 @@ func (m *DecisionMetrics) observe(event agent.Event) {
 	}
 }
 
+func (m *DecisionMetrics) observeDecisionOperation(operation decisionOperation) {
+	failure := 0
+	if operation.Failed {
+		failure = 1
+	}
+	switch operation.Op {
+	case "draft":
+		m.DraftCalls++
+		m.DraftFailures += failure
+		if !operation.Failed {
+			m.DraftActions += max(0, operation.Actions)
+		}
+	case "decision_preview":
+		m.PreviewCalls++
+		m.PreviewFailures += failure
+	case "decision_commit":
+		m.CommitCalls++
+		m.CommitFailures += failure
+		m.CommitDurationMS += max(0, operation.ElapsedMS)
+	case "decision_receipt":
+		m.ReceiptCalls++
+		m.ReceiptFailures += failure
+	case "read_graph":
+	default:
+		return
+	}
+	if operation.StateChanged {
+		m.StateChanged++
+	}
+	if !operation.Failed && operation.Committed && (operation.Op == "decision_commit" || operation.Op == "decision_receipt") {
+		m.Committed = true
+		// A run has one authoritative batch. Receipt retries confirm that same
+		// commit; counting their actions again would inflate published work.
+		m.CommittedActions = max(m.CommittedActions, operation.Actions)
+	}
+}
+
 func (m DecisionMetrics) finish(j Job, r Result, started, ended time.Time) DecisionMetrics {
 	m.ElapsedWallMS = max(0, ended.Sub(started).Milliseconds())
 	m.Trigger, m.Repeated = j.DecisionTrigger, j.DecisionRepeated
 	if j.Decision != nil {
 		m.ViewMode, m.BaselineViewBytes, m.SelectedViewBytes = j.Decision.Mode, j.Decision.BaselineBytes, len(j.Decision.View)
+	}
+	if j.Decision != nil && j.Decision.Version == 2 {
+		if m.Committed {
+			m.Outcome = "no_op_committed"
+			if m.CommittedActions > 0 {
+				m.Outcome = "actions_committed"
+			}
+		} else if m.DraftActions > 0 {
+			m.Outcome = "draft_only_observed"
+		}
+		return m
 	}
 	if m.GraphActionSuccesses > 0 {
 		m.Outcome = "actions_observed"

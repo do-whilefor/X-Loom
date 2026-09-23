@@ -73,7 +73,8 @@ func taskTemplate(j Job, conclude bool) (string, error) {
 		config.Task
 		ResultContractVersion int
 		GraphRPC              bool
-	}{j.Budget, j.ResultContractVersion, j.GraphRPC}
+		DecisionBatch         bool
+	}{j.Budget, j.ResultContractVersion, j.GraphRPC, j.Kind == "reason" && j.Decision != nil && j.Decision.Version == 2}
 	if err = t.Execute(&body, data); err != nil {
 		return "", err
 	}
@@ -96,7 +97,7 @@ func intentContext(j Job) string {
 
 func jobContextView(j Job) ([]byte, error) {
 	if j.Kind == "reason" && j.Decision != nil {
-		if j.State == nil || j.Decision.Version != 1 || j.Decision.StateVersion != board.DecisionStateVersion(*j.State) || j.Decision.Generation != j.Graph.Project.Generation || !json.Valid(j.Decision.View) {
+		if j.State == nil || (j.Decision.Version != 1 && j.Decision.Version != 2) || j.Decision.StateVersion != board.DecisionStateVersion(*j.State) || j.Decision.Generation != j.Graph.Project.Generation || !json.Valid(j.Decision.View) {
 			return nil, errors.New("invalid decision input binding")
 		}
 		return json.Marshal(j.Decision)

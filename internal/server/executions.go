@@ -62,8 +62,8 @@ func (s *Server) executions(t *b.Tx, q *request, r *http.Request) (int, any, err
 	}
 	if len(job.ResultContractVersion) != 0 {
 		var version int
-		if strings.TrimSpace(string(job.ResultContractVersion)) == "null" || json.Unmarshal(job.ResultContractVersion, &version) != nil || version < 0 || version > 1 {
-			return 0, nil, b.Err(422, "result_contract_version must be 0 or 1")
+		if strings.TrimSpace(string(job.ResultContractVersion)) == "null" || json.Unmarshal(job.ResultContractVersion, &version) != nil || version < 0 || version > 2 {
+			return 0, nil, b.Err(422, "result_contract_version must be 0, 1 or 2")
 		}
 	}
 	if !b.ValidExecutionID(e.ID) || len(e.Namespace) > 128 || len(e.Backend) > 256 || len(e.RetryKey) > 1024 || e.Lease != e.Backend+"@"+e.ID {
@@ -214,7 +214,17 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 	if err = json.Unmarshal(e.Job, &job); err != nil {
 		return 0, nil, err
 	}
+	requiresBatch := false
 	if e.Kind == "reason" {
+		var protocol struct {
+			Decision *struct {
+				Version int `json:"version"`
+			} `json:"decision"`
+		}
+		if err = json.Unmarshal(e.Job, &protocol); err != nil {
+			return 0, nil, err
+		}
+		requiresBatch = protocol.Decision != nil && protocol.Decision.Version == 2
 		initialVersion, err := b.DecisionJobVersion(e.Job)
 		if err != nil {
 			return 0, nil, err
@@ -243,6 +253,11 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 	}
 	if parsed.Outcome == "continue" || parsed.Outcome == "incomplete" {
 		return 0, nil, b.Err(422, "Continuing or incomplete worker output cannot be applied as a successful result")
+	}
+	if requiresBatch && parsed.Kind != "rejected" {
+		// Only a refusal can finish without publishing a plan. A successful
+		// batch already wrote its receipt; final JSON cannot replace that commit.
+		return 0, nil, b.Err(409, "Decide version 2 requires a committed decision batch")
 	}
 	call := func(fn action, fields map[string]any) (any, error) {
 		q := &request{fields: fields}
@@ -306,7 +321,12 @@ func (s *Server) applyExecution(t *b.Tx, _ *request, r *http.Request, e b.Execut
 	} else {
 		r.SetPathValue("iid", e.Intent)
 		r.SetPathValue("op", "conclude")
-		out, err := call(s.intentAction, map[string]any{"description": parsed.Fact, "worker": e.Lease})
+		var out any
+		if job.ResultContractVersion == 2 {
+			out, err = t.ConcludeEvidenceStep(e.ProjectID, e.Fence(), parsed.FactID, parsed.FactPayload)
+		} else {
+			out, err = call(s.intentAction, map[string]any{"description": parsed.Fact, "worker": e.Lease})
+		}
 		if err != nil {
 			return 0, nil, err
 		}

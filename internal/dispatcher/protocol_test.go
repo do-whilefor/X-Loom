@@ -69,7 +69,7 @@ func TestNewJobsRegisterTheCurrentResultProtocol(t *testing.T) {
 				case <-ctx.Done():
 					t.Fatal(ctx.Err())
 				}
-				if job.ResultContractVersion != 1 || job.GraphRPC != (backend != "mock") {
+				if job.ResultContractVersion != 2 || job.GraphRPC != (backend != "mock") {
 					t.Fatalf("wrong protocol for %s %s: version=%d graph_rpc=%v", backend, kind, job.ResultContractVersion, job.GraphRPC)
 				}
 				var executions []board.Execution

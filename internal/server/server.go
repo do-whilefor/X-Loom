@@ -462,7 +462,7 @@ func (s *Server) hint(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 	}
 	h := b.Hint{ID: id, Content: content, Creator: creator, CreatedAt: t.Now}
 	g.Hints = append(g.Hints, h)
-	return 201, h, t.Save(g)
+	return 201, h, t.SaveLegacyMutation(g, "hint", h.ID, r.Header.Get("X-Xloom-Run"), h, h)
 }
 func (s *Server) intent(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 	from, desc, creator, worker := q.sources(), q.text("description"), q.text("creator"), q.optional("worker")
@@ -482,13 +482,19 @@ func (s *Server) intent(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 	if r.Header.Get("X-Xloom-Run") != "" && r.Header.Get("X-Xloom-Lease") != "reason" {
 		return 0, nil, b.Err(403, "only Decide can create steps")
 	}
+	if err = t.CheckDirectDecisionWrite(g.Project.ID, b.ExecutionFence{Run: r.Header.Get("X-Xloom-Run"), Lease: r.Header.Get("X-Xloom-Lease")}); err != nil {
+		return 0, nil, err
+	}
+	if err = t.CheckDirectDecisionWrite(g.Project.ID, b.ExecutionFence{Run: creator, Lease: "reason"}); err != nil {
+		return 0, nil, err
+	}
 	if err = g.ValidateSources(from); err != nil {
 		return 0, nil, err
 	}
 	if worker != nil && *worker != creator {
 		return 0, nil, b.Err(400, "worker must be null or equal to creator")
 	}
-	if r.Header.Get("X-Xloom-Run") != "" {
+	if r.Header.Get("X-Xloom-Run") != "" || worker != nil {
 		state, err := t.State(g.Project.ID)
 		if err != nil {
 			return 0, nil, err
@@ -518,7 +524,7 @@ func (s *Server) intent(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 		i.Heartbeat = b.Ptr(t.Now)
 	}
 	g.Intents = append(g.Intents, i)
-	return 201, i, t.Save(g)
+	return 201, i, t.SaveLegacyMutation(g, "step", i.ID, r.Header.Get("X-Xloom-Run"), map[string]any{"action": "add", "from": from, "description": desc}, i)
 }
 func (s *Server) intentAction(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 	op := r.PathValue("op")
@@ -526,6 +532,11 @@ func (s *Server) intentAction(t *b.Tx, q *request, r *http.Request) (int, any, e
 		return 0, nil, b.Err(404, "Not Found")
 	}
 	worker := q.text("worker")
+	if run := r.Header.Get("X-Xloom-Run"); run != "" {
+		if r.Header.Get("X-Xloom-Lease") == "reason" || run != worker || r.Header.Get("X-Xloom-Intent") != r.PathValue("iid") {
+			return 0, nil, b.Err(403, "Step operations require the matching Execute identity")
+		}
+	}
 	desc := ""
 	if op == "conclude" {
 		desc = q.text("description")
@@ -563,10 +574,18 @@ func (s *Server) intentAction(t *b.Tx, q *request, r *http.Request) (int, any, e
 			i.Worker = nil
 			return 200, *i, t.Save(g)
 		}
+		if op == "heartbeat" && i.Worker == nil {
+			if err := t.StepReady(g.Project.ID, i.ID); err != nil {
+				return 0, nil, err
+			}
+		}
 		i.Worker = b.Ptr(worker)
 		i.Heartbeat = b.Ptr(t.Now)
 		if op == "heartbeat" {
 			return 200, *i, t.Save(g)
+		}
+		if err := t.CheckLegacyConclusion(g.Project.ID, worker); err != nil {
+			return 0, nil, err
 		}
 		fid, err := t.Next(g.Project.ID, "fact")
 		if err != nil {
@@ -576,7 +595,8 @@ func (s *Server) intentAction(t *b.Tx, q *request, r *http.Request) (int, any, e
 		i.To = &fid
 		i.ConcludedAt = b.Ptr(t.Now)
 		g.Facts = append(g.Facts, f)
-		return 200, b.Conclusion{Fact: f, Intent: *i}, t.Save(g)
+		result := b.Conclusion{Fact: f, Intent: *i}
+		return 200, result, t.SaveLegacyMutation(g, "step_completed", i.ID, worker, map[string]string{"fact_id": fid, "description": desc}, result)
 	}
 	return 0, nil, b.Err(404, "Intent not found")
 }
@@ -587,6 +607,12 @@ func (s *Server) complete(t *b.Tx, q *request, r *http.Request) (int, any, error
 		return 0, nil, err
 	}
 	if err = g.RequireActive(); err != nil {
+		return 0, nil, err
+	}
+	if err = t.CheckDirectDecisionWrite(g.Project.ID, b.ExecutionFence{Run: r.Header.Get("X-Xloom-Run"), Lease: r.Header.Get("X-Xloom-Lease")}); err != nil {
+		return 0, nil, err
+	}
+	if err = t.CheckDirectDecisionWrite(g.Project.ID, b.ExecutionFence{Run: worker, Lease: "reason"}); err != nil {
 		return 0, nil, err
 	}
 	if err = guard(t, g, r); err != nil {
@@ -609,7 +635,7 @@ func (s *Server) complete(t *b.Tx, q *request, r *http.Request) (int, any, error
 	g.Intents = append(g.Intents, i)
 	g.Project.Status = "completed"
 	g.Project.Reason = nil
-	return 200, i, t.Save(g)
+	return 200, i, t.SaveLegacyMutation(g, "complete", i.ID, worker, map[string]any{"from": from, "description": desc}, i)
 }
 func (s *Server) reopen(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 	desc, creator := q.text("description"), q.text("creator")
@@ -657,7 +683,8 @@ func (s *Server) reopen(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 	g.Facts = append(g.Facts, f)
 	g.Project.Status = "active"
 	g.Project.Reason = nil
-	return 200, b.Reopened{Project: g.Project, Fact: f, Intent: i}, t.Save(g)
+	result := b.Reopened{Project: g.Project, Fact: f, Intent: i}
+	return 200, result, t.SaveLegacyMutation(g, "reopen", f.ID, r.Header.Get("X-Xloom-Run"), map[string]string{"description": desc, "creator": creator}, result)
 }
 
 type plain string

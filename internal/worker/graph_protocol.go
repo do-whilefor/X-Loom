@@ -14,14 +14,15 @@ import (
 const MaxGraphRPCBytes = 128 << 10
 
 type GraphRequest struct {
-	RequestID       string            `json:"request_id"`
-	Op              string            `json:"op"`
-	Section         string            `json:"section,omitempty"`
-	Offset          int               `json:"offset,omitempty"`
-	Limit           int               `json:"limit,omitempty"`
-	ExpectedVersion string            `json:"expected_version,omitempty"`
-	IDs             []string          `json:"ids,omitempty"`
-	Action          board.StateAction `json:"action,omitempty"`
+	RequestID       string               `json:"request_id"`
+	Op              string               `json:"op"`
+	Section         string               `json:"section,omitempty"`
+	Offset          int                  `json:"offset,omitempty"`
+	Limit           int                  `json:"limit,omitempty"`
+	ExpectedVersion string               `json:"expected_version,omitempty"`
+	IDs             []string             `json:"ids,omitempty"`
+	Action          board.StateAction    `json:"action,omitempty"`
+	Batch           *board.DecisionBatch `json:"batch,omitempty"`
 }
 
 type GraphRequestEvent struct {
@@ -47,6 +48,15 @@ func ValidateGraphRequest(j Job, r GraphRequest) error {
 	if !ValidGraphRequestID(r.RequestID) {
 		return errors.New("invalid graph request_id")
 	}
+	if r.Op == "decision_preview" || r.Op == "decision_commit" || r.Op == "decision_receipt" {
+		if j.Kind != "reason" || j.Decision == nil || j.Decision.Version != 2 || !j.GraphRPC {
+			return errors.New("decision batches require a registered version 2 Decide bridge")
+		}
+		if r.Op != "decision_receipt" && (r.Batch == nil || len(r.Batch.Actions) > 64 || r.Batch.ExpectedVersion == "") {
+			return errors.New("decision batch requires a bound version and at most 64 actions")
+		}
+		return nil
+	}
 	if r.Op == "read_graph" {
 		if err := validateGraphIDs(r); err != nil {
 			return err
@@ -61,6 +71,9 @@ func ValidateGraphRequest(j Job, r GraphRequest) error {
 	}
 	if r.Op != "graph_action" {
 		return errors.New("unknown graph operation")
+	}
+	if j.Kind == "reason" && j.Decision != nil && j.Decision.Version == 2 {
+		return errors.New("version 2 Decide writes require a batch")
 	}
 	allowed := []string{"fact", "finding"}
 	if j.Kind == "reason" {

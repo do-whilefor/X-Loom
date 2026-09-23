@@ -14,7 +14,7 @@ type Policy struct {
 }
 
 func ParseWithPolicy(output, kind string, conclude bool, openIntents, maxIntents int, policy Policy) (Result, error) {
-	if policy.Version < 0 || policy.Version > 1 {
+	if policy.Version < 0 || policy.Version > 2 {
 		return Result{}, fmt.Errorf("unsupported result contract version %d", policy.Version)
 	}
 	if policy.Version == 0 {
@@ -26,7 +26,7 @@ func ParseWithPolicy(output, kind string, conclude bool, openIntents, maxIntents
 			return Result{}, errors.New("outcome requires result contract version 1; legacy jobs cannot mix result protocols")
 		}
 	}
-	if policy.Version == 1 && (kind == "explore" || kind == "bootstrap") {
+	if policy.Version >= 1 && (kind == "explore" || kind == "bootstrap") {
 		m, err := Extract(output)
 		if err != nil {
 			return Result{}, err
@@ -59,6 +59,9 @@ func ParseWithPolicy(output, kind string, conclude bool, openIntents, maxIntents
 		case "completed":
 			if len(m) != 3 || m["data"] == nil {
 				return Result{}, errors.New("completed requires only accepted, outcome and data")
+			}
+			if policy.Version == 2 {
+				return parseEvidenceResult(m["data"], kind, conclude)
 			}
 			if kind == "bootstrap" && conclude {
 				// A budget boundary changes which effects are allowed, not the

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"xloom/internal/agent"
+	"xloom/internal/board"
 	"xloom/internal/config"
 )
 
@@ -89,6 +90,7 @@ type session struct {
 	TaskPrompt             string                   `json:"task_prompt,omitempty"`
 	ConclusionPrompt       string                   `json:"conclusion_prompt,omitempty"`
 	ConclusionInputVersion int                      `json:"conclusion_input_version,omitempty"`
+	ConclusionEvidence     []board.EvidenceRef      `json:"conclusion_evidence,omitempty"`
 	Repairing              bool                     `json:"repairing,omitempty"`
 	RepairCount            int                      `json:"repair_count,omitempty"`
 	RepairReason           string                   `json:"repair_reason,omitempty"`

@@ -266,6 +266,12 @@ func (s *Scheduler) recoverExecutions(ctx context.Context, states map[string]str
 	return nil
 }
 func (s *Scheduler) runRegistered(ctx context.Context, t *task, stopHeartbeat func()) (string, error) {
+	if ok, err := s.decisionCommitted(ctx, t); ok || err != nil {
+		if ok {
+			return "success", nil
+		}
+		return "interrupted", err
+	}
 	var result worker.Result
 	if t.Execution.Status == "result_pending" {
 		if err := json.Unmarshal(t.Execution.Result, &result); err != nil {
@@ -273,14 +279,25 @@ func (s *Scheduler) runRegistered(ctx context.Context, t *task, stopHeartbeat fu
 		}
 	}
 	if t.Execution.Status != "result_pending" {
-		if err := s.status(ctx, t, "running", worker.Result{}); err != nil {
-			return "interrupted", err
-		}
 		for attempt := 0; attempt <= 2; attempt++ {
+			if err := s.status(ctx, t, "running", worker.Result{}); err != nil {
+				var pe *ProtocolError
+				if errors.As(err, &pe) && (pe.Status == 403 || pe.Status == 404 || pe.Status == 409) {
+					s.terminal(t, "cancelled", worker.Result{Status: "failed", FailureKind: "invalidated_before_start", Error: err.Error()})
+					return "cancelled", err
+				}
+				return "interrupted", err
+			}
 			var err error
 			result, err = s.Runner.Run(ctx, t.Worker, t.Job)
 			if result.Metrics != nil {
 				slog.Info("decision observation", "project", t.Job.Graph.Project.ID, "run", t.Job.RunID, "metrics", result.Metrics)
+			}
+			if committed, receiptErr := s.decisionCommitted(ctx, t); committed || receiptErr != nil {
+				if committed {
+					return "success", nil
+				}
+				return "interrupted", receiptErr
 			}
 			if ctx.Err() != nil {
 				// Process-wide shutdown leaves a recoverable registry entry. Explicit
@@ -344,6 +361,19 @@ func (s *Scheduler) runRegistered(ctx context.Context, t *task, stopHeartbeat fu
 	return "success", nil
 }
 
+// A batch commits the graph and its execution result together. Prefer that
+// receipt even if project completion cancelled the process before it replied.
+func (s *Scheduler) decisionCommitted(ctx context.Context, t *task) (bool, error) {
+	if t.Job.Kind != "reason" || t.Job.Decision == nil || t.Job.Decision.Version != 2 {
+		return false, nil
+	}
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	var receipt board.DecisionReceipt
+	err := s.Client.Do(readCtx, "GET", projectPath(t.Job.Graph.Project.ID)+"/state/decisions/receipt", nil, &receipt, &t.Lease)
+	return receipt.Committed, err
+}
+
 func (s *Scheduler) configureGraphHandler() {
 	setter, ok := s.Runner.(interface {
 		SetGraphHandler(func(context.Context, worker.Job, worker.GraphRequest) (any, error))
@@ -375,6 +405,21 @@ func (s *Scheduler) configureGraphHandler() {
 		}
 		base := projectPath(j.Graph.Project.ID)
 		switch request.Op {
+		case "decision_preview", "decision_commit", "decision_receipt":
+			var result board.DecisionReceipt
+			op := strings.TrimPrefix(request.Op, "decision_")
+			method := "POST"
+			var body any = request.Batch
+			if op == "receipt" {
+				method, body = "GET", nil
+			}
+			err := s.Client.Do(ctx, method, base+"/state/decisions/"+op, body, &result, &lease)
+			// Commit and recovery need only a compact acknowledgement; large
+			// projected entities must not make a successful commit undeliverable.
+			if result.Committed {
+				result.Results = nil
+			}
+			return result, err
 		case "read_graph":
 			var state board.State
 			if err := s.Client.Do(ctx, "GET", base+"/state", nil, &state, &lease); err != nil {

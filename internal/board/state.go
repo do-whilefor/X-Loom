@@ -39,14 +39,15 @@ type EvidenceRef struct {
 	EndLine   int    `json:"end_line,omitempty"`
 }
 type FactRecord struct {
-	ID          string        `json:"id"`
-	Description string        `json:"description"`
-	Scope       string        `json:"scope"`
-	ObservedAt  string        `json:"observed_at"`
-	Evidence    []EvidenceRef `json:"evidence"`
-	Status      string        `json:"status"`
-	RunID       string        `json:"run_id,omitempty"`
-	Legacy      bool          `json:"legacy"`
+	ID           string        `json:"id"`
+	Description  string        `json:"description"`
+	Scope        string        `json:"scope"`
+	ObservedAt   string        `json:"observed_at"`
+	Evidence     []EvidenceRef `json:"evidence"`
+	Status       string        `json:"status"`
+	RunID        string        `json:"run_id,omitempty"`
+	SourceStepID string        `json:"source_step_id,omitempty"`
+	Legacy       bool          `json:"legacy"`
 }
 type FactRelation struct {
 	Kind      string `json:"kind"`
@@ -67,16 +68,17 @@ type Goal struct {
 	SupportValid bool     `json:"support_valid"`
 }
 type Step struct {
-	ID          string   `json:"id"`
-	From        []string `json:"from"`
-	GoalID      string   `json:"goal_id"`
-	Description string   `json:"description"`
-	Status      string   `json:"status"`
-	Priority    int      `json:"priority"`
-	Result      *string  `json:"result"`
-	Worker      *string  `json:"worker"`
-	Reason      string   `json:"reason,omitempty"`
-	CreatedAt   string   `json:"created_at"`
+	ID             string   `json:"id"`
+	From           []string `json:"from"`
+	GoalID         string   `json:"goal_id"`
+	Description    string   `json:"description"`
+	Status         string   `json:"status"`
+	Priority       int      `json:"priority"`
+	Result         *string  `json:"result"`
+	Worker         *string  `json:"worker"`
+	Reason         string   `json:"reason,omitempty"`
+	CreatedAt      string   `json:"created_at"`
+	InvalidSources []string `json:"invalid_sources,omitempty"`
 }
 type Finding struct {
 	ID           string        `json:"id"`
@@ -230,6 +232,14 @@ func (t *Tx) State(project string) (State, error) {
 				return State{}, err
 			}
 		}
+		for _, id := range step.From {
+			if s.ValidateFactSources([]string{id}, false) != nil {
+				step.InvalidSources = append(step.InvalidSources, id)
+			}
+		}
+		if step.Status == "open" && len(step.InvalidSources) > 0 {
+			step.Status = "needs_review"
+		}
 		s.Steps = append(s.Steps, step)
 	}
 	return s, nil
@@ -360,6 +370,11 @@ func validateEvidence(refs []EvidenceRef, run string, allowed []EvidenceRef, req
 }
 
 func (t *Tx) StateAction(project string, fence ExecutionFence, action StateAction) (StateActionResult, error) {
+	if !t.inDecisionBatch {
+		if err := t.CheckDirectDecisionWrite(project, fence); err != nil {
+			return StateActionResult{}, err
+		}
+	}
 	s, err := t.State(project)
 	if err != nil {
 		return StateActionResult{}, err
@@ -376,7 +391,7 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 	if !required(action.IdempotencyKey, 256) {
 		return StateActionResult{}, Err(422, "idempotency_key is required and must be at most 256 bytes")
 	}
-	if !slices.Contains([]string{"fact", "fact_relation", "finding", "goal", "step"}, action.Op) {
+	if !slices.Contains([]string{"fact", "fact_relation", "finding", "goal", "step"}, action.Op) && !(t.inDecisionBatch && action.Op == "complete") {
 		return StateActionResult{}, Err(422, "unknown state action")
 	}
 	if (action.Op == "goal" || action.Op == "step") && fence.Lease != "reason" {
@@ -429,6 +444,16 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 		id, result, changed, err = t.changeGoal(s, &d, action.Payload)
 	case "step":
 		id, result, changed, err = t.changeStep(&s, &d, fence, action.Payload)
+	case "complete":
+		var input struct {
+			From        []string `json:"from"`
+			Description string   `json:"description"`
+		}
+		if err = decodeAction(action.Payload, &input); err == nil {
+			var completed Intent
+			completed, err = t.CompleteProject(project, fence, input.From, input.Description)
+			id, result = completed.ID, completed
+		}
 	}
 	if err != nil {
 		return StateActionResult{}, err
@@ -495,7 +520,7 @@ func (t *Tx) addStateFact(s *State, d *stateData, fence ExecutionFence, raw json
 	if err != nil {
 		return "", nil, err
 	}
-	f := FactRecord{ID: id, Description: strings.TrimSpace(input.Description), Scope: strings.TrimSpace(input.Scope), ObservedAt: observed.UTC().Format(time.RFC3339Nano), Evidence: input.Evidence, Status: "valid", RunID: fence.Run}
+	f := FactRecord{ID: id, Description: strings.TrimSpace(input.Description), Scope: strings.TrimSpace(input.Scope), ObservedAt: observed.UTC().Format(time.RFC3339Nano), Evidence: input.Evidence, Status: "valid", RunID: fence.Run, SourceStepID: fence.Intent}
 	d.Facts = append(d.Facts, f)
 	s.Graph.Facts = append(s.Graph.Facts, Fact{ID: id, Description: f.Description})
 	return id, f, t.Save(s.Graph)
@@ -684,7 +709,7 @@ func (t *Tx) changeGoal(s State, d *stateData, raw json.RawMessage) (string, any
 			}
 		}
 		for _, step := range s.Steps {
-			if step.GoalID == goal.ID && (step.Status == "open" || step.Status == "running") {
+			if step.GoalID == goal.ID && (step.Status == "open" || step.Status == "running" || step.Status == "needs_review") {
 				return "", nil, false, Err(409, "goal has an active step; resolve it explicitly first")
 			}
 		}
@@ -844,8 +869,12 @@ func (t *Tx) StepAvailable(project, id string) error {
 // ValidateStateCompletion adds checks only when extended state is present;
 // legacy clients without FGS metadata retain their original contract.
 func (t *Tx) ValidateStateCompletion(project string, from []string) error {
+	d, _, _, err := t.stateData(project)
+	if err != nil || (len(d.Facts) == 0 && len(d.Goals) == 0 && len(d.Steps) == 0 && len(d.Findings) == 0 && len(d.FactRelations) == 0) {
+		return err
+	}
 	s, err := t.State(project)
-	if err != nil || s.Revision == 0 {
+	if err != nil {
 		return err
 	}
 	if err = s.ValidateFactSources(from, true); err != nil {

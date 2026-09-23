@@ -100,7 +100,7 @@ func repairInstruction(j Job, concluding bool, attempt int, problem *outputFailu
 	}
 	reason, _ := json.Marshal(problem.Error())
 	fallback := "If no supported factual result is available, return {\"accepted\":false,\"reason\":\"...\"}."
-	if j.ResultContractVersion == 1 && j.Kind != "reason" {
+	if j.ResultContractVersion >= 1 && j.Kind != "reason" {
 		fallback = "An unfinished accepted task must report incomplete with remaining work and its blocker, not completed or rejected merely to satisfy JSON formatting."
 		if !concluding {
 			fallback += " If further execution can finish the task, report continue; the runtime will restore tools in this same run under the original deadline."

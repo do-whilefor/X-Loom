@@ -13,7 +13,7 @@ import (
 // as the Worker. A version change must not leave the default or repair prompt
 // teaching a response that will be rejected on every turn.
 func TestPromptExamplesMatchRegisteredResultProtocol(t *testing.T) {
-	for _, version := range []int{0, 1} {
+	for _, version := range []int{0, 1, 2} {
 		for _, kind := range []string{"bootstrap", "explore", "reason"} {
 			for _, conclude := range []bool{false, true} {
 				if kind == "reason" && conclude {
@@ -37,7 +37,7 @@ func TestPromptExamplesMatchRegisteredResultProtocol(t *testing.T) {
 							}
 							seen[r.Outcome] = true
 						}
-						if version == 1 && kind != "reason" {
+						if version >= 1 && kind != "reason" {
 							if !seen["completed"] || !seen["incomplete"] || seen["continue"] == conclude {
 								t.Fatalf("execution prompt lacks the correct terminal and continuation options: %v", seen)
 							}

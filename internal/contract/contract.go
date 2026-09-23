@@ -25,12 +25,14 @@ func (d Direction) Input() map[string]any {
 }
 
 type Result struct {
-	Kind     string
-	Outcome  string
-	Reason   string
-	Intents  []Direction
-	Complete Direction
-	Fact     string
+	Kind        string
+	Outcome     string
+	Reason      string
+	Intents     []Direction
+	Complete    Direction
+	Fact        string
+	FactID      string
+	FactPayload json.RawMessage
 }
 
 func Extract(text string) (map[string]json.RawMessage, error) {

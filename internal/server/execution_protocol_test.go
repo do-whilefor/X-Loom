@@ -316,7 +316,7 @@ func TestExecutionRegistrationRejectsInvalidProtocolFields(t *testing.T) {
 		{"boolean_version", "result_contract_version", true},
 		{"negative_version", "result_contract_version", -1},
 		{"fractional_version", "result_contract_version", 1.5},
-		{"unsupported_version", "result_contract_version", 2},
+		{"unsupported_version", "result_contract_version", 3},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newExecutionProtocolFixture(t)

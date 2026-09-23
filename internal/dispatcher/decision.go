@@ -65,6 +65,9 @@ func (s *Scheduler) prepareDecision(ctx context.Context, t *task, trigger string
 	t.Job.Graph = state.Graph
 	t.Job.State = &state
 	t.Job.Decision = view
+	if t.Job.GraphRPC {
+		t.Job.Decision.Version = 2
+	}
 	t.Job.DecisionRevision = state.DecisionRevision
 	t.Job.DecisionTrigger = trigger
 	t.Job.DecisionTriggers = decisionTriggers(state, previous, trigger)

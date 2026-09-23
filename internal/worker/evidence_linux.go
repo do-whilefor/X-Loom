@@ -18,10 +18,96 @@ import (
 
 	"golang.org/x/sys/unix"
 	"xloom/internal/board"
+	"xloom/internal/contract"
 )
 
 const maxEvidenceFileBytes = 32 << 20
 const maxEvidenceExcerptBytes = 8192
+
+func retainEvidenceBytes(ctx context.Context, run, dir string, raw []byte) (board.EvidenceRef, error) {
+	digest := sha256.Sum256(raw)
+	ref := board.EvidenceRef{RunID: run, Path: filepath.Join(dir, hex.EncodeToString(digest[:])+".raw"), Excerpt: string(raw)}
+	if err := retainEvidenceFile(ctx, ref.Path, raw); err != nil {
+		return board.EvidenceRef{}, err
+	}
+	return ref, nil
+}
+
+// prepareFinalEvidence runs before the result is durable. Normal execution
+// freezes selected files once; conclusion selects only its persisted boundary
+// fragments and never follows a newly supplied workspace path.
+func prepareFinalEvidence(ctx context.Context, j Job, runDir string, r Result, frozen []board.EvidenceRef) (Result, error) {
+	if j.ResultContractVersion < 2 || j.Kind == "reason" || r.Status != "success" {
+		return r, nil
+	}
+	parsed, err := parseOutput(j, r.Conclude, r.Text)
+	if err != nil || len(parsed.FactPayload) == 0 {
+		return r, err
+	}
+	var payload map[string]json.RawMessage
+	if err = json.Unmarshal(parsed.FactPayload, &payload); err != nil {
+		return r, err
+	}
+	action := board.StateAction{Op: "fact", IdempotencyKey: j.RunID + ":final-result", Payload: parsed.FactPayload}
+	if r.Conclude {
+		var selections []board.EvidenceRef
+		if err = json.Unmarshal(payload["evidence"], &selections); err != nil {
+			return r, err
+		}
+		var refs []board.EvidenceRef
+		for _, selection := range selections {
+			var found *board.EvidenceRef
+			for n := range frozen {
+				if selection.Path == frozen[n].Path {
+					found = &frozen[n]
+					break
+				}
+			}
+			if found == nil || !currentEvidence(selection.RunID, j.RunID) || !currentEvidence(found.RunID, j.RunID) {
+				return r, errors.New("conclusion evidence must select a frozen boundary fragment")
+			}
+			// Reuse the immutable bytes saved at the boundary, never reopen
+			// the mutable source. Restore a missing retained fragment exactly;
+			// conflicting bytes at that address fail instead of being replaced.
+			retained, err := freezeEvidenceBytes(ctx, j.RunID, runDir, []byte(found.Excerpt))
+			if err != nil {
+				return r, err
+			}
+			if retained.Path != found.Path {
+				return r, errors.New("saved conclusion fragment has an invalid identity")
+			}
+			excerpt, err := selectedEvidence([]byte(found.Excerpt), selection)
+			if err != nil {
+				return r, err
+			}
+			ref := *found
+			ref.Excerpt, ref.StartLine, ref.EndLine = excerpt, selection.StartLine, selection.EndLine
+			refs = append(refs, ref)
+		}
+		action, err = setActionEvidence(action, payload, refs)
+	} else {
+		action, err = prepareEvidence(ctx, j, runDir, action)
+	}
+	if err != nil {
+		return r, err
+	}
+	m, err := contract.Extract(r.Text)
+	if err != nil {
+		return r, err
+	}
+	var data map[string]json.RawMessage
+	if err = json.Unmarshal(m["data"], &data); err != nil {
+		return r, err
+	}
+	data["fact"] = action.Payload
+	m["data"], err = json.Marshal(data)
+	if err != nil {
+		return r, err
+	}
+	raw, err := json.Marshal(m)
+	r.Text = string(raw)
+	return r, err
+}
 
 // The manifest freezes a tool action before it can reach the graph bridge.
 // Retrying after a lost receipt must not read a newer version of the source.

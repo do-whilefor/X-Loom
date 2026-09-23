@@ -116,9 +116,6 @@ func (t *Tx) RegisterExecution(e Execution) error {
 		if e.RetryKey != e.Kind+":"+e.Intent {
 			return Err(422, "Execute retry key must be bound to its step")
 		}
-		if err = t.StepAvailable(e.ProjectID, e.Intent); err != nil {
-			return err
-		}
 	}
 	prior, err := t.Execution(e.ProjectID, e.ID)
 	if err == nil {
@@ -130,6 +127,11 @@ func (t *Tx) RegisterExecution(e Execution) error {
 	var ae *APIError
 	if !errors.As(err, &ae) || ae.Status != 404 {
 		return err
+	}
+	if e.Kind != "reason" {
+		if err = t.StepReady(e.ProjectID, e.Intent); err != nil {
+			return err
+		}
 	}
 	var job struct {
 		PreviousRunID string `json:"previous_run_id"`
@@ -203,6 +205,11 @@ func (t *Tx) ExecutionStatus(e Execution, status string, result json.RawMessage)
 	if status == "succeeded" && current.Status != "result_pending" {
 		return Err(409, "only a pending result can be applied successfully")
 	}
+	if status == "running" && current.Status != "running" && current.Kind != "reason" {
+		if err = t.StepReady(current.ProjectID, current.Intent); err != nil {
+			return err
+		}
+	}
 	_, err = t.Exec(`UPDATE xloom_executions SET status=?,result=?,updated_at=? WHERE project_id=? AND id=?`, status, []byte(result), t.Now, e.ProjectID, e.ID)
 	if err == nil && slices.Contains([]string{"failed", "rejected", "cancelled", "succeeded"}, status) {
 		_, err = t.Exec("INSERT OR IGNORE INTO xloom_revoked_runs(project_id,worker) VALUES(?,?)", e.ProjectID, current.Lease)
@@ -253,6 +260,11 @@ func (t *Tx) ResumeExecution(e Execution) error {
 	} else {
 		if err = t.StepAvailable(e.ProjectID, e.Intent); err != nil {
 			return err
+		}
+		if e.Status != "result_pending" {
+			if err = t.StepReady(e.ProjectID, e.Intent); err != nil {
+				return err
+			}
 		}
 		found := false
 		for n := range g.Intents {

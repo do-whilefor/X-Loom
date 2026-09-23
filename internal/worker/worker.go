@@ -31,6 +31,8 @@ type Options struct {
 	ContextTargetTokens int
 	GraphVersion        *string
 	ReplanShadow        bool
+	decision            *decisionDraft
+	decisionEmit        agent.Emit
 }
 
 func Execute(ctx context.Context, jobPath string, output io.Writer) error {
@@ -183,6 +185,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 			logErr = enc.Encode(e)
 		}
 	}
+	o.decisionEmit = emit
 	var l *agent.Loop
 	save := func(history []agent.Message) error {
 		if logErr != nil {
@@ -210,6 +213,14 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 			return Result{}, context.Canceled
 		}
 		r = checkedResult(j, r)
+		if r.Status == "success" {
+			prepared, err := prepareFinalEvidence(ctx, j, o.RunDir, r, state.ConclusionEvidence)
+			if err != nil {
+				r.Status, r.FailureKind, r.Error = "failed", "result_evidence", err.Error()
+			} else {
+				r = prepared
+			}
+		}
 		if r.Status == "failed" && r.FailureKind == "" {
 			r.FailureKind = "execution"
 		}
@@ -267,7 +278,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		return Result{}, err
 	}
 	if j.WorkerType == "mock" {
-		return finish(mock(j))
+		return finish(mock(j, o.RunDir))
 	}
 	if o.Provider == nil {
 		p := &provider.Anthropic{BaseURL: os.Getenv("ANTHROPIC_BASE_URL"), Token: os.Getenv("ANTHROPIC_AUTH_TOKEN"), Model: os.Getenv("ANTHROPIC_MODEL"), MaxTokens: envInt("XLOOM_MAX_OUTPUT_TOKENS", provider.DefaultMaxTokens), ReasoningEffort: os.Getenv("XLOOM_REASONING_EFFORT"), Timeout: time.Duration(envInt("XLOOM_REQUEST_TIMEOUT", 180)) * time.Second}
@@ -284,6 +295,22 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	if err := ConfigureRuntimeTools(j, &o); err != nil {
 		return Result{}, err
 	}
+	if o.decision != nil {
+		if _, err := o.decision.recover(ctx); err != nil {
+			return Result{}, err
+		}
+		if o.decision.committed {
+			return finish(Result{Type: "result", Status: "success", Text: committedDecisionText})
+		}
+		if resuming {
+			o.decision.invalidate()
+		}
+		// A batch planner succeeds through a tool receipt, never repaired final
+		// JSON. Resume its uncommitted planning phase without restoring consumed
+		// repair/continuation allowances or deadlines. Execute repair is unchanged.
+		state.Repairing, state.RepairPending = false, false
+		state.RepairReason, state.RepairPrompt = "", ""
+	}
 	if o.ContextBytes <= 0 {
 		o.ContextBytes = envInt("XLOOM_CONTEXT_BYTES", DefaultContextBytes)
 	}
@@ -296,6 +323,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 	l = &agent.Loop{Provider: o.Provider, Tools: o.Tools, History: state.History, Concluding: state.Concluding, Repairing: state.Repairing, RepairPrompt: state.RepairPrompt, Emit: emit, Checkpoint: state.ContextCheckpoint, SaveState: func(history []agent.Message, _ *agent.ContextCheckpoint) error {
 		return save(history)
 	}, ContextBytes: o.ContextBytes, ContextTokens: o.ContextTokens, ContextTargetTokens: o.ContextTargetTokens, ObserveRequests: j.Kind == "reason", TaskPrompt: state.TaskPrompt, ConclusionPrompt: state.ConclusionPrompt}
+	if o.decision != nil {
+		l.StopResult = o.decision.result
+	}
 	var endCancel context.CancelFunc = func() {}
 	defer func() { endCancel() }()
 	runCtx := ctx
@@ -333,11 +363,12 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 			}
 		}
 		if state.ConclusionInputVersion != conclusionInputVersion || l.ConclusionPrompt == "" {
-			input, err := conclusionInput(next, j, o.RunDir, !wasConcluding)
+			input, refs, err := conclusionInputWithEvidence(next, j, o.RunDir, !wasConcluding)
 			if err != nil {
 				return nil, err
 			}
 			l.ConclusionPrompt = input
+			state.ConclusionEvidence = refs
 			state.ConclusionInputVersion = conclusionInputVersion
 			// Persist the frozen input before another model request. Recovery
 			// reuses it even if files have changed or disappeared since then.
@@ -431,6 +462,9 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		if err := save(l.History); err != nil {
 			return "", err
 		}
+		if o.decision != nil {
+			return "This Decide has no committed receipt. Continue planning in this same run with read_graph and graph_action, then commit the complete draft (including an empty plan). Final JSON cannot publish a plan. For truncated tool calls, reissue complete arguments. Tools remain available and the original deadline still applies. If the task must be declined, return accepted:false with its reason.", nil
+		}
 		return "Continue the unfinished work in this same execution. Tools are enabled. The original task deadline still applies. Use completed only when the assigned task is finished; otherwise continue working or report incomplete with the remaining work and blocker.", nil
 	}
 	l.OnTurnEnd = func(turnCtx context.Context, l *agent.Loop, m agent.Message) (context.Context, string, error) {
@@ -438,6 +472,18 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 			return nil, "", err
 		}
 		hasCalls := hasToolCalls(m)
+		if o.decision != nil {
+			if !truncated(m) {
+				if hasCalls {
+					return turnCtx, "", nil
+				}
+				if parsed, err := parseOutput(j, false, m.Text()); err == nil && parsed.Kind == "rejected" {
+					return turnCtx, "", nil
+				}
+			}
+			instruction, err := continueExecution()
+			return turnCtx, instruction, err
+		}
 		problem := outputProblem(j, l.Concluding, m)
 		needsResult := !hasCalls || truncated(m) || l.Concluding || l.Repairing
 		if !l.Concluding && j.Kind != "reason" && (shouldConclude() || (j.ResultContractVersion == 0 && needsResult && problem != nil)) {
@@ -552,12 +598,22 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 			return Result{}, err
 		}
 	}
+	if resuming && o.decision != nil {
+		// Saved tool results describe a previous private draft, not a plan that
+		// survived the restart. Keep the immutable job and its original budget.
+		if err := l.RepairHistory(); err != nil {
+			return Result{}, err
+		}
+		if err := l.AppendInstruction("The uncommitted decision draft was discarded on recovery. Read the current overview and affected facts, restage the whole plan and commit. Old $aliases and draft receipts are no longer valid."); err != nil {
+			return Result{}, err
+		}
+	}
 	text, runErr := l.Run(runCtx, prompt)
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
 	r := Result{Type: "result", Status: "success", Text: text, Conclude: l.Concluding}
-	if runErr == nil {
+	if runErr == nil && !(o.decision != nil && o.decision.committed) {
 		if last, ok := lastAssistant(l.History); ok {
 			if problem := outputProblem(j, l.Concluding, last); problem != nil {
 				runErr = problem
@@ -588,7 +644,7 @@ func envInt(key string, fallback int) int {
 	}
 	return n
 }
-func mock(j Job) Result {
+func mock(j Job, runDir string) Result {
 	if configured := os.Getenv("XLOOM_MOCK_" + strings.ToUpper(j.Kind)); configured != "" {
 		return Result{Type: "result", Status: "success", Text: configured}
 	}
@@ -607,8 +663,20 @@ func mock(j Job) Result {
 		}
 	}
 	response := map[string]any{"accepted": true, "data": data}
-	if j.ResultContractVersion == 1 && j.Kind != "reason" {
+	if j.ResultContractVersion >= 1 && j.Kind != "reason" {
 		response["outcome"] = "completed"
+	}
+	if j.ResultContractVersion >= 2 && j.Kind != "reason" {
+		name := filepath.Join(runDir, "output-mock.txt")
+		if err := retainEvidenceFile(context.Background(), name, []byte("Synthetic Mock fixture observation: assigned check completed.\n")); err != nil {
+			return Result{Type: "result", Status: "failed", FailureKind: "fixture", Error: err.Error()}
+		}
+		delete(data, "description")
+		info, err := os.Stat(name)
+		if err != nil {
+			return Result{Type: "result", Status: "failed", FailureKind: "fixture", Error: err.Error()}
+		}
+		data["fact"] = map[string]any{"description": "Synthetic Mock fixture check completed", "scope": "local synthetic fixture", "observed_at": info.ModTime().UTC().Format(time.RFC3339), "evidence": []map[string]string{{"path": name}}}
 	}
 	raw, _ := json.Marshal(response)
 	return Result{Type: "result", Status: "success", Text: string(raw)}

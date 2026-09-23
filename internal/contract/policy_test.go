@@ -221,7 +221,7 @@ func TestZeroPolicyPreservesLegacyParsing(t *testing.T) {
 }
 
 func TestPolicyRejectsUnsupportedVersions(t *testing.T) {
-	for _, version := range []int{-1, 2, 999} {
+	for _, version := range []int{-1, 3, 999} {
 		for _, kind := range []string{"explore", "bootstrap", "reason"} {
 			// Even a declined task must not silently bypass an unknown protocol.
 			if got, err := ParseWithPolicy(`{"accepted":false,"reason":"Unsupported"}`, kind, false, 1, 3, Policy{Version: version}); err == nil {
