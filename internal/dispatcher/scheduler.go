@@ -472,7 +472,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 			if running > 0 || g.Project.Reason != nil || i.Worker != nil {
 				return false, nil
 			}
-			return s.launch(ctx, g, "bootstrap", i, "")
+			return s.launch(ctx, g, "bootstrap", i, "", check)
 		}
 	}
 	bootstrapFailed := false
@@ -501,7 +501,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 			supported = supported || slices.Contains(w.TaskTypes, "bootstrap")
 		}
 		if !g.Project.Bootstrap || (boot == nil && !supported) {
-			return s.launch(ctx, g, "reason", nil, "initial")
+			return s.launch(ctx, g, "reason", nil, "initial", reasonCheck)
 		}
 		if boot == nil {
 			var i board.Intent
@@ -515,11 +515,15 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		if boot.Worker != nil {
 			return false, nil
 		}
-		return s.launch(ctx, g, "bootstrap", boot, "")
+		check, err := s.executionCheck(ctx, g, "bootstrap", boot, "")
+		if err != nil {
+			return false, err
+		}
+		return s.launch(ctx, g, "bootstrap", boot, "", check)
 	}
 	if g.Project.Reason == nil && !localReason {
 		if trigger := s.trigger(g, reasonCheck); trigger != "" {
-			if ok, err := s.launch(ctx, g, "reason", nil, trigger); ok || err != nil {
+			if ok, err := s.launch(ctx, g, "reason", nil, trigger, reasonCheck); ok || err != nil {
 				return ok, err
 			}
 		}
@@ -529,6 +533,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		stepState[step.ID] = step
 	}
 	var newest *board.Intent
+	var newestCheck board.ExecutionCheck
 	for n := range g.Intents {
 		i := &g.Intents[n]
 		if i.To != nil || i.ConcludedAt != nil || i.Worker != nil || bootstrap(*i) || stepState[i.ID].Status == "abandoned" || len(stepState[i.ID].InvalidSources) > 0 {
@@ -548,11 +553,11 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 			}
 		}
 		if !local && (newest == nil || stepState[i.ID].Priority > stepState[newest.ID].Priority || (stepState[i.ID].Priority == stepState[newest.ID].Priority && i.CreatedAt > newest.CreatedAt)) {
-			newest = i
+			newest, newestCheck = i, check
 		}
 	}
 	if newest != nil {
-		return s.launch(ctx, g, "explore", newest, "")
+		return s.launch(ctx, g, "explore", newest, "", newestCheck)
 	}
 	return false, nil
 }
@@ -595,11 +600,7 @@ func (s *Scheduler) choose(project, kind string) *config.Worker {
 	}
 	return &candidates[0]
 }
-func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, intent *board.Intent, trigger string) (bool, error) {
-	check, err := s.executionCheck(ctx, g, kind, intent, "")
-	if err != nil {
-		return false, err
-	}
+func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, intent *board.Intent, trigger string, check board.ExecutionCheck) (bool, error) {
 	if check.Blocked {
 		return false, nil
 	}

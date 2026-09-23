@@ -239,11 +239,13 @@ func (t *Tx) CheckExecutions(q ExecutionCheckQuery) (ExecutionCheck, error) {
 			return out, err
 		}
 	}
-	latest, err := scanExecutionSummary(t.QueryRow(`SELECT `+executionSummaryColumns+` FROM xloom_executions WHERE namespace=? AND project_id=? AND generation=? AND kind='reason' AND status='succeeded' ORDER BY created_at DESC,rowid DESC LIMIT 1`, q.Namespace, q.ProjectID, q.Generation))
-	if err == nil {
-		out.LatestDecision = &latest
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return out, err
+	if q.Kind == "reason" {
+		latest, err := scanExecutionSummary(t.QueryRow(`SELECT `+executionSummaryColumns+` FROM xloom_executions WHERE namespace=? AND project_id=? AND generation=? AND kind='reason' AND status='succeeded' ORDER BY created_at DESC,rowid DESC LIMIT 1`, q.Namespace, q.ProjectID, q.Generation))
+		if err == nil {
+			out.LatestDecision = &latest
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return out, err
+		}
 	}
 	if q.Kind != "reason" || out.Attempts != 1 || out.Pending || out.PreviousRunID != "" {
 		return out, nil

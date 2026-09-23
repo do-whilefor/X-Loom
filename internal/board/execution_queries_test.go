@@ -91,6 +91,19 @@ func TestExecutionPendingKeysetExcludesHistoryAndKeepsCleanup(t *testing.T) {
 	})
 }
 
+func TestExecuteCheckOmitsDecisionBoundary(t *testing.T) {
+	s := executionQueryStore(t)
+	executionQueryTx(t, s, func(tx *Tx) {
+		putQueryExecution(t, tx, Execution{ID: "decided", Status: "succeeded"}, 0, "")
+		for _, kind := range []string{"bootstrap", "explore", "reason"} {
+			check, err := tx.CheckExecutions(ExecutionCheckQuery{ProjectID: "p", Namespace: "ns", Kind: kind, Intent: "step", RetryKey: kind + ":step"})
+			if err != nil || (check.LatestDecision != nil) != (kind == "reason") {
+				t.Fatalf("%s decision boundary=%+v, error=%v", kind, check.LatestDecision, err)
+			}
+		}
+	})
+}
+
 func TestExecutionCheckPreservesGrantsPendingAndAttemptAllowance(t *testing.T) {
 	s := executionQueryStore(t)
 	executionQueryTx(t, s, func(tx *Tx) {

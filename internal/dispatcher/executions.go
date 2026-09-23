@@ -76,18 +76,7 @@ func (s *Scheduler) retryKey(g board.Graph, kind string, intent *board.Intent) s
 	if input, ok := s.schedules[g.Project.ID]; ok {
 		return input.RetryKey
 	}
-	ended := []string{}
-	for _, i := range g.Intents {
-		if i.To != nil || i.ConcludedAt != nil {
-			ended = append(ended, i.ID)
-		}
-	}
-	return kind + ":" + digest(struct {
-		Facts    []board.Fact
-		Hints    []board.Hint
-		Ended    []string
-		Revision int64
-	}{g.Facts, g.Hints, ended, s.stateRevisions[g.Project.ID]})
+	return board.DecisionRetryKey(g, s.stateRevisions[g.Project.ID])
 }
 
 // Scheduling asks the registry only about this input. Historical Jobs and
