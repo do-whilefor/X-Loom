@@ -270,28 +270,36 @@ func (t *Tx) CheckExecutions(q ExecutionCheckQuery) (ExecutionCheck, error) {
 
 // Scheduling needs only admission and retry grants for the current page's
 // Execute candidates. Registration still verifies their leases and identity.
-func (t *Tx) ScheduleExecutionChecks(project, namespace string, intents []Intent) (map[string]ExecutionCheck, error) {
+func (t *Tx) ScheduleExecutionChecks(project, namespace string, intents []Intent, steps []Step) (map[string]ExecutionCheck, error) {
 	checks := make(map[string]ExecutionCheck, len(intents))
 	if len(intents) == 0 {
 		return checks, nil
 	}
-	values := make([]string, len(intents))
-	args := make([]any, 0, 3*len(intents)+2)
-	for n, i := range intents {
+	stepState := make(map[string]Step, len(steps))
+	for _, step := range steps {
+		stepState[step.ID] = step
+	}
+	values := make([]string, 0, len(intents))
+	args := make([]any, 0, 3*len(intents)+6)
+	for _, i := range intents {
 		kind := "explore"
-		if i.Description == "bootstrap" && i.Creator == "dispatcher.bootstrap" && len(i.From) == 1 && i.From[0] == "origin" {
+		if i.To == nil && i.ConcludedAt == nil && i.Description == "bootstrap" && i.Creator == "dispatcher.bootstrap" && len(i.From) == 1 && i.From[0] == "origin" {
 			kind = "bootstrap"
+		} else if step := stepState[i.ID]; i.To != nil || i.ConcludedAt != nil || i.Worker != nil || step.Status == "abandoned" || len(step.InvalidSources) > 0 {
+			continue
 		}
-		values[n] = "(?,?,?)"
+		values = append(values, "(?,?,?)")
 		args = append(args, kind, i.ID, kind+":"+i.ID)
 	}
-	args = append(args, namespace, project)
-	rows, err := t.Query(`WITH candidates(kind,intent,retry_key) AS (VALUES `+strings.Join(values, ",")+`),
-	registry AS (SELECT rowid AS sequence,* FROM xloom_executions WHERE namespace=? AND project_id=?)
+	if len(values) == 0 {
+		return checks, nil
+	}
+	args = append(args, namespace, project, namespace, project, namespace, project)
+	rows, err := t.Query(`WITH candidates(kind,intent,retry_key) AS (VALUES `+strings.Join(values, ",")+`)
 	SELECT c.retry_key,
-	EXISTS(SELECT 1 FROM registry e WHERE e.kind=c.kind AND e.intent=c.intent AND `+pendingExecutionSQL+`),
-	COALESCE((SELECT e.id FROM registry e WHERE e.kind=c.kind AND e.intent=c.intent AND e.status='retry_requested' ORDER BY e.created_at DESC,e.sequence DESC LIMIT 1),''),
-	EXISTS(SELECT 1 FROM registry e WHERE e.kind=c.kind AND e.retry_key=c.retry_key AND e.status NOT IN ('retry_requested','retried'))
+	EXISTS(SELECT 1 FROM xloom_executions e WHERE e.namespace=? AND e.project_id=? AND e.kind=c.kind AND e.intent=c.intent AND `+pendingExecutionSQL+`),
+	COALESCE((SELECT e.id FROM xloom_executions e WHERE e.namespace=? AND e.project_id=? AND e.kind=c.kind AND e.intent=c.intent AND e.status='retry_requested' ORDER BY e.created_at DESC,e.rowid DESC LIMIT 1),''),
+	EXISTS(SELECT 1 FROM xloom_executions e WHERE e.namespace=? AND e.project_id=? AND e.kind=c.kind AND e.retry_key=c.retry_key AND e.status NOT IN ('retry_requested','retried'))
 	FROM candidates c`, args...)
 	if err != nil {
 		return nil, err

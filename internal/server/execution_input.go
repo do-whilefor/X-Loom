@@ -27,7 +27,7 @@ func (s *Server) schedulingInput(t *b.Tx, _ *request, r *http.Request) (int, any
 		var namespace string
 		namespace, err = executionNamespace(r)
 		if err == nil {
-			p.ExecutionChecks, err = t.ScheduleExecutionChecks(p.Project.ID, namespace, p.Intents)
+			p.ExecutionChecks, err = t.ScheduleExecutionChecks(p.Project.ID, namespace, p.Intents, p.Steps)
 		}
 	}
 	return 200, p, err
