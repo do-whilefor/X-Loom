@@ -31,8 +31,8 @@ type Set struct {
 }
 
 func (s *Set) All() []agent.Tool {
-	def := func(name, desc, schema string, parallel, conclude bool, fn func(context.Context, json.RawMessage) (string, error)) agent.Tool {
-		return agent.Tool{Definition: agent.Definition{Name: name, Description: desc, Schema: json.RawMessage(schema)}, Parallel: parallel, Conclude: conclude, Execute: func(ctx context.Context, raw json.RawMessage) (string, error) {
+	def := func(name, desc, schema string, parallel bool, fn func(context.Context, json.RawMessage) (string, error)) agent.Tool {
+		return agent.Tool{Definition: agent.Definition{Name: name, Description: desc, Schema: json.RawMessage(schema)}, Parallel: parallel, Execute: func(ctx context.Context, raw json.RawMessage) (string, error) {
 			if err := agent.ValidateArguments(json.RawMessage(schema), raw); err != nil {
 				return "", err
 			}
@@ -40,13 +40,13 @@ func (s *Set) All() []agent.Tool {
 		}}
 	}
 	return []agent.Tool{
-		def("read", "Read a text file with optional 1-based offset and line limit.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}`, true, true, s.read),
-		def("bash", "Run a bash command in the project workspace. Long output is saved to a file.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false}`, false, false, s.bash),
-		def("edit", "Replace exactly one occurrence of oldText in a UTF-8 file.", `{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["path","oldText","newText"],"additionalProperties":false}`, false, false, s.edit),
-		def("write", "Write a file using exactly one of content (generated text) or source_path (byte-exact copy). Optional source_start_line/source_end_line must be paired, 1-based inclusive. source_sha256 verifies the entire source file before copying. Creates parent directories; returns byte count and SHA-256.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"source_path":{"type":"string"},"source_start_line":{"type":"integer","minimum":1},"source_end_line":{"type":"integer","minimum":1},"source_sha256":{"type":"string"}},"required":["path"],"additionalProperties":false}`, false, false, s.write),
-		def("grep", "Search file contents with ripgrep; regex by default.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"}},"required":["pattern"],"additionalProperties":false}`, true, true, s.grep),
-		def("find", "Find file paths matching a glob, including hidden files.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"],"additionalProperties":false}`, true, true, s.find),
-		def("ls", "List entries in a directory.", `{"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}`, true, true, s.ls),
+		def("read", "Read a text file with optional 1-based offset and line limit.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}`, true, s.read),
+		def("bash", "Run a bash command in the project workspace. Long output is saved to a file.", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false}`, false, s.bash),
+		def("edit", "Replace exactly one occurrence of oldText in a UTF-8 file.", `{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["path","oldText","newText"],"additionalProperties":false}`, false, s.edit),
+		def("write", "Write a file using exactly one of content (generated text) or source_path (byte-exact copy). Optional source_start_line/source_end_line must be paired, 1-based inclusive. source_sha256 verifies the entire source file before copying. Creates parent directories; returns byte count and SHA-256.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"source_path":{"type":"string"},"source_start_line":{"type":"integer","minimum":1},"source_end_line":{"type":"integer","minimum":1},"source_sha256":{"type":"string"}},"required":["path"],"additionalProperties":false}`, false, s.write),
+		def("grep", "Search file contents with ripgrep; regex by default.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"}},"required":["pattern"],"additionalProperties":false}`, true, s.grep),
+		def("find", "Find file paths matching a glob, including hidden files.", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"],"additionalProperties":false}`, true, s.find),
+		def("ls", "List entries in a directory.", `{"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}`, true, s.ls),
 	}
 }
 func decode(raw json.RawMessage, dst any, required ...string) error {
