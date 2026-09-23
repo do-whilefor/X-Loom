@@ -20,6 +20,7 @@ func TestGenerateOutputBudgetDefaultsAndOverrides(t *testing.T) {
 		{"default", 0, 32768},
 		{"bounded evaluation", 8192, 8192},
 		{"larger explicit allowance", 65536, 65536},
+		{"production allowance", 384000, 384000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
