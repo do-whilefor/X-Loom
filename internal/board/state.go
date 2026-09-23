@@ -117,14 +117,32 @@ type StateEvent struct {
 }
 type stateData struct {
 	Goals         []Goal         `json:"goals"`
-	Steps         []Step         `json:"steps"`
+	Steps         []stepMetadata `json:"steps"`
 	Facts         []FactRecord   `json:"facts"`
 	Findings      []Finding      `json:"findings"`
 	FactRelations []FactRelation `json:"fact_relations"`
 }
 
+// Keep the legacy status key for rollback readers, but persist only the one
+// status not projected from the authoritative Intent and execution records.
+type stepMetadata struct {
+	ID       string `json:"id"`
+	GoalID   string `json:"goal_id"`
+	Priority int    `json:"priority"`
+	Reason   string `json:"reason,omitempty"`
+	Status   string `json:"status,omitempty"`
+}
+
+func stepMetadataFrom(step Step) stepMetadata {
+	metadata := stepMetadata{ID: step.ID, GoalID: step.GoalID, Priority: step.Priority, Reason: step.Reason}
+	if step.Status == "abandoned" {
+		metadata.Status = "abandoned"
+	}
+	return metadata
+}
+
 func (t *Tx) stateData(project string) (stateData, int64, int64, error) {
-	d := stateData{Goals: []Goal{}, Steps: []Step{}, Facts: []FactRecord{}, Findings: []Finding{}, FactRelations: []FactRelation{}}
+	d := stateData{Goals: []Goal{}, Steps: []stepMetadata{}, Facts: []FactRecord{}, Findings: []Finding{}, FactRelations: []FactRelation{}}
 	var raw string
 	var revision, decision int64
 	err := t.QueryRow("SELECT data,revision,decision_revision FROM xloom_state WHERE project_id=?", project).Scan(&raw, &revision, &decision)
@@ -133,6 +151,11 @@ func (t *Tx) stateData(project string) (stateData, int64, int64, error) {
 	}
 	if err == nil {
 		err = json.Unmarshal([]byte(raw), &d)
+		for n := range d.Steps {
+			if d.Steps[n].Status != "abandoned" {
+				d.Steps[n].Status = ""
+			}
+		}
 	}
 	return d, revision, decision, err
 }
@@ -863,7 +886,7 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 			return "", nil, false, err
 		}
 		step := Step{ID: id, From: input.From, GoalID: input.GoalID, Description: strings.TrimSpace(input.Description), Status: "open", Priority: input.Priority, CreatedAt: t.Now}
-		d.Steps = append(d.Steps, step)
+		d.Steps = append(d.Steps, stepMetadataFrom(step))
 		s.Graph.Intents = append(s.Graph.Intents, Intent{ID: id, From: input.From, Description: step.Description, Creator: fence.Run, CreatedAt: t.Now})
 		return id, step, true, t.Save(s.Graph)
 	}
@@ -909,12 +932,12 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 		found := false
 		for n := range d.Steps {
 			if d.Steps[n].ID == current.ID {
-				d.Steps[n] = current
+				d.Steps[n] = stepMetadataFrom(current)
 				found = true
 			}
 		}
 		if !found {
-			d.Steps = append(d.Steps, current)
+			d.Steps = append(d.Steps, stepMetadataFrom(current))
 		}
 		return current.ID, current, true, nil
 	}
