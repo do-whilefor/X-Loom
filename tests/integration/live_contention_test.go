@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"xloom/internal/board"
 )
@@ -172,6 +175,15 @@ func liveContentionAggregate(files map[string][]byte) map[string]any {
 	return map[string]any{"kind": "aggregate", "rows": 24, "fixture_sha256": liveContentionDigest(liveContentionFixture()), "branch_sha256": digests, "results": results}
 }
 
+func liveContentionMarker(description, marker string) bool {
+	suffix, ok := strings.CutPrefix(description, marker)
+	if !ok || suffix == "" {
+		return ok
+	}
+	next, _ := utf8.DecodeRuneInString(suffix)
+	return !unicode.IsLetter(next) && !unicode.IsNumber(next) && next != '_' && next != '-'
+}
+
 // files maps container-absolute artifact paths to copied bytes. This audits the
 // business result and evidence, while the live harness audits concurrency,
 // conflict recovery, actual tool calls, model usage, and elapsed time.
@@ -208,7 +220,7 @@ func validateLiveContention(state board.State, files map[string][]byte) []string
 		marker := fmt.Sprintf("CONT-%s-%d", kind, count)
 		matches := []board.FactRecord{}
 		for _, fact := range state.FactRecords {
-			if strings.HasPrefix(fact.Description, marker) && (len(fact.Description) == len(marker) || !strings.ContainsRune("0123456789", rune(fact.Description[len(marker)]))) {
+			if liveContentionMarker(fact.Description, marker) {
 				matches = append(matches, fact)
 			}
 		}
@@ -350,7 +362,17 @@ func TestLiveContentionAudit(t *testing.T) {
 			t.Fatalf("fixture totals changed: %+v", amount)
 		}
 	})
-	for _, corruption := range []string{"wrong_total", "missing_checkpoint", "fabricated_excerpt", "foreign_run", "missing_completion_source", "duplicate_step", "stale_aggregate_hash", "missing_retained_snapshot", "tampered_retained_snapshot", "cross_run_retained_path"} {
+	t.Run("correction_is_not_another_final_fact", func(t *testing.T) {
+		state, files := liveContentionAuditFixture()
+		correction := state.FactRecords[2]
+		correction.ID = "f-amount-arithmetic-correction"
+		correction.Description = "CONT-amount-24-arithmetic-correction: correct the earlier derivation wording; the retained final values are unchanged"
+		state.FactRecords = append(state.FactRecords, correction)
+		if failures := validateLiveContention(state, files); len(failures) != 0 {
+			t.Fatalf("a separately named correction was mistaken for another final Fact: %v", failures)
+		}
+	})
+	for _, corruption := range []string{"wrong_total", "missing_checkpoint", "fabricated_excerpt", "foreign_run", "missing_completion_source", "duplicate_step", "duplicate_final_fact", "stale_aggregate_hash", "missing_retained_snapshot", "tampered_retained_snapshot", "cross_run_retained_path"} {
 		t.Run(corruption, func(t *testing.T) {
 			state, files := liveContentionAuditFixture()
 			switch corruption {
@@ -367,6 +389,11 @@ func TestLiveContentionAudit(t *testing.T) {
 				state.Goals[0].Sources = state.Goals[0].Sources[:3]
 			case "duplicate_step":
 				state.Steps = append(state.Steps, board.Step{ID: "extra", Status: "open"})
+			case "duplicate_final_fact":
+				duplicate := state.FactRecords[2]
+				duplicate.ID = "f-amount-duplicate"
+				duplicate.Description = "CONT-amount-24: another final Fact for the same branch"
+				state.FactRecords = append(state.FactRecords, duplicate)
 			case "stale_aggregate_hash":
 				files[liveContentionRoot+"/amount/final.json"] = append(files[liveContentionRoot+"/amount/final.json"], '\n')
 			case "missing_retained_snapshot":
@@ -384,6 +411,89 @@ func TestLiveContentionAudit(t *testing.T) {
 				t.Fatal("corrupted evidence passed strict audit")
 			}
 		})
+	}
+}
+
+func TestLiveContentionMarkerBoundary(t *testing.T) {
+	const marker = "CONT-amount-24"
+	for _, suffix := range []string{"", " verified", ": verified", "：verified", ", verified", "。verified", "\nverified"} {
+		if !liveContentionMarker(marker+suffix, marker) {
+			t.Fatalf("complete marker with natural delimiter %q was rejected", suffix)
+		}
+	}
+	for _, suffix := range []string{"0", "correction", "_correction", "-arithmetic-correction", "修订", "２"} {
+		if liveContentionMarker(marker+suffix, marker) {
+			t.Fatalf("marker suffix %q was incorrectly classified as a final Fact", suffix)
+		}
+	}
+	if liveContentionMarker("prefix "+marker, marker) {
+		t.Fatal("marker was accepted outside the description prefix")
+	}
+}
+
+// Reaudit saved evidence without rerunning the model or replacing any original
+// observation. The original verdict remains beside the separately named review.
+func TestLiveContentionRetainedAudit(t *testing.T) {
+	directory := os.Getenv("XLOOM_LIVE_REAUDIT")
+	if directory == "" {
+		t.Skip("set XLOOM_LIVE_REAUDIT to audit a retained live run offline")
+	}
+	var state board.State
+	raw, err := os.ReadFile(filepath.Join(directory, "state.json"))
+	if err != nil || json.Unmarshal(raw, &state) != nil {
+		t.Fatal("cannot read retained project state", err)
+	}
+	var original struct {
+		Failures []string `json:"failures"`
+	}
+	raw, err = os.ReadFile(filepath.Join(directory, "validation.json"))
+	if err != nil || json.Unmarshal(raw, &original) != nil {
+		t.Fatal("cannot read original validation result", err)
+	}
+	files := map[string][]byte{}
+	err = filepath.WalkDir(filepath.Join(directory, "workspace"), func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		relative, err := filepath.Rel(directory, path)
+		if err != nil {
+			return err
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		files["/"+filepath.ToSlash(relative)] = raw
+		return nil
+	})
+	if err != nil {
+		t.Fatal("cannot read retained workspace", err)
+	}
+	failures := validateLiveContention(state, files)
+	passed := state.Graph.Project.Status == "completed" && len(failures) == 0
+	review := map[string]any{
+		"project_completed": state.Graph.Project.Status == "completed", "passed": passed, "failures": failures,
+		"original_failures": original.Failures, "review_reason": "marker suffix correction",
+		"source_commit": os.Getenv("XLOOM_SOURCE_COMMIT"), "reviewed_at": time.Now().UTC(),
+	}
+	raw, err = json.MarshalIndent(review, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewPath := filepath.Join(directory, "validation-reviewed.json")
+	if info, err := os.Lstat(reviewPath); err == nil && !info.Mode().IsRegular() {
+		t.Fatal("review destination must be a regular file")
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(reviewPath, append(raw, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !passed {
+		t.Fatalf("retained business acceptance failed: %v", failures)
 	}
 }
 

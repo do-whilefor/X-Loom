@@ -34,25 +34,28 @@ type liveHTTPUsage struct {
 // Only timings, counts and explicitly selected protocol metadata are retained.
 // Request/response bodies, URLs, headers and thinking text never enter a record.
 type liveHTTPObservation struct {
-	RequestID       int           `json:"request_id"`
-	RunID           string        `json:"run_id"`
-	Model           string        `json:"model"`
-	MaxTokens       int           `json:"max_tokens"`
-	ToolCount       int           `json:"tool_count"`
-	StartedAt       time.Time     `json:"started_at"`
-	FinishedAt      time.Time     `json:"finished_at"`
-	HTTPStatus      int           `json:"http_status"`
-	HeadersMS       *float64      `json:"headers_ms"`
-	FirstEventMS    *float64      `json:"first_event_ms"`
-	FirstThinkingMS *float64      `json:"first_thinking_ms"`
-	LastThinkingMS  *float64      `json:"last_thinking_ms"`
-	FirstOutputMS   *float64      `json:"first_output_ms"`
-	LastOutputMS    *float64      `json:"last_output_ms"`
-	ThinkingChars   int64         `json:"thinking_chars"`
-	OutputChars     int64         `json:"output_chars"`
-	Usage           liveHTTPUsage `json:"usage"`
-	StopReason      string        `json:"stop_reason,omitempty"`
-	Errors          []string      `json:"errors,omitempty"`
+	RequestID           int           `json:"request_id"`
+	RunID               string        `json:"run_id"`
+	Model               string        `json:"model"`
+	MaxTokens           int           `json:"max_tokens"`
+	ToolCount           int           `json:"tool_count"`
+	StartedAt           time.Time     `json:"started_at"`
+	FinishedAt          time.Time     `json:"finished_at"`
+	HTTPStatus          int           `json:"http_status"`
+	HeadersMS           *float64      `json:"headers_ms"`
+	FirstEventMS        *float64      `json:"first_event_ms"`
+	FirstThinkingMS     *float64      `json:"first_thinking_ms"`
+	LastThinkingMS      *float64      `json:"last_thinking_ms"`
+	FirstOutputMS       *float64      `json:"first_output_ms"`
+	LastOutputMS        *float64      `json:"last_output_ms"`
+	TerminalEvent       string        `json:"terminal_event,omitempty"`
+	TerminalEventMS     *float64      `json:"terminal_event_ms,omitempty"`
+	ClosedAfterTerminal bool          `json:"closed_after_terminal,omitempty"`
+	ThinkingChars       int64         `json:"thinking_chars"`
+	OutputChars         int64         `json:"output_chars"`
+	Usage               liveHTTPUsage `json:"usage"`
+	StopReason          string        `json:"stop_reason,omitempty"`
+	Errors              []string      `json:"errors,omitempty"`
 }
 
 type liveProxyRecorder struct {
@@ -66,7 +69,7 @@ func (r *liveProxyRecorder) Snapshot() []liveHTTPObservation {
 	out := append([]liveHTTPObservation(nil), r.observations...)
 	for i := range out {
 		out[i].Errors = append([]string(nil), out[i].Errors...)
-		for _, timing := range []**float64{&out[i].HeadersMS, &out[i].FirstEventMS, &out[i].FirstThinkingMS, &out[i].LastThinkingMS, &out[i].FirstOutputMS, &out[i].LastOutputMS} {
+		for _, timing := range []**float64{&out[i].HeadersMS, &out[i].FirstEventMS, &out[i].FirstThinkingMS, &out[i].LastThinkingMS, &out[i].FirstOutputMS, &out[i].LastOutputMS, &out[i].TerminalEventMS} {
 			if *timing != nil {
 				value := **timing
 				*timing = &value
@@ -89,6 +92,25 @@ func (a *liveProxyAttempt) update(fn func(*liveHTTPObservation)) {
 
 func (a *liveProxyAttempt) failure(kind string) {
 	a.update(func(o *liveHTTPObservation) {
+		for _, old := range o.Errors {
+			if old == kind {
+				return
+			}
+		}
+		o.Errors = append(o.Errors, kind)
+	})
+}
+
+// The Anthropic consumer returns at message_stop and closes its HTTP body
+// without waiting for the upstream connection to reach EOF. Such a close is
+// expected after an observed terminal event, not a failed model response.
+// This records upstream completion only; it does not assert client delivery.
+func (a *liveProxyAttempt) transportFailure(kind string) {
+	a.update(func(o *liveHTTPObservation) {
+		if o.TerminalEvent != "" {
+			o.ClosedAfterTerminal = true
+			return
+		}
 		for _, old := range o.Errors {
 			if old == kind {
 				return
@@ -149,7 +171,7 @@ func newLiveModelProxy(upstream, token string) (*httptest.Server, *liveProxyReco
 		attempt := &liveProxyAttempt{recorder: recorder, index: index}
 		defer func() {
 			if r.Context().Err() != nil {
-				attempt.failure("request_cancelled")
+				attempt.transportFailure("request_cancelled")
 			}
 			attempt.update(func(o *liveHTTPObservation) { o.FinishedAt = time.Now() })
 		}()
@@ -219,7 +241,7 @@ func (b *liveObservedBody) Read(p []byte) (int, error) {
 				b.observeJSON(b.buffer)
 			}
 		} else {
-			b.attempt.failure("upstream_body_read_failed")
+			b.attempt.transportFailure("upstream_body_read_failed")
 		}
 		b.buffer = nil
 	}
@@ -288,6 +310,11 @@ func (b *liveObservedBody) observeJSON(raw []byte) {
 		elapsed := float64(time.Since(o.StartedAt)) / float64(time.Millisecond)
 		if o.FirstEventMS == nil {
 			o.FirstEventMS = &elapsed
+		}
+		if event.Type == "message_stop" || (!b.sse && event.Type == "message" && event.StopReason != "") {
+			if o.TerminalEvent == "" {
+				o.TerminalEvent, o.TerminalEventMS = event.Type, &elapsed
+			}
 		}
 		mergeLiveUsage(&o.Usage, event.Message.Usage)
 		mergeLiveUsage(&o.Usage, event.Usage)
@@ -504,5 +531,67 @@ func TestLiveModelProxyObservationLimitDoesNotTruncateStream(t *testing.T) {
 	o := liveFinishedObservations(t, recorder)[0]
 	if o.Usage.OutputTokens != 9 || len(o.Errors) != 1 || o.Errors[0] != "sse_line_observation_limit" {
 		t.Fatalf("observer failed to resume after oversized SSE line: %+v", o)
+	}
+}
+
+func TestLiveModelProxyClientCloseRequiresTerminalEvent(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		name := "before_message_stop"
+		if terminal {
+			name = "after_message_stop"
+		}
+		t.Run(name, func(t *testing.T) {
+			// A stop_reason in message_delta is not the stream's terminal event.
+			// Keep upstream open to reproduce the real consumer's early Close.
+			stream := "data: {\"type\":\"message_start\"}\n\n" +
+				"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":4}}\n\n"
+			if terminal {
+				stream += "data: {\"type\":\"message_stop\"}\n\n"
+			}
+			cancelled := make(chan struct{})
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, stream)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+				close(cancelled)
+			}))
+			defer upstream.Close()
+			proxy, recorder, err := newLiveModelProxy(upstream.URL, "test-secret")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer proxy.Close()
+			response, err := http.Get(proxy.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(stream))
+			_, err = io.ReadFull(response.Body, got)
+			response.Body.Close()
+			if err != nil || string(got) != stream {
+				t.Fatal("proxy changed terminal stream bytes", err)
+			}
+			select {
+			case <-cancelled:
+			case <-time.After(time.Second):
+				t.Fatal("client close did not cancel the remaining upstream stream")
+			}
+			o := liveFinishedObservations(t, recorder)[0]
+			if o.HTTPStatus != http.StatusOK || o.StopReason != "tool_use" || o.Usage.OutputTokens != 4 {
+				t.Fatalf("client close discarded the completed response metadata: %+v", o)
+			}
+			if terminal {
+				if o.TerminalEvent != "message_stop" || o.TerminalEventMS == nil || !o.ClosedAfterTerminal || len(o.Errors) != 0 {
+					t.Fatalf("normal close after message_stop was marked as a failure: %+v", o)
+				}
+				*o.TerminalEventMS = -1
+				if *recorder.Snapshot()[0].TerminalEventMS < 0 {
+					t.Fatal("Snapshot terminal timing aliases recorder state")
+				}
+			} else if o.TerminalEvent != "" || o.TerminalEventMS != nil || o.ClosedAfterTerminal || len(o.Errors) == 0 {
+				t.Fatalf("stop_reason hid cancellation before message_stop: %+v", o)
+			}
+		})
 	}
 }
