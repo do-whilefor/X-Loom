@@ -80,6 +80,19 @@ docker compose down
 
 示例 Worker 只启用 `reason`、`explore`；配置缺少 `reason` 能力会报错。需要继续处理历史 bootstrap 项目时，将 `bootstrap` 加回 Worker 的 `task_types`，并添加 `tasks.bootstrap: {timeout: 0, conclude_timeout: 60}`。
 
+## 黑板与提交协议
+
+- 新版实时 Decide 使用 `decision.version: 2`：`graph_action` 暂存本轮计划，`preview` 校验，`commit` 一次提交。新增 Goal／Step 可通过 `$key` 在同批次中引用；最多 64 项，任何一项非法则整批不生效。提交后本轮立即结束。
+- 提交在同一 SQLite 事务中写入计划、事件与执行成功回执。响应丢失时查询原运行的回执；进程恢复时丢弃未提交草稿，保留原身份、截止时间和恢复额度。版本冲突后必须刷新概览并补读相关内容，再重新规划。服务端仍检查提交时的内容版本。
+- 新 Execute 使用 `result_contract_version: 2`。完成 Step 的结果必须引用本 Step 的有效证据事实 `data.fact_id`，或提供 `data.fact: {description, scope, observed_at, evidence}`。运行时绑定 Step、运行身份、证据片段与文件快照，最终事实、Step 收尾和执行回执一起提交。过程观察可以复用，无需重复生成 Fact。
+- 事实被反驳或替代后，未启动的依赖 Step 显示 `needs_review`／`invalid_sources`，认领、登记和启动时都会复核。已运行的 Step 保留原输入及独立观察，由 Decide 决定是否放弃；撤销后拒绝迟到结果。
+- 根目标来自用户输入。Decide 可在同一批次中说明理由、撤回辅助计划并完成项目；仍须引用有效观察，不能靠空队列或耗尽预算自动完成。结构校验保证状态一致性，证据是否充分覆盖用户要求仍需模型或用户判断。
+- 每轮 Decide 保留原始根条件和有限全局概览；大图明确标出省略数量及分页补读入口。执行记录提供读取、草稿、预览、提交、冲突及模型耗时等观测数据。Mock 验证协议和故障行为，不代表已证明真实模型的规划质量或成本改善。
+
+已登记的旧版任务继续按原合同恢复；旧 HTTP 接口保留兼容映射，并为业务写入生成事件。心跳、租约活动和无变化重放不增加业务事件。新版运行不能通过旧收尾接口降级为无证据结论。原 Web 静态页面保持不变，扩展状态可通过 `/projects/{id}/state` 读取。
+
+升级前应备份 SQLite 数据库和运行／证据目录。新版增加的状态和执行协议不保证旧二进制能够处理；回退代码时应同时恢复对应备份，不能仅凭 `git revert` 推断数据兼容。
+
 ## 测试与 CI
 
 GitHub Actions 会在推送代码、提交 PR 或手动触发时，在新的 Linux 环境中检出对应提交，执行单元测试、Mock 集成测试、竞态检查、`go vet` 和程序编译。

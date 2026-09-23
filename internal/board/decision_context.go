@@ -24,23 +24,24 @@ type DecisionContext struct {
 type decisionChanges map[string][]string
 
 type decisionView struct {
-	Version          int             `json:"version"`
-	Revision         int64           `json:"revision"`
-	DecisionRevision int64           `json:"decision_revision"`
-	Generation       int64           `json:"generation"`
-	FromRevision     int64           `json:"from_revision"`
-	Project          Project         `json:"project"`
-	UserInputs       []Fact          `json:"user_inputs"`
-	Hints            []Hint          `json:"hints"`
-	Goals            []Goal          `json:"goals"`
-	Steps            []Step          `json:"steps"`
-	Facts            []FactRecord    `json:"fact_records"`
-	Findings         []Finding       `json:"findings"`
-	Relations        []FactRelation  `json:"fact_relations"`
-	Changed          decisionChanges `json:"changed"`
-	Removed          decisionChanges `json:"removed"`
-	Omitted          map[string]int  `json:"omitted"`
-	ReadMore         string          `json:"read_more"`
+	Version          int              `json:"version"`
+	Revision         int64            `json:"revision"`
+	DecisionRevision int64            `json:"decision_revision"`
+	Generation       int64            `json:"generation"`
+	FromRevision     int64            `json:"from_revision"`
+	Project          Project          `json:"project"`
+	UserInputs       []Fact           `json:"user_inputs"`
+	Hints            []Hint           `json:"hints"`
+	Goals            []Goal           `json:"goals"`
+	Steps            []Step           `json:"steps"`
+	Facts            []FactRecord     `json:"fact_records"`
+	Findings         []Finding        `json:"findings"`
+	Relations        []FactRelation   `json:"fact_relations"`
+	Changed          decisionChanges  `json:"changed"`
+	Removed          decisionChanges  `json:"removed"`
+	Omitted          map[string]int   `json:"omitted"`
+	ReadMore         string           `json:"read_more"`
+	Overview         *contextOverview `json:"overview"`
 }
 
 // BuildDecisionContext narrows a Decide input around changes and their support.
@@ -185,8 +186,13 @@ func BuildDecisionContext(current State, previous *State, events []StateEvent, m
 		}
 	}
 	for _, step := range current.Steps {
-		if step.Status == "open" || step.Status == "running" || selectedGoals[step.GoalID] || references(step.From) || selectedFacts[Value(step.Result)] {
+		if contextActiveStep(step.Status) || selectedGoals[step.GoalID] || references(step.From) || selectedFacts[Value(step.Result)] {
 			selectedSteps[step.ID] = true
+		}
+	}
+	for _, goal := range current.Goals {
+		if goal.Status == "open" {
+			selectedGoals[goal.ID] = true
 		}
 	}
 	selectedGoals["goal"] = true
@@ -236,6 +242,15 @@ func BuildDecisionContext(current State, previous *State, events []StateEvent, m
 	}
 
 	view := decisionView{Version: 1, Revision: current.Revision, DecisionRevision: current.DecisionRevision, Generation: project.Generation, FromRevision: previous.Revision, Project: project, UserInputs: []Fact{}, Hints: append([]Hint{}, current.Graph.Hints...), Goals: []Goal{}, Steps: []Step{}, Facts: []FactRecord{}, Findings: []Finding{}, Relations: []FactRelation{}, Changed: changed, Removed: removed, Omitted: map[string]int{}, ReadMore: "Read omitted nodes and evidence using read_graph with ids. Omission is not absence; reads are pinned to state_version."}
+	// The same bounded discovery index accompanies full and incremental bodies.
+	// Keeping the latter narrow must not erase unrelated historical knowledge.
+	var overview struct {
+		Overview *contextOverview `json:"overview"`
+	}
+	if err := json.Unmarshal(baseline, &overview); err != nil {
+		return nil, err
+	}
+	view.Overview = overview.Overview
 	for _, fact := range current.Graph.Facts {
 		if fact.ID == "origin" || fact.ID == "goal" {
 			view.UserInputs = append(view.UserInputs, fact)
@@ -330,33 +345,58 @@ func decisionRelationClosure(relations []FactRelation, selected map[string]bool)
 	}
 }
 
-// The fallback may omit step details, but must not suggest that an omitted
-// executable plan does not exist. Keep a compact index of all active steps.
+// Changes are also an index, so large revisions must not force an unbounded
+// payload. Current nodes remain discoverable through the overview pages;
+// removals have explicit counts because live pages cannot restore their bodies.
 func decisionFallbackView(state State, baseline json.RawMessage, changed, removed decisionChanges, maxBytes int) (json.RawMessage, error) {
-	type activeStep struct {
-		ID     string `json:"id"`
-		GoalID string `json:"goal_id"`
-		Status string `json:"status"`
+	metadata := struct {
+		Changed        decisionChanges `json:"changed"`
+		Removed        decisionChanges `json:"removed"`
+		ChangedOmitted map[string]int  `json:"changed_omitted"`
+		RemovedOmitted map[string]int  `json:"removed_omitted"`
+		ReadMore       string          `json:"read_more"`
+	}{decisionChanges{}, decisionChanges{}, map[string]int{}, map[string]int{}, "Read changed nodes and support using read_graph with ids. Scan overview sections to discover omitted history and changes; missing nodes are not evidence of absence. Reads are pinned to state_version."}
+	for kind, ids := range changed {
+		metadata.Changed[kind] = []string{}
+		metadata.ChangedOmitted[kind] = len(ids)
 	}
-	active := []activeStep{}
-	for _, step := range contextState(state).Steps {
-		if step.Status == "open" || step.Status == "running" {
-			active = append(active, activeStep{step.ID, step.GoalID, step.Status})
+	for kind, ids := range removed {
+		metadata.Removed[kind] = []string{}
+		metadata.RemovedOmitted[kind] = len(ids)
+	}
+	index, _ := json.Marshal(metadata)
+	used := len(index)
+	if used > maxBytes/4 {
+		return nil, errors.New("decision context: change index exceeds the budget")
+	}
+	appendIDs := func(source, dest decisionChanges, omitted map[string]int) {
+		keys := make([]string, 0, len(source))
+		for kind := range source {
+			keys = append(keys, kind)
+		}
+		sort.Strings(keys)
+		for _, kind := range keys {
+			for _, id := range source[kind] {
+				raw, _ := json.Marshal(id)
+				extra := len(raw)
+				if len(dest[kind]) > 0 {
+					extra++
+				}
+				if used+extra > maxBytes/4 {
+					continue
+				}
+				dest[kind] = append(dest[kind], id)
+				omitted[kind]--
+				used += extra
+			}
 		}
 	}
-	metadata := struct {
-		OpenSteps []activeStep    `json:"open_steps"`
-		Changed   decisionChanges `json:"changed,omitempty"`
-		Removed   decisionChanges `json:"removed,omitempty"`
-		ReadMore  string          `json:"read_more"`
-	}{active, changed, removed, "Read changed nodes, open_steps and omitted support using read_graph with ids. Omission is not absence; reads are pinned to state_version."}
-	index, _ := json.Marshal(metadata)
+	appendIDs(removed, metadata.Removed, metadata.RemovedOmitted)
+	appendIDs(changed, metadata.Changed, metadata.ChangedOmitted)
+	index, _ = json.Marshal(metadata)
 	// Merge two nonempty JSON objects by replacing their adjacent braces with
-	// a comma. Reserve the full index before ContextView chooses any history.
+	// a comma. Reserve the bounded index before choosing history bodies.
 	extra := len(index) - 1
-	if extra >= maxBytes {
-		return nil, errors.New("decision context: active plan and change index exceed the budget")
-	}
 	if len(baseline)+extra > maxBytes {
 		var err error
 		baseline, err = ContextView(state, "", maxBytes-extra)
