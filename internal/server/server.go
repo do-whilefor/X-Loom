@@ -372,7 +372,10 @@ func (s *Server) projects(t *b.Tx, q *request, r *http.Request) (int, any, error
 			g.Hints = append(g.Hints, b.Hint{ID: hid, Content: content, Creator: creator, CreatedAt: t.Now})
 		}
 	}
-	return 201, g, t.Save(g)
+	if err = t.Save(g); err != nil {
+		return 0, nil, err
+	}
+	return 201, g, t.CheckContextCapacity(g.Project.ID)
 }
 func (s *Server) project(t *b.Tx, _ *request, r *http.Request) (int, any, error) {
 	g, err := t.Load(r.PathValue("pid"))
@@ -392,7 +395,10 @@ func (s *Server) title(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 		return 0, nil, err
 	}
 	g.Project.Title = title
-	return 200, g.Project, t.Save(g)
+	if err = t.Save(g); err != nil {
+		return 0, nil, err
+	}
+	return 200, g.Project, t.CheckContextCapacity(g.Project.ID)
 }
 func (s *Server) status(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 	status, _ := q.fields["status"].(string)

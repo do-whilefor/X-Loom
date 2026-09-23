@@ -23,6 +23,11 @@ func (t *Tx) SaveLegacyMutation(g Graph, op, id, run string, payload, result any
 	if err = t.Save(g); err != nil {
 		return err
 	}
+	if op == "hint" || op == "step" || op == "reopen" {
+		if err = t.CheckContextCapacity(g.Project.ID); err != nil {
+			return err
+		}
+	}
 	after, err := t.Load(g.Project.ID)
 	if err != nil {
 		return err

@@ -514,6 +514,20 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 	if err != nil {
 		return StateActionResult{}, err
 	}
+	if changed && (action.Op == "goal" || action.Op == "step") {
+		var transition struct {
+			Action string `json:"action"`
+		}
+		_ = json.Unmarshal(action.Payload, &transition)
+		// Releasing old work must remain possible even for pre-admission data
+		// whose requirements were already over budget. Terminal transitions do
+		// not introduce a new runnable Step or increase its mandatory ancestry.
+		if transition.Action != "abandon" && transition.Action != "withdraw" && transition.Action != "achieve" {
+			if err = ValidateContextCapacity(current); err != nil {
+				return StateActionResult{}, err
+			}
+		}
+	}
 	out := StateActionResult{Op: action.Op, ID: id, Revision: s.Revision, Result: resultJSON, StateVersion: DecisionStateVersion(current), Unchanged: !changed}
 	response, _ := json.Marshal(out)
 	if _, err = t.Exec("INSERT INTO xloom_state_actions(project_id,idempotency_key,request,response) VALUES(?,?,?,?)", project, action.IdempotencyKey, string(canonical), string(response)); err != nil {
