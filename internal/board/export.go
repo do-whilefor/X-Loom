@@ -2,8 +2,6 @@ package board
 
 import (
 	"fmt"
-	"sort"
-	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -23,44 +21,12 @@ func displayOptional(s *string) *string {
 	return Ptr(displayTime(*s))
 }
 func Export(g Graph, format string) (string, error) {
+	if format != "yaml" {
+		return "", fmt.Errorf("graph-only export supports yaml; use ExportTimeline for FGS history")
+	}
 	facts := map[string]string{}
 	for _, f := range g.Facts {
 		facts[f.ID] = f.Description
-	}
-	if format == "timeline" {
-		type event struct{ at, text string }
-		events := []event{{g.Project.CreatedAt, fmt.Sprintf("[%s] PROJECT CREATED\n  origin: %s\n  goal: %s", displayTime(g.Project.CreatedAt), facts["origin"], facts["goal"])}}
-		for _, h := range g.Hints {
-			events = append(events, event{h.CreatedAt, fmt.Sprintf("[%s] HINT by %s\n  %s", displayTime(h.CreatedAt), h.Creator, h.Content)})
-		}
-		for _, i := range g.Intents {
-			from := strings.Join(i.From, ", ")
-			meta := "  from: " + from
-			if i.Worker != nil && i.ConcludedAt == nil {
-				meta += "\n  worker: " + *i.Worker + " (in progress)"
-			}
-			events = append(events, event{i.CreatedAt, fmt.Sprintf("[%s] INTENT DECLARED %s by %s\n%s\n  %s", displayTime(i.CreatedAt), i.ID, i.Creator, meta, i.Description)})
-			if i.ConcludedAt == nil || i.To == nil {
-				continue
-			}
-			actor := Value(i.Worker)
-			if actor == "" {
-				actor = i.Creator
-			}
-			var text string
-			if *i.To == "goal" {
-				text = fmt.Sprintf("[%s] PROJECT COMPLETED by %s\n  via: %s from %s", displayTime(*i.ConcludedAt), actor, i.ID, from)
-			} else {
-				text = fmt.Sprintf("[%s] INTENT CONCLUDED %s by %s\n  from: %s\n  produced: %s\n  %s", displayTime(*i.ConcludedAt), i.ID, actor, from, *i.To, facts[*i.To])
-			}
-			events = append(events, event{*i.ConcludedAt, text})
-		}
-		sort.SliceStable(events, func(i, j int) bool { return events[i].at < events[j].at })
-		parts := []string{}
-		for _, e := range events {
-			parts = append(parts, e.text)
-		}
-		return strings.Join(parts, "\n\n") + "\n", nil
 	}
 	type project struct {
 		Title     string `yaml:"title"`

@@ -282,7 +282,7 @@
       }
       const firstLoad = !state;
       $('graph-empty').hidden = true;
-      const [nextState, runs] = await Promise.all([api.request(pathFor(target) + '/state', options), api.request(pathFor(target) + '/executions', options)]);
+      const [nextState, runs] = await Promise.all([api.request(pathFor(target) + '/state', options), api.projectExecutions(pathFor(target), options)]);
       if (!requests.current(request.version)) return;
       const generation = nextState.graph.project.generation || 0;
       let cache = eventCache.get(target) || {after:0,events:[],generation};

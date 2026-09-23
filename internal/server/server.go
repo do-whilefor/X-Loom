@@ -698,6 +698,10 @@ func (s *Server) export(t *b.Tx, _ *request, r *http.Request) (int, any, error) 
 	if format != "yaml" && format != "timeline" {
 		return 0, nil, b.Err(400, "Supported formats: yaml, timeline")
 	}
+	if format == "timeline" {
+		text, err := t.ExportTimeline(r.PathValue("pid"))
+		return 200, plain(text), err
+	}
 	g, err := t.Load(r.PathValue("pid"))
 	if err != nil {
 		return 0, nil, err

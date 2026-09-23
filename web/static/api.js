@@ -14,6 +14,20 @@
   }
   class Client {
     constructor(fetcher = (...args) => fetch(...args), timeout = 15000) { this.fetcher = fetcher; this.timeout = timeout; }
+    async projectExecutions(projectPath, options = {}) {
+      const items = [];
+      let cursor = 0, through = 0;
+      do {
+        const page = await this.request(projectPath + '/executions?limit=20&cursor=' + cursor + '&through=' + through, options);
+        if (!Array.isArray(page.items) || !Number.isSafeInteger(page.through) || page.through < 0 ||
+            (page.next_cursor !== undefined && (!Number.isSafeInteger(page.next_cursor) || page.next_cursor <= cursor || page.next_cursor > page.through)) ||
+            (through !== 0 && page.through !== through)) throw new APIError('执行记录分页边界无效');
+        items.push(...page.items);
+        through = page.through;
+        cursor = page.next_cursor || 0;
+      } while (cursor);
+      return items;
+    }
     async request(path, {method = 'GET', body, signal} = {}) {
       if (!path.startsWith('/') || path.startsWith('//') || path.includes('\\')) throw new APIError('仅支持本站接口');
       const controller = new AbortController();

@@ -1,6 +1,9 @@
 package board
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"sort"
+)
 
 // Keep optional scenario metadata outside Cairn's projects table so both
 // legacy schemas and clients continue to work without inventing a scenario.
@@ -34,9 +37,9 @@ type ExecutionResultView struct {
 	Truncated bool   `json:"truncated,omitempty"`
 }
 
-func executionResultView(raw []byte) *ExecutionResultView {
-	var result ExecutionResultView
-	if json.Unmarshal(raw, &result) != nil || (result.Text == "" && result.Error == "") {
+func executionResultView(text, failure string) *ExecutionResultView {
+	result := ExecutionResultView{Text: text, Error: failure}
+	if result.Text == "" && result.Error == "" {
 		return nil
 	}
 	result.Truncated = false
@@ -52,40 +55,89 @@ func executionResultView(raw []byte) *ExecutionResultView {
 	return &result
 }
 
+// The SQL boundary extracts only bounded public result fields. Four UTF-8
+// bytes per character plus a sentinel preserve the existing character limits;
+// slicing BLOBs also preserves embedded NULs (SQLite text substr does not).
+// Historical Job bodies never enter this read.
+const executionViewColumns = `rowid,id,project_id,generation,kind,backend,intent,status,resumes,created_at,updated_at,
+COALESCE(CASE WHEN json_valid(result) THEN CASE WHEN json_type(result,'$.text')='text' THEN substr(CAST(json_extract(result,'$.text') AS BLOB),1,262148) END END,''),
+COALESCE(CASE WHEN json_valid(result) THEN CASE WHEN json_type(result,'$.error')='text' THEN substr(CAST(json_extract(result,'$.error') AS BLOB),1,16388) END END,'')`
+
+const MaxExecutionViewPageBytes = 1 << 20
+
+type ExecutionViewPage struct {
+	Items      []ExecutionView `json:"items"`
+	NextCursor int64           `json:"next_cursor,omitempty"`
+	Through    int64           `json:"through"`
+}
+
+// ProjectExecutions preserves the original array response for old clients.
+// New clients follow ProjectExecutionPage cursors for bounded responses.
 func (t *Tx) ProjectExecutions(project string) ([]ExecutionView, error) {
-	var exists bool
-	if err := t.QueryRow("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?)", project).Scan(&exists); err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, Err(404, "Project not found")
-	}
-	rows, err := t.Query(`SELECT id,project_id,kind,backend,intent,status,resumes,created_at,updated_at,result,job FROM xloom_executions WHERE project_id=? ORDER BY created_at,rowid`, project)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	out := []ExecutionView{}
-	for rows.Next() {
-		var entry ExecutionView
-		var result, job []byte
-		if err := rows.Scan(&entry.ID, &entry.ProjectID, &entry.Kind, &entry.Backend, &entry.Intent, &entry.Status, &entry.Resumes, &entry.CreatedAt, &entry.UpdatedAt, &result, &job); err != nil {
+	var after, through int64
+	for {
+		page, err := t.ProjectExecutionPage(project, after, through, 100)
+		if err != nil {
 			return nil, err
 		}
-		// Only the round number crosses the UI projection. The immutable job
-		// itself remains private to dispatcher recovery.
-		var round struct {
-			Graph struct {
-				Project struct {
-					Generation int64 `json:"generation"`
-				} `json:"project"`
-			} `json:"graph"`
+		out = append(out, page.Items...)
+		if page.NextCursor == 0 {
+			break
 		}
-		if json.Unmarshal(job, &round) == nil {
-			entry.Generation = round.Graph.Project.Generation
+		after, through = page.NextCursor, page.Through
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
+	return out, nil
+}
+
+// Through freezes the set of executions to enumerate, not their changing
+// statuses. A fresh refresh starts at zero and sees current runtime metadata.
+func (t *Tx) ProjectExecutionPage(project string, after, through int64, limit int) (ExecutionViewPage, error) {
+	out := ExecutionViewPage{Items: []ExecutionView{}, Through: through}
+	if after < 0 || through < 0 || (through != 0 && after > through) || limit < 1 || limit > 100 {
+		return out, Err(422, "invalid execution page boundary (limit must be 1-100)")
+	}
+	var exists bool
+	if err := t.QueryRow("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?)", project).Scan(&exists); err != nil {
+		return out, err
+	}
+	if !exists {
+		return out, Err(404, "Project not found")
+	}
+	if through == 0 {
+		if err := t.QueryRow("SELECT COALESCE(MAX(rowid),0) FROM xloom_executions WHERE project_id=?", project).Scan(&out.Through); err != nil {
+			return out, err
 		}
-		entry.Result = executionResultView(result)
-		out = append(out, entry)
+	}
+	rows, err := t.Query("SELECT "+executionViewColumns+" FROM xloom_executions WHERE project_id=? AND rowid>? AND rowid<=? ORDER BY rowid LIMIT ?", project, after, out.Through, limit+1)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	used, last := 128, after
+	for rows.Next() {
+		var entry ExecutionView
+		var row int64
+		var text, failure string
+		if err := rows.Scan(&row, &entry.ID, &entry.ProjectID, &entry.Generation, &entry.Kind, &entry.Backend, &entry.Intent, &entry.Status, &entry.Resumes, &entry.CreatedAt, &entry.UpdatedAt, &text, &failure); err != nil {
+			return out, err
+		}
+		entry.Result = executionResultView(text, failure)
+		raw, err := json.Marshal(entry)
+		if err != nil {
+			return out, err
+		}
+		if len(raw)+128 > MaxExecutionViewPageBytes {
+			return out, Err(422, "execution metadata exceeds page size")
+		}
+		if len(out.Items) == limit || used+len(raw)+1 > MaxExecutionViewPageBytes {
+			out.NextCursor = last
+			break
+		}
+		out.Items = append(out.Items, entry)
+		used += len(raw) + 1
+		last = row
 	}
 	return out, rows.Err()
 }
