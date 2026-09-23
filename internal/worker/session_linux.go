@@ -94,7 +94,6 @@ type session struct {
 	ConclusionEvidence     []board.EvidenceRef      `json:"conclusion_evidence,omitempty"`
 	Repairing              bool                     `json:"repairing,omitempty"`
 	RepairCount            int                      `json:"repair_count,omitempty"`
-	RepairReason           string                   `json:"repair_reason,omitempty"`
 	RepairPrompt           string                   `json:"repair_prompt,omitempty"`
 	RepairPending          bool                     `json:"repair_pending,omitempty"`
 	ContinuationCount      int                      `json:"continuation_count,omitempty"`

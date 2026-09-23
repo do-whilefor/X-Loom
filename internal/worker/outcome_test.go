@@ -355,6 +355,24 @@ func TestRecoveryAfterRepairExitRetainsSpentRepairAttempts(t *testing.T) {
 	if err != nil || !first.Retryable || outcomeSession(t, runDir).RepairCount != 1 {
 		t.Fatalf("first result=%+v err=%v", first, err)
 	}
+	// Older sessions saved a write-only reason beside the actual repair prompt.
+	// Accept that field without refunding repairs, then omit it on the next save.
+	raw, err := os.ReadFile(filepath.Join(runDir, "session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacy["repair_reason"] = json.RawMessage(`"obsolete diagnostic"`)
+	raw, err = json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicSessionFile(runDir, raw); err != nil {
+		t.Fatal(err)
+	}
 	turns = 0
 	last, err := Run(context.Background(), j, Options{RunDir: runDir, Provider: scenarioProvider(func(context.Context, []agent.Message, []agent.Definition, agent.Emit) (agent.Message, error) {
 		turns++
@@ -365,6 +383,17 @@ func TestRecoveryAfterRepairExitRetainsSpentRepairAttempts(t *testing.T) {
 	})})
 	if err != nil || last.Status != "failed" || last.Retryable || turns != 2 || !strings.Contains(last.Error, "repair exhausted") || outcomeSession(t, runDir).RepairCount != 2 {
 		t.Fatalf("last result=%+v err=%v turns=%d", last, err, turns)
+	}
+	raw, err = os.ReadFile(filepath.Join(runDir, "session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &current); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := current["repair_reason"]; ok {
+		t.Fatal("saved session retained the unused repair reason")
 	}
 }
 

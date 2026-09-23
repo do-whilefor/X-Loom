@@ -334,24 +334,6 @@ func (s *Scheduler) Step(ctx context.Context) error {
 func bootstrap(i board.Intent) bool {
 	return i.To == nil && i.ConcludedAt == nil && i.Description == "bootstrap" && i.Creator == "dispatcher.bootstrap" && len(i.From) == 1 && i.From[0] == "origin"
 }
-func initial(g board.Graph) bool {
-	if len(g.Facts) != 2 {
-		return false
-	}
-	ids := map[string]bool{}
-	for _, f := range g.Facts {
-		ids[f.ID] = true
-	}
-	if !ids["origin"] || !ids["goal"] {
-		return false
-	}
-	for _, i := range g.Intents {
-		if !bootstrap(i) {
-			return false
-		}
-	}
-	return true
-}
 func (s *Scheduler) trigger(g board.Graph, check board.ExecutionCheck) string {
 	if check.PreviousRunID != "" {
 		return "explicit_retry"
@@ -658,10 +640,7 @@ func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, inte
 	// a long current turn reaches the boundary where soft conclusion begins.
 	t := &task{Job: worker.Job{RunID: id, Kind: kind, WorkerType: w.Type, Graph: g, Intent: intent, Budget: budget, Workspace: "/workspace", GraphRPC: w.Type != "mock", ResultContractVersion: 2, DecisionRevision: s.stateRevisions[g.Project.ID], EnvironmentID: s.environmentID(*w)}, Worker: *w, Lease: lease}
 	if kind == "reason" {
-		if err := s.prepareDecision(ctx, t, trigger); err != nil {
-			_ = s.Client.Do(ctx, "POST", s.leasePath(t)+"/release", map[string]string{"worker": lease.Run}, nil, nil)
-			return false, err
-		}
+		t.Job.DecisionTrigger = trigger
 	}
 	if err := s.register(ctx, t); err != nil {
 		_ = s.Client.Do(ctx, "POST", s.leasePath(t)+"/release", map[string]string{"worker": lease.Run}, nil, nil)

@@ -131,9 +131,7 @@ func TestRecoveryFetchesOnlyTheSelectedImmutableJob(t *testing.T) {
 	if err := s.Client.Do(ctx, "POST", projectPath(graph.Project.ID)+"/reason/claim", map[string]string{"worker": run.Lease.Run, "trigger": "initial"}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.prepareDecision(ctx, run, "initial"); err != nil {
-		t.Fatal(err)
-	}
+	run.Job.DecisionTrigger = "initial"
 	if err := s.register(ctx, run); err != nil {
 		t.Fatal(err)
 	}

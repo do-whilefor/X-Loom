@@ -150,9 +150,7 @@ func TestDecisionTerminalFailureSurvivesConcurrentStaleCancellation(t *testing.T
 	if err := scheduler.Client.Do(ctx, "POST", projectPath(graph.Project.ID)+"/reason/claim", map[string]string{"worker": run.Lease.Run, "trigger": "initial"}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := scheduler.prepareDecision(ctx, run, "initial"); err != nil {
-		t.Fatal(err)
-	}
+	run.Job.DecisionTrigger = "initial"
 	if err := scheduler.register(ctx, run); err != nil {
 		t.Fatal(err)
 	}
@@ -214,9 +212,7 @@ func TestDecisionCommittedReceiptWinsStaleCancellation(t *testing.T) {
 	if err := scheduler.Client.Do(ctx, "POST", projectPath(graph.Project.ID)+"/reason/claim", map[string]string{"worker": run.Lease.Run, "trigger": "initial"}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := scheduler.prepareDecision(ctx, run, "initial"); err != nil {
-		t.Fatal(err)
-	}
+	run.Job.DecisionTrigger = "initial"
 	if err := scheduler.register(ctx, run); err != nil {
 		t.Fatal(err)
 	}

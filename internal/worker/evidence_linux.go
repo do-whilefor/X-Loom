@@ -304,10 +304,6 @@ func selectedEvidence(raw []byte, ref board.EvidenceRef) (string, error) {
 	return string(selection), nil
 }
 
-func evidenceExcerpt(raw []byte, start, end int) (string, error) {
-	return selectedEvidence(raw, board.EvidenceRef{StartLine: start, EndLine: end})
-}
-
 func evidenceRange(raw []byte, start, end int) ([]byte, error) {
 	if start < 0 || end < 0 || start == 0 && end != 0 || start > 0 && end < start {
 		return nil, errors.New("evidence lines require both start_line and end_line, inclusive and 1-based")

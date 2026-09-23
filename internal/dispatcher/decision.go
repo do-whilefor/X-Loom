@@ -9,13 +9,6 @@ import (
 	"xloom/internal/board"
 )
 
-func (s *Scheduler) prepareDecision(_ context.Context, t *task, trigger string) error {
-	// The server freezes its input and builds the projection atomically during
-	// registration. No full graph crosses the dispatcher boundary.
-	t.Job.DecisionTrigger = trigger
-	return nil
-}
-
 func (s *Scheduler) scheduleInput(ctx context.Context, id string) (board.SchedulePage, error) {
 	var input board.SchedulePage
 	for offset := 0; ; {
