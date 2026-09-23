@@ -23,6 +23,13 @@ func (s *Server) schedulingInput(t *b.Tx, _ *request, r *http.Request) (int, any
 		offset = n
 	}
 	p, err := t.ScheduleInput(r.PathValue("pid"), offset, r.URL.Query().Get("expected_version"))
+	if err == nil && r.URL.Query().Has("namespace") {
+		var namespace string
+		namespace, err = executionNamespace(r)
+		if err == nil {
+			p.ExecutionChecks, err = t.ScheduleExecutionChecks(p.Project.ID, namespace, p.Intents, p.Steps)
+		}
+	}
 	return 200, p, err
 }
 
@@ -161,15 +168,7 @@ func (s *Server) prepareExecution(t *b.Tx, q *request, r *http.Request) (int, an
 	if err != nil {
 		return 0, nil, err
 	}
-	raw, err := json.Marshal(e)
-	if err != nil {
-		return 0, nil, err
-	}
-	fields := map[string]any{}
-	if err = json.Unmarshal(raw, &fields); err != nil {
-		return 0, nil, err
-	}
-	return s.executions(t, &request{fields: fields, prepared: true}, r)
+	return s.registerExecution(t, e, r, true)
 }
 
 func preparedDecisionTriggers(state b.State, previous *b.ExecutionSummary, trigger string) []string {

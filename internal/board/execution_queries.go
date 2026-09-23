@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // ExecutionSummary is the scheduling identity and immutable input boundary.
@@ -239,11 +240,13 @@ func (t *Tx) CheckExecutions(q ExecutionCheckQuery) (ExecutionCheck, error) {
 			return out, err
 		}
 	}
-	latest, err := scanExecutionSummary(t.QueryRow(`SELECT `+executionSummaryColumns+` FROM xloom_executions WHERE namespace=? AND project_id=? AND generation=? AND kind='reason' AND status='succeeded' ORDER BY created_at DESC,rowid DESC LIMIT 1`, q.Namespace, q.ProjectID, q.Generation))
-	if err == nil {
-		out.LatestDecision = &latest
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return out, err
+	if q.Kind == "reason" {
+		latest, err := scanExecutionSummary(t.QueryRow(`SELECT `+executionSummaryColumns+` FROM xloom_executions WHERE namespace=? AND project_id=? AND generation=? AND kind='reason' AND status='succeeded' ORDER BY created_at DESC,rowid DESC LIMIT 1`, q.Namespace, q.ProjectID, q.Generation))
+		if err == nil {
+			out.LatestDecision = &latest
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return out, err
+		}
 	}
 	if q.Kind != "reason" || out.Attempts != 1 || out.Pending || out.PreviousRunID != "" {
 		return out, nil
@@ -263,4 +266,54 @@ func (t *Tx) CheckExecutions(q ExecutionCheckQuery) (ExecutionCheck, error) {
 		out.AutomaticRetryID = candidate.ID
 	}
 	return out, nil
+}
+
+// Scheduling needs only admission and retry grants for the current page's
+// Execute candidates. Registration still verifies their leases and identity.
+func (t *Tx) ScheduleExecutionChecks(project, namespace string, intents []Intent, steps []Step) (map[string]ExecutionCheck, error) {
+	checks := make(map[string]ExecutionCheck, len(intents))
+	if len(intents) == 0 {
+		return checks, nil
+	}
+	stepState := make(map[string]Step, len(steps))
+	for _, step := range steps {
+		stepState[step.ID] = step
+	}
+	values := make([]string, 0, len(intents))
+	args := make([]any, 0, 3*len(intents)+6)
+	for _, i := range intents {
+		kind := "explore"
+		if i.To == nil && i.ConcludedAt == nil && i.Description == "bootstrap" && i.Creator == "dispatcher.bootstrap" && len(i.From) == 1 && i.From[0] == "origin" {
+			kind = "bootstrap"
+		} else if step := stepState[i.ID]; i.To != nil || i.ConcludedAt != nil || i.Worker != nil || step.Status == "abandoned" || len(step.InvalidSources) > 0 {
+			continue
+		}
+		values = append(values, "(?,?,?)")
+		args = append(args, kind, i.ID, kind+":"+i.ID)
+	}
+	if len(values) == 0 {
+		return checks, nil
+	}
+	args = append(args, namespace, project, namespace, project, namespace, project)
+	rows, err := t.Query(`WITH candidates(kind,intent,retry_key) AS (VALUES `+strings.Join(values, ",")+`)
+	SELECT c.retry_key,
+	EXISTS(SELECT 1 FROM xloom_executions e WHERE e.namespace=? AND e.project_id=? AND e.kind=c.kind AND e.intent=c.intent AND `+pendingExecutionSQL+`),
+	COALESCE((SELECT e.id FROM xloom_executions e WHERE e.namespace=? AND e.project_id=? AND e.kind=c.kind AND e.intent=c.intent AND e.status='retry_requested' ORDER BY e.created_at DESC,e.rowid DESC LIMIT 1),''),
+	EXISTS(SELECT 1 FROM xloom_executions e WHERE e.namespace=? AND e.project_id=? AND e.kind=c.kind AND e.retry_key=c.retry_key AND e.status NOT IN ('retry_requested','retried'))
+	FROM candidates c`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var check ExecutionCheck
+		var tried bool
+		if err := rows.Scan(&key, &check.Pending, &check.PreviousRunID, &tried); err != nil {
+			return nil, err
+		}
+		check.Blocked = check.Pending || (tried && check.PreviousRunID == "")
+		checks[key] = check
+	}
+	return checks, rows.Err()
 }

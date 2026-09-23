@@ -334,24 +334,6 @@ func (s *Scheduler) Step(ctx context.Context) error {
 func bootstrap(i board.Intent) bool {
 	return i.To == nil && i.ConcludedAt == nil && i.Description == "bootstrap" && i.Creator == "dispatcher.bootstrap" && len(i.From) == 1 && i.From[0] == "origin"
 }
-func initial(g board.Graph) bool {
-	if len(g.Facts) != 2 {
-		return false
-	}
-	ids := map[string]bool{}
-	for _, f := range g.Facts {
-		ids[f.ID] = true
-	}
-	if !ids["origin"] || !ids["goal"] {
-		return false
-	}
-	for _, i := range g.Intents {
-		if !bootstrap(i) {
-			return false
-		}
-	}
-	return true
-}
 func (s *Scheduler) trigger(g board.Graph, check board.ExecutionCheck) string {
 	if check.PreviousRunID != "" {
 		return "explicit_retry"
@@ -482,7 +464,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		if !bootstrap(*i) {
 			continue
 		}
-		check, err := s.executionCheck(ctx, g, "bootstrap", i, "")
+		check, err := s.candidateCheck(ctx, input, g, "bootstrap", i)
 		if err != nil {
 			return false, err
 		}
@@ -490,7 +472,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 			if running > 0 || g.Project.Reason != nil || i.Worker != nil {
 				return false, nil
 			}
-			return s.launch(ctx, g, "bootstrap", i, "")
+			return s.launch(ctx, g, "bootstrap", i, "", check)
 		}
 	}
 	bootstrapFailed := false
@@ -519,7 +501,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 			supported = supported || slices.Contains(w.TaskTypes, "bootstrap")
 		}
 		if !g.Project.Bootstrap || (boot == nil && !supported) {
-			return s.launch(ctx, g, "reason", nil, "initial")
+			return s.launch(ctx, g, "reason", nil, "initial", reasonCheck)
 		}
 		if boot == nil {
 			var i board.Intent
@@ -533,11 +515,15 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		if boot.Worker != nil {
 			return false, nil
 		}
-		return s.launch(ctx, g, "bootstrap", boot, "")
+		check, err := s.candidateCheck(ctx, input, g, "bootstrap", boot)
+		if err != nil {
+			return false, err
+		}
+		return s.launch(ctx, g, "bootstrap", boot, "", check)
 	}
 	if g.Project.Reason == nil && !localReason {
 		if trigger := s.trigger(g, reasonCheck); trigger != "" {
-			if ok, err := s.launch(ctx, g, "reason", nil, trigger); ok || err != nil {
+			if ok, err := s.launch(ctx, g, "reason", nil, trigger, reasonCheck); ok || err != nil {
 				return ok, err
 			}
 		}
@@ -547,12 +533,13 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		stepState[step.ID] = step
 	}
 	var newest *board.Intent
+	var newestCheck board.ExecutionCheck
 	for n := range g.Intents {
 		i := &g.Intents[n]
 		if i.To != nil || i.ConcludedAt != nil || i.Worker != nil || bootstrap(*i) || stepState[i.ID].Status == "abandoned" || len(stepState[i.ID].InvalidSources) > 0 {
 			continue
 		}
-		check, err := s.executionCheck(ctx, g, "explore", i, "")
+		check, err := s.candidateCheck(ctx, input, g, "explore", i)
 		if err != nil {
 			return false, err
 		}
@@ -566,11 +553,11 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 			}
 		}
 		if !local && (newest == nil || stepState[i.ID].Priority > stepState[newest.ID].Priority || (stepState[i.ID].Priority == stepState[newest.ID].Priority && i.CreatedAt > newest.CreatedAt)) {
-			newest = i
+			newest, newestCheck = i, check
 		}
 	}
 	if newest != nil {
-		return s.launch(ctx, g, "explore", newest, "")
+		return s.launch(ctx, g, "explore", newest, "", newestCheck)
 	}
 	return false, nil
 }
@@ -613,11 +600,7 @@ func (s *Scheduler) choose(project, kind string) *config.Worker {
 	}
 	return &candidates[0]
 }
-func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, intent *board.Intent, trigger string) (bool, error) {
-	check, err := s.executionCheck(ctx, g, kind, intent, "")
-	if err != nil {
-		return false, err
-	}
+func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, intent *board.Intent, trigger string, check board.ExecutionCheck) (bool, error) {
 	if check.Blocked {
 		return false, nil
 	}
@@ -658,10 +641,7 @@ func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, inte
 	// a long current turn reaches the boundary where soft conclusion begins.
 	t := &task{Job: worker.Job{RunID: id, Kind: kind, WorkerType: w.Type, Graph: g, Intent: intent, Budget: budget, Workspace: "/workspace", GraphRPC: w.Type != "mock", ResultContractVersion: 2, DecisionRevision: s.stateRevisions[g.Project.ID], EnvironmentID: s.environmentID(*w)}, Worker: *w, Lease: lease}
 	if kind == "reason" {
-		if err := s.prepareDecision(ctx, t, trigger); err != nil {
-			_ = s.Client.Do(ctx, "POST", s.leasePath(t)+"/release", map[string]string{"worker": lease.Run}, nil, nil)
-			return false, err
-		}
+		t.Job.DecisionTrigger = trigger
 	}
 	if err := s.register(ctx, t); err != nil {
 		_ = s.Client.Do(ctx, "POST", s.leasePath(t)+"/release", map[string]string{"worker": lease.Run}, nil, nil)
@@ -670,15 +650,29 @@ func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, inte
 	s.start(ctx, t)
 	return true, nil
 }
-func (s *Scheduler) runTask(ctx context.Context, t *task) (string, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+func (s *Scheduler) runTask(ctx context.Context, t *task) (outcome string, runErr error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	leaseCtx, stopLease := context.WithCancel(ctx)
 	heartbeatDone := make(chan struct{})
 	go func() { defer close(heartbeatDone); s.heartbeat(leaseCtx, t, cancel) }()
 	defer func() {
 		stopLease()
 		<-heartbeatDone
+		// Invalidation can interrupt startup, a model call, or recovery backoff.
+		// Reconcile once after the heartbeat stops, before releasing this lease.
+		if cause := context.Cause(ctx); outcome != "failed" && outcome != "success" && decisionStateChanged(cause) && (t.Root == nil || t.Root.Err() == nil) {
+			committed, err := s.decisionCommitted(ctx, t)
+			switch {
+			case committed:
+				outcome, runErr = "success", nil
+			case err != nil:
+				outcome, runErr = "interrupted", err
+			default:
+				s.terminal(t, "failed", worker.Result{Status: "failed", FailureKind: "state_changed", Error: cause.Error()})
+				outcome, runErr = "failed", cause
+			}
+		}
 		releaseCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
 		defer c()
 		_ = s.Client.Do(releaseCtx, "POST", s.leasePath(t)+"/release", map[string]string{"worker": t.Lease.Run}, nil, nil)
@@ -700,7 +694,15 @@ func (s *Scheduler) leasePath(t *task) string {
 	}
 	return base + "/intents/" + t.Lease.Intent
 }
-func (s *Scheduler) heartbeat(ctx context.Context, t *task, cancel context.CancelFunc) {
+func (s *Scheduler) renewLease(ctx context.Context, t *task) error {
+	body := map[string]string{"worker": t.Lease.Run}
+	if t.Job.Kind == "reason" && t.Job.Decision != nil && t.Job.Decision.Version == 2 {
+		body["expected_version"] = t.Job.Decision.StateVersion
+	}
+	return s.Client.Do(ctx, "POST", s.leasePath(t)+"/heartbeat", body, nil, &t.Lease)
+}
+
+func (s *Scheduler) heartbeat(ctx context.Context, t *task, cancel context.CancelCauseFunc) {
 	interval := time.Duration(s.Config.Runtime.Interval) * time.Second
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
@@ -718,7 +720,7 @@ func (s *Scheduler) heartbeat(ctx context.Context, t *task, cancel context.Cance
 			// Server into a hard cancellation after only two heartbeat intervals.
 			// Stop before the actual Server lease expires, including queue time.
 			callCtx, c := context.WithDeadline(ctx, last.Add(timeout-interval))
-			err := s.Client.Do(callCtx, "POST", s.leasePath(t)+"/heartbeat", map[string]string{"worker": t.Lease.Run}, nil, &t.Lease)
+			err := s.renewLease(callCtx, t)
 			c()
 			if ctx.Err() != nil {
 				return
@@ -737,11 +739,14 @@ func (s *Scheduler) heartbeat(ctx context.Context, t *task, cancel context.Cance
 					case <-ctx.Done():
 						timer.Stop()
 					case <-timer.C:
-						cancel()
+						cancel(err)
 					}
 					return
 				}
-				cancel()
+				if decisionStateChanged(err) {
+					slog.Info("decision input changed; cancelling stale run", "project", t.Job.Graph.Project.ID, "run", t.Job.RunID)
+				}
+				cancel(err)
 				return
 			}
 		}

@@ -11,17 +11,6 @@ import (
 type Direction struct {
 	From        []string `json:"from"`
 	Description string   `json:"description"`
-	payload     map[string]json.RawMessage
-}
-
-// Input preserves Cairn's contract boundary: reason verifies the two required
-// keys, while the Server validates field types, sources and graph state. This
-// lets a bad direction fail independently of valid siblings in the same batch.
-func (d Direction) Input() map[string]any {
-	if d.payload != nil {
-		return map[string]any{"from": d.payload["from"], "description": d.payload["description"]}
-	}
-	return map[string]any{"from": d.From, "description": d.Description}
 }
 
 type Result struct {
@@ -83,7 +72,6 @@ func direction(raw json.RawMessage) (Direction, error) {
 	}
 	_ = json.Unmarshal(m["from"], &d.From)
 	_ = json.Unmarshal(m["description"], &d.Description)
-	d.payload = m
 	return d, nil
 }
 
@@ -97,7 +85,12 @@ func Parse(output, kind string, conclude bool, openIntents, maxIntents int) (Res
 	if err != nil {
 		return Result{}, err
 	}
+	return parseObject(m, kind, conclude, openIntents, maxIntents)
+}
+
+func parseObject(m map[string]json.RawMessage, kind string, conclude bool, openIntents, maxIntents int) (Result, error) {
 	data := m
+	var err error
 	var accepted bool
 	wrapped := false
 	if raw, ok := m["accepted"]; ok && json.Unmarshal(raw, &accepted) == nil && string(raw) != "null" {

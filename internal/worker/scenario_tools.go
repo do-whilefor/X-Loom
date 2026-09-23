@@ -22,9 +22,6 @@ func cvssTool() agent.Tool {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		if err := agent.ValidateArguments(definition.Schema, raw); err != nil {
-			return "", err
-		}
 		var input struct {
 			Vector string `json:"vector"`
 		}

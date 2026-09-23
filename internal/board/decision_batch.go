@@ -285,11 +285,8 @@ func (t *Tx) decisionBatch(project string, fence ExecutionFence, batch DecisionB
 		if resolveErr != nil {
 			return out, resolveErr
 		}
-		state, err = t.State(project)
-		if err != nil {
-			return out, err
-		}
-		result, actionErr := t.StateAction(project, fence, StateAction{Op: action.Op, Payload: payload, IdempotencyKey: fmt.Sprintf("decision:%s:%d", fence.Run, n), ExpectedVersion: DecisionStateVersion(state)})
+		before := state
+		result, actionErr := t.stateAction(&state, fence, StateAction{Op: action.Op, Payload: payload, IdempotencyKey: fmt.Sprintf("decision:%s:%d", fence.Run, n)})
 		if actionErr != nil {
 			var api *APIError
 			if errors.As(actionErr, &api) {
@@ -298,7 +295,7 @@ func (t *Tx) decisionBatch(project string, fence ExecutionFence, batch DecisionB
 			return out, fmt.Errorf("decision action %d (%s): %w", n+1, action.Op, actionErr)
 		}
 		if !commit && action.Op == "complete" {
-			out.CompletionReview, err = buildCompletionReview(state, batch.ExpectedVersion, payload, MaxCompletionReviewBytes)
+			out.CompletionReview, err = buildCompletionReview(before, batch.ExpectedVersion, payload, MaxCompletionReviewBytes)
 			if err != nil {
 				return out, err
 			}
@@ -310,10 +307,6 @@ func (t *Tx) decisionBatch(project string, fence ExecutionFence, batch DecisionB
 		if action.Ref != "" {
 			out.IDs[action.Ref] = result.ID
 		}
-	}
-	state, err = t.State(project)
-	if err != nil {
-		return out, err
 	}
 	out.StateVersion = DecisionStateVersion(state)
 	if !commit {
@@ -340,7 +333,7 @@ func (t *Tx) decisionBatch(project string, fence ExecutionFence, batch DecisionB
 	// its planner lease now; process cancellation happens outside this transaction.
 	if state.Graph.Project.Reason != nil && state.Graph.Project.Reason.Worker == fence.Run {
 		state.Graph.Project.Reason = nil
-		if err = t.Save(state.Graph); err != nil {
+		if _, err = t.Exec("UPDATE projects SET reason_worker=NULL,reason_trigger=NULL,reason_started_at=NULL,reason_last_heartbeat_at=NULL WHERE id=?", project); err != nil {
 			return out, err
 		}
 	}

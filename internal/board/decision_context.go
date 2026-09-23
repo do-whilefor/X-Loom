@@ -3,7 +3,6 @@ package board
 import (
 	"encoding/json"
 	"errors"
-	"reflect"
 	"sort"
 )
 
@@ -44,84 +43,8 @@ type decisionView struct {
 	Overview         *contextOverview `json:"overview"`
 }
 
-// BuildDecisionContext narrows a Decide input around changes and their support.
-// Events validate the revision interval and locate transient changes; snapshot
-// comparison also catches legacy writes that do not emit graph events. Missing
-// history and an oversized dependency closure use the existing bounded view.
-func BuildDecisionContext(current State, previous *State, events []StateEvent, maxBytes int) (*DecisionContext, error) {
-	if maxBytes <= 0 {
-		maxBytes = DefaultContextViewBytes
-	}
-	baseline, err := ContextView(current, "", maxBytes)
-	if err != nil {
-		return nil, err
-	}
-	result := &DecisionContext{Version: 1, StateVersion: DecisionStateVersion(current), View: baseline, Mode: "full", ToRevision: current.Revision, Generation: current.Graph.Project.Generation, BaselineBytes: len(baseline)}
-	var changed, removed decisionChanges
-	fallback := func(reason string) (*DecisionContext, error) {
-		view, err := decisionFallbackView(current, baseline, changed, removed, maxBytes)
-		if err != nil {
-			return nil, err
-		}
-		result.View = view
-		result.Fallback = reason
-		return result, nil
-	}
-	if previous == nil {
-		return fallback("no_baseline")
-	}
-	result.FromRevision = previous.Revision
-	if previous.Graph.Project.ID != current.Graph.Project.ID {
-		return fallback("project_changed")
-	}
-	if previous.Graph.Project.Generation != current.Graph.Project.Generation {
-		return fallback("generation_changed")
-	}
-	if previous.Revision > current.Revision || previous.Revision < 0 {
-		return fallback("invalid_cursor")
-	}
-	span := current.Revision - previous.Revision
-	if span > 1000 && int64(len(events)) < span {
-		return fallback("event_limit")
-	}
-	if int64(len(events)) != span {
-		return fallback("event_gap")
-	}
-	ordered := append([]StateEvent{}, events...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Revision < ordered[j].Revision })
-	for i, event := range ordered {
-		if event.Revision != previous.Revision+int64(i)+1 {
-			return fallback("event_gap")
-		}
-	}
-
-	current = contextState(current)
-	before := contextState(*previous)
-	changed, removed = decisionChanges{}, decisionChanges{}
-	facts, oldFacts := decisionIndex(current.FactRecords, func(v FactRecord) string { return v.ID }), decisionIndex(before.FactRecords, func(v FactRecord) string { return v.ID })
-	goals := decisionIndex(current.Goals, func(v Goal) string { return v.ID })
-	steps := decisionIndex(current.Steps, func(v Step) string { return v.ID })
-	findings := decisionIndex(current.Findings, func(v Finding) string { return v.ID })
-	relations := decisionIndex(current.FactRelations, decisionRelationKey)
-	decisionDiff("fact_records", facts, oldFacts, changed, removed)
-	decisionDiff("goals", goals, decisionIndex(before.Goals, func(v Goal) string { return v.ID }), changed, removed)
-	decisionDiff("steps", steps, decisionIndex(before.Steps, func(v Step) string { return v.ID }), changed, removed)
-	decisionDiff("findings", findings, decisionIndex(before.Findings, func(v Finding) string { return v.ID }), changed, removed)
-	decisionDiff("fact_relations", relations, decisionIndex(before.FactRelations, decisionRelationKey), changed, removed)
-	decisionDiff("hints", decisionIndex(current.Graph.Hints, func(v Hint) string { return v.ID }), decisionIndex(before.Graph.Hints, func(v Hint) string { return v.ID }), changed, removed)
-	decisionDiff("facts", decisionIndex(current.Graph.Facts, func(v Fact) string { return v.ID }), decisionIndex(before.Graph.Facts, func(v Fact) string { return v.ID }), changed, removed)
-	project, oldProject := current.Graph.Project, before.Graph.Project
-	project.Reason, oldProject.Reason = nil, nil // Lease/heartbeat activity is not evidence.
-	if !reflect.DeepEqual(project, oldProject) {
-		changed["project"] = []string{project.ID}
-	}
-
-	return buildDecisionChanges(current, baseline, result, changed, removed, ordered, before.FactRelations, maxBytes)
-}
-
-// The view is built from the current FGS. Previous relations are used only by
-// the legacy snapshot-comparison entry point for removed edges.
-func buildDecisionChanges(current State, baseline json.RawMessage, result *DecisionContext, changed, removed decisionChanges, ordered []StateEvent, previousRelations []FactRelation, maxBytes int) (*DecisionContext, error) {
+// Build the view from the current FGS and the cursor's event index.
+func buildDecisionChanges(current State, baseline json.RawMessage, result *DecisionContext, changed decisionChanges, ordered []StateEvent, maxBytes int) (*DecisionContext, error) {
 	current = contextState(current)
 	project := current.Graph.Project
 	project.Reason = nil
@@ -129,9 +52,8 @@ func buildDecisionChanges(current State, baseline json.RawMessage, result *Decis
 	goals := decisionIndex(current.Goals, func(v Goal) string { return v.ID })
 	steps := decisionIndex(current.Steps, func(v Step) string { return v.ID })
 	findings := decisionIndex(current.Findings, func(v Finding) string { return v.ID })
-	relations := decisionIndex(current.FactRelations, decisionRelationKey)
 	fallback := func(reason string) (*DecisionContext, error) {
-		view, err := decisionFallbackView(current, baseline, changed, removed, maxBytes)
+		view, err := decisionFallbackView(current, baseline, changed, maxBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -139,30 +61,17 @@ func buildDecisionChanges(current State, baseline json.RawMessage, result *Decis
 		return result, nil
 	}
 	selectedFacts, selectedGoals, selectedSteps, selectedFindings := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
-	seed := func(changes decisionChanges) {
-		for _, id := range append(append([]string{}, changes["facts"]...), changes["fact_records"]...) {
-			selectedFacts[id] = true
-		}
-		for _, id := range changes["goals"] {
-			selectedGoals[id] = true
-		}
-		for _, id := range changes["steps"] {
-			selectedSteps[id] = true
-		}
-		for _, id := range changes["findings"] {
-			selectedFindings[id] = true
-		}
+	for _, id := range changed["fact_records"] {
+		selectedFacts[id] = true
 	}
-	seed(changed)
-	seed(removed)
-	for _, key := range changed["fact_relations"] {
-		relation := relations[key]
-		selectedFacts[relation.Source], selectedFacts[relation.Target] = true, true
+	for _, id := range changed["goals"] {
+		selectedGoals[id] = true
 	}
-	oldRelations := decisionIndex(previousRelations, decisionRelationKey)
-	for _, key := range removed["fact_relations"] {
-		relation := oldRelations[key]
-		selectedFacts[relation.Source], selectedFacts[relation.Target] = true, true
+	for _, id := range changed["steps"] {
+		selectedSteps[id] = true
+	}
+	for _, id := range changed["findings"] {
+		selectedFindings[id] = true
 	}
 	for _, event := range ordered {
 		if event.ID != "" {
@@ -272,7 +181,7 @@ func buildDecisionChanges(current State, baseline json.RawMessage, result *Decis
 		}
 	}
 
-	view := decisionView{Version: 1, Revision: current.Revision, DecisionRevision: current.DecisionRevision, Generation: project.Generation, FromRevision: result.FromRevision, Project: project, UserInputs: []Fact{}, Hints: append([]Hint{}, current.Graph.Hints...), Goals: []Goal{}, Steps: []Step{}, Facts: []FactRecord{}, Findings: []Finding{}, Relations: []FactRelation{}, Changed: changed, Removed: removed, Omitted: map[string]int{}, ReadMore: "Read omitted nodes and evidence using read_graph with ids. Omission is not absence; reads are pinned to state_version. Missing or ambiguous producers are not inferred."}
+	view := decisionView{Version: 1, Revision: current.Revision, DecisionRevision: current.DecisionRevision, Generation: project.Generation, FromRevision: result.FromRevision, Project: project, UserInputs: []Fact{}, Hints: append([]Hint{}, current.Graph.Hints...), Goals: []Goal{}, Steps: []Step{}, Facts: []FactRecord{}, Findings: []Finding{}, Relations: []FactRelation{}, Changed: changed, Removed: decisionChanges{}, Omitted: map[string]int{}, ReadMore: "Read omitted nodes and evidence using read_graph with ids. Omission is not absence; reads are pinned to state_version. Missing or ambiguous producers are not inferred."}
 	// The same bounded discovery index accompanies full and incremental bodies.
 	// Keeping the latter narrow must not erase unrelated historical knowledge.
 	var overview struct {
@@ -369,27 +278,6 @@ func decisionIndex[T any](items []T, key func(T) string) map[string]T {
 	return out
 }
 
-func decisionDiff[T any](kind string, current, previous map[string]T, changed, removed decisionChanges) {
-	for id, item := range current {
-		old, ok := previous[id]
-		if !ok || !reflect.DeepEqual(item, old) {
-			changed[kind] = append(changed[kind], id)
-		}
-	}
-	for id := range previous {
-		if _, ok := current[id]; !ok {
-			removed[kind] = append(removed[kind], id)
-		}
-	}
-	sort.Strings(changed[kind])
-	sort.Strings(removed[kind])
-}
-
-func decisionRelationKey(relation FactRelation) string {
-	key, _ := json.Marshal([]string{relation.Kind, relation.Source, relation.Target})
-	return string(key)
-}
-
 func decisionRelationClosure(relations []FactRelation, selected map[string]bool) {
 	for {
 		count := len(selected)
@@ -405,9 +293,8 @@ func decisionRelationClosure(relations []FactRelation, selected map[string]bool)
 }
 
 // Changes are also an index, so large revisions must not force an unbounded
-// payload. Current nodes remain discoverable through the overview pages;
-// removals have explicit counts because live pages cannot restore their bodies.
-func decisionFallbackView(state State, baseline json.RawMessage, changed, removed decisionChanges, maxBytes int) (json.RawMessage, error) {
+// payload. Current nodes remain discoverable through the overview pages.
+func decisionFallbackView(state State, baseline json.RawMessage, changed decisionChanges, maxBytes int) (json.RawMessage, error) {
 	metadata := struct {
 		Changed        decisionChanges `json:"changed"`
 		Removed        decisionChanges `json:"removed"`
@@ -419,39 +306,31 @@ func decisionFallbackView(state State, baseline json.RawMessage, changed, remove
 		metadata.Changed[kind] = []string{}
 		metadata.ChangedOmitted[kind] = len(ids)
 	}
-	for kind, ids := range removed {
-		metadata.Removed[kind] = []string{}
-		metadata.RemovedOmitted[kind] = len(ids)
-	}
 	index, _ := json.Marshal(metadata)
 	used := len(index)
 	if used > maxBytes/4 {
 		return nil, errors.New("decision context: change index exceeds the budget")
 	}
-	appendIDs := func(source, dest decisionChanges, omitted map[string]int) {
-		keys := make([]string, 0, len(source))
-		for kind := range source {
-			keys = append(keys, kind)
-		}
-		sort.Strings(keys)
-		for _, kind := range keys {
-			for _, id := range source[kind] {
-				raw, _ := json.Marshal(id)
-				extra := len(raw)
-				if len(dest[kind]) > 0 {
-					extra++
-				}
-				if used+extra > maxBytes/4 {
-					continue
-				}
-				dest[kind] = append(dest[kind], id)
-				omitted[kind]--
-				used += extra
+	keys := make([]string, 0, len(changed))
+	for kind := range changed {
+		keys = append(keys, kind)
+	}
+	sort.Strings(keys)
+	for _, kind := range keys {
+		for _, id := range changed[kind] {
+			raw, _ := json.Marshal(id)
+			extra := len(raw)
+			if len(metadata.Changed[kind]) > 0 {
+				extra++
 			}
+			if used+extra > maxBytes/4 {
+				continue
+			}
+			metadata.Changed[kind] = append(metadata.Changed[kind], id)
+			metadata.ChangedOmitted[kind]--
+			used += extra
 		}
 	}
-	appendIDs(removed, metadata.Removed, metadata.RemovedOmitted)
-	appendIDs(changed, metadata.Changed, metadata.ChangedOmitted)
 	index, _ = json.Marshal(metadata)
 	// Merge two nonempty JSON objects by replacing their adjacent braces with
 	// a comma. Reserve the bounded index before choosing history bodies.

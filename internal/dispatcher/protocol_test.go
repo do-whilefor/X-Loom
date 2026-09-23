@@ -58,7 +58,7 @@ func TestNewJobsRegisterTheCurrentResultProtocol(t *testing.T) {
 					}
 					graph.Intents = append(graph.Intents, *intent)
 				}
-				started, err := scheduler.launch(ctx, graph, kind, intent, "initial")
+				started, err := scheduler.launch(ctx, graph, kind, intent, "initial", board.ExecutionCheck{})
 				if err != nil || !started {
 					t.Fatalf("launch: started=%v, err=%v", started, err)
 				}

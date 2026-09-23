@@ -91,6 +91,85 @@ func TestExecutionPendingKeysetExcludesHistoryAndKeepsCleanup(t *testing.T) {
 	})
 }
 
+func TestExecuteCheckOmitsDecisionBoundary(t *testing.T) {
+	s := executionQueryStore(t)
+	executionQueryTx(t, s, func(tx *Tx) {
+		putQueryExecution(t, tx, Execution{ID: "decided", Status: "succeeded"}, 0, "")
+		for _, kind := range []string{"bootstrap", "explore", "reason"} {
+			check, err := tx.CheckExecutions(ExecutionCheckQuery{ProjectID: "p", Namespace: "ns", Kind: kind, Intent: "step", RetryKey: kind + ":step"})
+			if err != nil || (check.LatestDecision != nil) != (kind == "reason") {
+				t.Fatalf("%s decision boundary=%+v, error=%v", kind, check.LatestDecision, err)
+			}
+		}
+	})
+}
+
+func TestScheduleExecutionChecksMatchIndividualAdmission(t *testing.T) {
+	s := executionQueryStore(t)
+	executionQueryTx(t, s, func(tx *Tx) {
+		intents := []Intent{{ID: "new"}, {ID: "pending"}, {ID: "failed"}, {ID: "granted"}, {ID: "foreign"}, {ID: "old-round"}, {ID: "boot", Description: "bootstrap", Creator: "dispatcher.bootstrap", From: []string{"origin"}}}
+		for _, e := range []Execution{
+			{ID: "p", Kind: "explore", Intent: "pending", RetryKey: "another-key", Status: "result_pending"},
+			{ID: "f", Kind: "explore", Intent: "failed", RetryKey: "explore:failed", Status: "failed"},
+			{ID: "g0", Kind: "explore", Intent: "granted", RetryKey: "explore:granted", Status: "failed"},
+			{ID: "g1", Kind: "explore", Intent: "granted", RetryKey: "other-key", Status: "retry_requested"},
+			{ID: "g2", Kind: "explore", Intent: "granted", RetryKey: "third-key", Status: "retry_requested"},
+			{ID: "other", Namespace: "elsewhere", Kind: "explore", Intent: "foreign", RetryKey: "explore:foreign", Status: "running"},
+			{ID: "old", Kind: "explore", Intent: "old-round", RetryKey: "explore:old-round", Status: "running"},
+			{ID: "b", Kind: "bootstrap", Intent: "boot", RetryKey: "bootstrap:boot", Status: "failed"},
+		} {
+			putQueryExecution(t, tx, e, 0, "")
+		}
+		checks, err := tx.ScheduleExecutionChecks("p", "ns", intents, nil)
+		if err != nil || len(checks) != len(intents) {
+			t.Fatalf("checks=%+v err=%v", checks, err)
+		}
+		for _, i := range intents {
+			kind := "explore"
+			if i.ID == "boot" {
+				kind = "bootstrap"
+			}
+			key := kind + ":" + i.ID
+			want, err := tx.CheckExecutions(ExecutionCheckQuery{ProjectID: "p", Namespace: "ns", Generation: 1, Kind: kind, Intent: i.ID, RetryKey: key})
+			got := checks[key]
+			if err != nil || got.Pending != want.Pending || got.Blocked != want.Blocked || got.PreviousRunID != want.PreviousRunID {
+				t.Fatalf("%s batch=%+v individual=%+v err=%v", key, got, want, err)
+			}
+		}
+		if checks["explore:granted"].PreviousRunID != "g2" {
+			t.Fatal("lost retry-grant tie ordering")
+		}
+		checks, err = tx.ScheduleExecutionChecks("p", "ns", nil, nil)
+		if err != nil || len(checks) != 0 {
+			t.Fatalf("empty page=%+v err=%v", checks, err)
+		}
+	})
+}
+
+func TestScheduleExecutionChecksSkipUnavailableHistory(t *testing.T) {
+	s := executionQueryStore(t)
+	executionQueryTx(t, s, func(tx *Tx) {
+		intents := []Intent{{ID: "done", To: Ptr("fact")}, {ID: "ended", ConcludedAt: Ptr("now")}, {ID: "working", Worker: Ptr("worker")}, {ID: "abandoned"}, {ID: "invalid"}}
+		steps := []Step{{ID: "abandoned", Status: "abandoned"}, {ID: "invalid", InvalidSources: []string{"withdrawn"}}}
+		boot := Intent{ID: "boot", Description: "bootstrap", Creator: "dispatcher.bootstrap", From: []string{"origin"}, Worker: Ptr("worker")}
+		checks, err := tx.ScheduleExecutionChecks("p", "ns", append(intents, boot), steps)
+		if err != nil || len(checks) != 1 {
+			t.Fatalf("bootstrap retry must remain visible: %+v err=%v", checks, err)
+		}
+		if _, ok := checks["bootstrap:boot"]; !ok {
+			t.Fatal("missing bootstrap check")
+		}
+		// An all-history page does not query the registry at all.
+		if _, err := tx.Exec("DROP TABLE xloom_executions"); err != nil {
+			t.Fatal(err)
+		}
+		checks, err = tx.ScheduleExecutionChecks("p", "ns", intents, steps)
+		if err != nil || len(checks) != 0 {
+			t.Fatalf("history triggered registry work: %+v err=%v", checks, err)
+		}
+	})
+}
+
 func TestExecutionCheckPreservesGrantsPendingAndAttemptAllowance(t *testing.T) {
 	s := executionQueryStore(t)
 	executionQueryTx(t, s, func(tx *Tx) {

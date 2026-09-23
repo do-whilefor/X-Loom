@@ -117,14 +117,32 @@ type StateEvent struct {
 }
 type stateData struct {
 	Goals         []Goal         `json:"goals"`
-	Steps         []Step         `json:"steps"`
+	Steps         []stepMetadata `json:"steps"`
 	Facts         []FactRecord   `json:"facts"`
 	Findings      []Finding      `json:"findings"`
 	FactRelations []FactRelation `json:"fact_relations"`
 }
 
+// Keep the legacy status key for rollback readers, but persist only the one
+// status not projected from the authoritative Intent and execution records.
+type stepMetadata struct {
+	ID       string `json:"id"`
+	GoalID   string `json:"goal_id"`
+	Priority int    `json:"priority"`
+	Reason   string `json:"reason,omitempty"`
+	Status   string `json:"status,omitempty"`
+}
+
+func stepMetadataFrom(step Step) stepMetadata {
+	metadata := stepMetadata{ID: step.ID, GoalID: step.GoalID, Priority: step.Priority, Reason: step.Reason}
+	if step.Status == "abandoned" {
+		metadata.Status = "abandoned"
+	}
+	return metadata
+}
+
 func (t *Tx) stateData(project string) (stateData, int64, int64, error) {
-	d := stateData{Goals: []Goal{}, Steps: []Step{}, Facts: []FactRecord{}, Findings: []Finding{}, FactRelations: []FactRelation{}}
+	d := stateData{Goals: []Goal{}, Steps: []stepMetadata{}, Facts: []FactRecord{}, Findings: []Finding{}, FactRelations: []FactRelation{}}
 	var raw string
 	var revision, decision int64
 	err := t.QueryRow("SELECT data,revision,decision_revision FROM xloom_state WHERE project_id=?", project).Scan(&raw, &revision, &decision)
@@ -133,6 +151,11 @@ func (t *Tx) stateData(project string) (stateData, int64, int64, error) {
 	}
 	if err == nil {
 		err = json.Unmarshal([]byte(raw), &d)
+		for n := range d.Steps {
+			if d.Steps[n].Status != "abandoned" {
+				d.Steps[n].Status = ""
+			}
+		}
 	}
 	return d, revision, decision, err
 }
@@ -308,11 +331,10 @@ func executionFailureDescription(status string, raw json.RawMessage) string {
 }
 
 func (t *Tx) recordExecutionFailure(e Execution, status string, failure json.RawMessage) error {
-	d, revision, decision, err := t.stateData(e.ProjectID)
+	d, _, _, err := t.stateData(e.ProjectID)
 	if err != nil {
 		return err
 	}
-	revision++
 	triggerDecision := true
 	for _, step := range d.Steps {
 		if step.ID == e.Intent && step.Status == "abandoned" {
@@ -321,20 +343,29 @@ func (t *Tx) recordExecutionFailure(e Execution, status string, failure json.Raw
 			triggerDecision = false
 		}
 	}
-	if triggerDecision {
-		decision++
-	}
-	raw, err := json.Marshal(d)
+	revision, err := t.advanceStateRevision(e.ProjectID, triggerDecision)
 	if err != nil {
-		return err
-	}
-	if _, err = t.Exec("INSERT INTO xloom_state(project_id,data,revision,decision_revision) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET data=excluded.data,revision=excluded.revision,decision_revision=excluded.decision_revision", e.ProjectID, string(raw), revision, decision); err != nil {
 		return err
 	}
 	detail, _ := json.Marshal(map[string]any{"run_id": e.ID, "status": status, "reason": executionFailureDescription(status, failure), "result": failure})
 	event, _ := json.Marshal(StateEvent{Revision: revision, Op: "execution_failed", ID: e.Intent, RunID: e.Lease, CreatedAt: t.Now, Payload: detail, Result: detail})
 	_, err = t.Exec("INSERT INTO xloom_state_events(project_id,revision,event) VALUES(?,?,?)", e.ProjectID, revision, string(event))
 	return err
+}
+
+// Event-only changes preserve metadata byte-for-byte, including unknown fields
+// retained by older databases. The surrounding transaction owns the event too.
+func (t *Tx) advanceStateRevision(project string, decisionChange bool) (int64, error) {
+	increment := 0
+	if decisionChange {
+		increment = 1
+	}
+	var revision int64
+	err := t.QueryRow(`INSERT INTO xloom_state(project_id,data,revision,decision_revision)
+		VALUES(?,'{"goals":[],"steps":[],"facts":[],"findings":[],"fact_relations":[]}',1,?)
+		ON CONFLICT(project_id) DO UPDATE SET revision=revision+1,decision_revision=decision_revision+excluded.decision_revision
+		RETURNING revision`, project, increment).Scan(&revision)
+	return revision, err
 }
 
 func (s State) ValidateFactSources(ids []string, requireObservation bool) error {
@@ -414,6 +445,15 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 	if err != nil {
 		return StateActionResult{}, err
 	}
+	return t.stateAction(&s, fence, action)
+}
+
+// A batch owns this snapshot for one transaction and replaces it only after a
+// successful action. Each next action sees the persisted result of its parent.
+func (t *Tx) stateAction(snapshot *State, fence ExecutionFence, action StateAction) (StateActionResult, error) {
+	s := *snapshot
+	project := s.Graph.Project.ID
+	var err error
 	if err = s.Graph.RequireActive(); err != nil {
 		return StateActionResult{}, err
 	}
@@ -458,8 +498,12 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 	if !errors.Is(err, sql.ErrNoRows) {
 		return StateActionResult{}, err
 	}
-	if err = t.CheckDecisionStateVersion(s, fence, action.ExpectedVersion); err != nil {
-		return StateActionResult{}, err
+	// The batch already checked its caller's version under this transaction's
+	// write reservation. Its own successive versions need no Job revalidation.
+	if !t.inDecisionBatch {
+		if err = t.CheckDecisionStateVersion(s, fence, action.ExpectedVersion); err != nil {
+			return StateActionResult{}, err
+		}
 	}
 	d, _, _, err := t.stateData(project)
 	if err != nil {
@@ -534,10 +578,14 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 		return StateActionResult{}, err
 	}
 	if !changed {
+		*snapshot = current
 		return out, nil
 	}
 	event, _ := json.Marshal(StateEvent{Revision: s.Revision, Op: action.Op, ID: id, RunID: fence.Run, CreatedAt: t.Now, Payload: action.Payload, Result: resultJSON})
 	_, err = t.Exec("INSERT INTO xloom_state_events(project_id,revision,event) VALUES(?,?,?)", project, s.Revision, string(event))
+	if err == nil {
+		*snapshot = current
+	}
 	return out, err
 }
 
@@ -572,7 +620,8 @@ func (t *Tx) addStateFact(s *State, d *stateData, fence ExecutionFence, raw json
 	f := FactRecord{ID: id, Description: strings.TrimSpace(input.Description), Scope: strings.TrimSpace(input.Scope), ObservedAt: observed.UTC().Format(time.RFC3339Nano), Evidence: input.Evidence, Status: "valid", RunID: fence.Run, SourceStepID: fence.Intent}
 	d.Facts = append(d.Facts, f)
 	s.Graph.Facts = append(s.Graph.Facts, Fact{ID: id, Description: f.Description})
-	return id, f, t.Save(s.Graph)
+	_, err = t.Exec("INSERT OR IGNORE INTO facts(id,project_id,description) VALUES(?,?,?)", id, s.Graph.Project.ID, f.Description)
+	return id, f, err
 }
 
 func (t *Tx) addFactRelation(s State, d *stateData, fence ExecutionFence, raw json.RawMessage) (string, any, bool, error) {
@@ -863,9 +912,10 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 			return "", nil, false, err
 		}
 		step := Step{ID: id, From: input.From, GoalID: input.GoalID, Description: strings.TrimSpace(input.Description), Status: "open", Priority: input.Priority, CreatedAt: t.Now}
-		d.Steps = append(d.Steps, step)
-		s.Graph.Intents = append(s.Graph.Intents, Intent{ID: id, From: input.From, Description: step.Description, Creator: fence.Run, CreatedAt: t.Now})
-		return id, step, true, t.Save(s.Graph)
+		d.Steps = append(d.Steps, stepMetadataFrom(step))
+		intent := Intent{ID: id, From: input.From, Description: step.Description, Creator: fence.Run, CreatedAt: t.Now}
+		s.Graph.Intents = append(s.Graph.Intents, intent)
+		return id, step, true, t.saveIntent(s.Graph.Project.ID, intent)
 	}
 	if !slices.Contains([]string{"priority", "abandon"}, input.Action) || !required(input.Reason, 8192) || input.GoalID != "" || len(input.From) != 0 || input.Description != "" {
 		return "", nil, false, Err(422, "step change requires a reason; existing task inputs are immutable")
@@ -901,20 +951,20 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 					}
 				}
 				i.Worker, current.Worker, i.ConcludedAt = nil, nil, Ptr(t.Now)
-			}
-			if err := t.Save(s.Graph); err != nil {
-				return "", nil, false, err
+				if _, err := t.Exec("UPDATE intents SET worker=NULL,concluded_at=? WHERE project_id=? AND id=?", t.Now, s.Graph.Project.ID, i.ID); err != nil {
+					return "", nil, false, err
+				}
 			}
 		}
 		found := false
 		for n := range d.Steps {
 			if d.Steps[n].ID == current.ID {
-				d.Steps[n] = current
+				d.Steps[n] = stepMetadataFrom(current)
 				found = true
 			}
 		}
 		if !found {
-			d.Steps = append(d.Steps, current)
+			d.Steps = append(d.Steps, stepMetadataFrom(current))
 		}
 		return current.ID, current, true, nil
 	}
@@ -922,7 +972,7 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 }
 
 func (t *Tx) StateEvents(project string, after int64) ([]StateEvent, error) {
-	if _, err := t.Load(project); err != nil {
+	if err := t.RequireProject(project); err != nil {
 		return nil, err
 	}
 	rows, err := t.Query("SELECT event FROM xloom_state_events WHERE project_id=? AND revision>? ORDER BY revision LIMIT 1000", project, after)

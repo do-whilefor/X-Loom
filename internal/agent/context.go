@@ -17,14 +17,17 @@ const DefaultSummaryMaxTokens = 16384
 // ContextCheckpoint is saved atomically with History. Detailed earlier
 // checkpoints remain in the append-only event log, not in the model context.
 type ContextCheckpoint struct {
-	Version         int               `json:"version"`
-	LastSequence    uint64            `json:"last_sequence"`
-	CompactionCount uint64            `json:"compaction_count"`
-	OverflowRetries int               `json:"overflow_retries"`
-	LastCompaction  *CompactionRecord `json:"last_compaction,omitempty"`
+	Version         int                   `json:"version"`
+	LastSequence    uint64                `json:"last_sequence"`
+	CompactionCount uint64                `json:"compaction_count"`
+	OverflowRetries int                   `json:"overflow_retries"`
+	LastCompaction  *CompactionCheckpoint `json:"last_compaction,omitempty"`
 }
 
-type CompactionRecord struct {
+// CompactionCheckpoint retains the metadata needed to continue compaction.
+// History already stores the current request view; older views remain in events.
+// Legacy checkpoint JSON may contain a view, which decoding safely ignores.
+type CompactionCheckpoint struct {
 	Version           int    `json:"version"`
 	ID                uint64 `json:"id"`
 	PreviousID        uint64 `json:"previous_id,omitempty"`
@@ -43,6 +46,10 @@ type CompactionRecord struct {
 	Usage                *Usage         `json:"usage,omitempty"`
 	Reason               string         `json:"reason"`
 	Status               string         `json:"status"`
+}
+
+type CompactionRecord struct {
+	CompactionCheckpoint
 	// View makes this event self-contained for request-view replay even after
 	// later compactions. Sequence 0 denotes synthetic pinned/summary messages.
 	View []Message `json:"view"`
@@ -284,7 +291,7 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 			}
 		}
 	}
-	attemptRecord := &CompactionRecord{Version: 1, ID: l.Checkpoint.CompactionCount + 1, PreviousID: previousID, SourceStart: sourceStart, SourceEnd: sourceEnd, AtSequence: l.Checkpoint.LastSequence, BeforeBytes: before, BeforeTokensEstimate: beforeTokens, TokenBasis: basis, Reason: "threshold", Status: "failed"}
+	attemptRecord := &CompactionRecord{CompactionCheckpoint: CompactionCheckpoint{Version: 1, ID: l.Checkpoint.CompactionCount + 1, PreviousID: previousID, SourceStart: sourceStart, SourceEnd: sourceEnd, AtSequence: l.Checkpoint.LastSequence, BeforeBytes: before, BeforeTokensEstimate: beforeTokens, TokenBasis: basis, Reason: "threshold", Status: "failed"}}
 	if force {
 		attemptRecord.Reason = "overflow"
 	}
@@ -327,7 +334,7 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 	if after >= before || after > target || (targetTokens > 0 && afterTokens > targetTokens) {
 		return budgetError("compaction did not produce a smaller request within the input budget")
 	}
-	record := &CompactionRecord{Version: 1, ID: l.Checkpoint.CompactionCount + 1, PreviousID: previousID, SourceStart: sourceStart, SourceEnd: sourceEnd, AtSequence: l.Checkpoint.LastSequence, Summary: text, BeforeBytes: before, AfterBytes: after, BeforeTokensEstimate: beforeTokens, AfterTokensEstimate: afterTokens, TokenBasis: basis + " -> " + afterBasis, Usage: summary.Usage, Reason: "threshold", Status: "committed", View: candidate}
+	record := &CompactionRecord{CompactionCheckpoint: CompactionCheckpoint{Version: 1, ID: l.Checkpoint.CompactionCount + 1, PreviousID: previousID, SourceStart: sourceStart, SourceEnd: sourceEnd, AtSequence: l.Checkpoint.LastSequence, Summary: text, BeforeBytes: before, AfterBytes: after, BeforeTokensEstimate: beforeTokens, AfterTokensEstimate: afterTokens, TokenBasis: basis + " -> " + afterBasis, Usage: summary.Usage, Reason: "threshold", Status: "committed"}, View: candidate}
 	record.Quotes = quotes
 	if force {
 		record.Reason = "overflow"
@@ -344,7 +351,8 @@ func (l *Loop) compactContext(ctx context.Context, force bool) (resultErr error)
 	oldHistory, oldCheckpoint := l.History, l.Checkpoint
 	copyCheckpoint := *l.Checkpoint
 	copyCheckpoint.CompactionCount = record.ID
-	copyCheckpoint.LastCompaction = record
+	metadata := record.CompactionCheckpoint
+	copyCheckpoint.LastCompaction = &metadata
 	l.History, l.Checkpoint = candidate, &copyCheckpoint
 	if err := l.saveState(); err != nil {
 		l.History, l.Checkpoint = oldHistory, oldCheckpoint

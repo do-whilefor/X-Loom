@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,title TEXT NOT NULL,stat
 CREATE TABLE IF NOT EXISTS facts(id TEXT NOT NULL,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,description TEXT NOT NULL,PRIMARY KEY(id,project_id));
 CREATE TABLE IF NOT EXISTS intents(id TEXT NOT NULL,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,to_fact_id TEXT,description TEXT NOT NULL,creator TEXT NOT NULL,worker TEXT,last_heartbeat_at TEXT,created_at TEXT NOT NULL,concluded_at TEXT,PRIMARY KEY(id,project_id));
 CREATE TABLE IF NOT EXISTS intent_sources(intent_id TEXT NOT NULL,project_id TEXT NOT NULL,fact_id TEXT NOT NULL,PRIMARY KEY(intent_id,project_id,fact_id),FOREIGN KEY(intent_id,project_id) REFERENCES intents(id,project_id) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS intent_sources_project ON intent_sources(project_id);
 CREATE TABLE IF NOT EXISTS hints(id TEXT NOT NULL,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,content TEXT NOT NULL,creator TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(id,project_id));
 CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY,value INTEGER NOT NULL DEFAULT 0);
 INSERT OR IGNORE INTO counters(name,value) VALUES('project',0);
@@ -283,27 +284,43 @@ func (t *Tx) Load(id string) (Graph, error) {
 	if err != nil {
 		return g, err
 	}
-	for n := range g.Intents {
-		rows, err = t.Query("SELECT fact_id FROM intent_sources WHERE project_id=? AND intent_id=? ORDER BY rowid", id, g.Intents[n].ID)
-		if err != nil {
+	intentIndex := make(map[string]int, len(g.Intents))
+	for n, intent := range g.Intents {
+		intentIndex[intent.ID] = n
+	}
+	rows, err = t.Query("SELECT intent_id,fact_id FROM intent_sources WHERE project_id=? ORDER BY rowid", id)
+	if err != nil {
+		return g, err
+	}
+	for rows.Next() {
+		var intent, fact string
+		if err = rows.Scan(&intent, &fact); err != nil {
+			rows.Close()
 			return g, err
 		}
-		for rows.Next() {
-			var fid string
-			if err = rows.Scan(&fid); err != nil {
-				rows.Close()
-				return g, err
-			}
-			g.Intents[n].From = append(g.Intents[n].From, fid)
+		if n, ok := intentIndex[intent]; ok {
+			g.Intents[n].From = append(g.Intents[n].From, fact)
 		}
-		err = rows.Err()
-		rows.Close()
-		if err != nil {
-			return g, err
-		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return g, err
 	}
 	return g, nil
 }
+
+func (t *Tx) RequireProject(project string) error {
+	var exists bool
+	if err := t.QueryRow("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?)", project).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return Err(404, "Project not found")
+	}
+	return nil
+}
+
 func (t *Tx) Save(g Graph) error {
 	p := g.Project
 	if p.Scenario != "" && !ValidScenario(p.Scenario) {
@@ -336,14 +353,21 @@ func (t *Tx) Save(g Graph) error {
 		}
 	}
 	for _, i := range g.Intents {
-		_, err = t.Exec(`INSERT INTO intents(id,project_id,to_fact_id,description,creator,worker,last_heartbeat_at,created_at,concluded_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id,project_id) DO UPDATE SET to_fact_id=excluded.to_fact_id,worker=excluded.worker,last_heartbeat_at=excluded.last_heartbeat_at,concluded_at=excluded.concluded_at`, i.ID, p.ID, i.To, i.Description, i.Creator, i.Worker, i.Heartbeat, i.CreatedAt, i.ConcludedAt)
-		if err != nil {
+		if err = t.saveIntent(p.ID, i); err != nil {
 			return err
 		}
-		for _, fid := range i.From {
-			if _, err = t.Exec("INSERT OR IGNORE INTO intent_sources(intent_id,project_id,fact_id) VALUES(?,?,?)", i.ID, p.ID, fid); err != nil {
-				return err
-			}
+	}
+	return nil
+}
+
+func (t *Tx) saveIntent(project string, i Intent) error {
+	_, err := t.Exec(`INSERT INTO intents(id,project_id,to_fact_id,description,creator,worker,last_heartbeat_at,created_at,concluded_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id,project_id) DO UPDATE SET to_fact_id=excluded.to_fact_id,worker=excluded.worker,last_heartbeat_at=excluded.last_heartbeat_at,concluded_at=excluded.concluded_at`, i.ID, project, i.To, i.Description, i.Creator, i.Worker, i.Heartbeat, i.CreatedAt, i.ConcludedAt)
+	if err != nil {
+		return err
+	}
+	for _, fid := range i.From {
+		if _, err = t.Exec("INSERT OR IGNORE INTO intent_sources(intent_id,project_id,fact_id) VALUES(?,?,?)", i.ID, project, fid); err != nil {
+			return err
 		}
 	}
 	return nil

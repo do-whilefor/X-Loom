@@ -3,9 +3,118 @@ package board
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"testing"
 )
+
+func TestDecisionBatchReusesPersistedTransitionsThroughCompletion(t *testing.T) {
+	f := newStateBenchmarkFixture(t, stateBenchmarkSize{16, 128, 2}, 2)
+	batch := DecisionBatch{ExpectedVersion: f.version, Actions: []DecisionAction{
+		{Op: "step", Payload: json.RawMessage(`{"action":"abandon","id":"active","reason":"finish this round"}`)},
+		{Op: "goal", Ref: "child", Payload: json.RawMessage(`{"action":"add","condition":"Review alternate path"}`)},
+		{Op: "step", Ref: "work", Payload: json.RawMessage(`{"action":"add","goal_id":"$child","from":["source000"],"description":"Check alternate path"}`)},
+		{Op: "step", Payload: json.RawMessage(`{"action":"abandon","id":"$work","reason":"alternative ruled out"}`)},
+		{Op: "goal", Payload: json.RawMessage(`{"action":"withdraw","id":"$child","reason":"alternative ruled out"}`)},
+		{Op: "complete", Payload: json.RawMessage(`{"from":["source001"],"description":"Fixture reviewed"}`)},
+	}}
+	if err := f.store.Do(context.Background(), func(tx *Tx) error {
+		preview, err := tx.PreviewDecision(stateBenchmarkProject, stateBenchmarkPlanner, batch)
+		if err != nil {
+			return err
+		}
+		if preview.Committed || preview.ChangedActions != 6 || preview.CompletionReview == nil {
+			t.Fatalf("preview did not see preceding actions: %+v", preview)
+		}
+		state, err := tx.State(stateBenchmarkProject)
+		if err != nil {
+			return err
+		}
+		if DecisionStateVersion(state) != f.version || state.Revision != 0 {
+			t.Fatal("preview escaped its savepoint")
+		}
+		result, err := tx.CommitDecision(stateBenchmarkProject, stateBenchmarkPlanner, batch)
+		if err != nil {
+			return err
+		}
+		if !result.Completed || !result.Committed || result.ChangedActions != 6 {
+			t.Fatalf("completion did not observe the resolved Step and Goal: %+v", result)
+		}
+		state, err = tx.State(stateBenchmarkProject)
+		if err != nil {
+			return err
+		}
+		if state.Graph.Project.Reason != nil || state.Graph.Project.Status != "completed" || state.Revision != 6 || result.StateVersion != DecisionStateVersion(state) {
+			t.Fatalf("batch result differs from persisted final state: %+v", result)
+		}
+		replay, err := tx.CommitDecision(stateBenchmarkProject, stateBenchmarkPlanner, batch)
+		if err == nil && (replay.StateVersion != result.StateVersion || replay.IDs["work"] != result.IDs["work"]) {
+			t.Fatal("receipt replay changed batch")
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDecisionBatchLaterActionsObserveInvalidatedSources(t *testing.T) {
+	f := newStateBenchmarkFixture(t, stateBenchmarkSize{16, 128, 2}, 2)
+	batch := DecisionBatch{ExpectedVersion: f.version, Actions: []DecisionAction{
+		{Op: "fact_relation", Payload: json.RawMessage(`{"kind":"refutes","source":"source001","target":"source000","reason":"corrected observation"}`)},
+		{Op: "step", Payload: json.RawMessage(`{"action":"add","from":["source000"],"description":"Must reject invalidated input"}`)},
+	}}
+	if err := f.store.Do(context.Background(), func(tx *Tx) error {
+		_, err := tx.CommitDecision(stateBenchmarkProject, stateBenchmarkPlanner, batch)
+		var api *APIError
+		if !errors.As(err, &api) || api.Status != 409 {
+			t.Fatalf("stale batch source accepted: %v", err)
+		}
+		state, err := tx.State(stateBenchmarkProject)
+		if err != nil {
+			return err
+		}
+		if DecisionStateVersion(state) != f.version || len(state.FactRelations) != 0 || state.Revision != 0 {
+			t.Fatal("rejected dependent action left a relation or revision")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDecisionBatchSQLFailureDiscardsReusableStateAndCounters(t *testing.T) {
+	f := newStateBenchmarkFixture(t, stateBenchmarkSize{16, 128, 2}, 2)
+	batch := f.batch(2)
+	if err := f.store.Do(context.Background(), func(tx *Tx) error {
+		if _, err := tx.Exec(`CREATE TRIGGER reject_second_batch_event BEFORE INSERT ON xloom_state_events WHEN NEW.revision=2 BEGIN SELECT RAISE(ABORT,'event unavailable'); END`); err != nil {
+			return err
+		}
+		if _, err := tx.CommitDecision(stateBenchmarkProject, stateBenchmarkPlanner, batch); err == nil {
+			t.Fatal("injected SQL failure accepted")
+		}
+		state, err := tx.State(stateBenchmarkProject)
+		if err != nil {
+			return err
+		}
+		var count int
+		if err := tx.QueryRow("SELECT (SELECT COUNT(*) FROM xloom_state_events)+(SELECT COUNT(*) FROM xloom_state_actions)").Scan(&count); err != nil {
+			return err
+		}
+		if count != 0 || state.Revision != 0 || DecisionStateVersion(state) != f.version || state.Graph.Project.Reason == nil {
+			t.Fatal("failure retained graph, event, receipt or released lease")
+		}
+		if _, err := tx.Exec("DROP TRIGGER reject_second_batch_event"); err != nil {
+			return err
+		}
+		result, err := tx.CommitDecision(stateBenchmarkProject, stateBenchmarkPlanner, batch)
+		if err == nil && (result.IDs["step0"] != "i017" || result.IDs["step1"] != "i018") {
+			t.Fatalf("failed batch consumed counters: %+v", result)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestDecisionBatchSavepointProtectsCallerThatHandlesFailure(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "batch.db"))

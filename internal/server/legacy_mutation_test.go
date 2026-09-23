@@ -1,12 +1,125 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"reflect"
+	"strings"
 	"testing"
 
 	"xloom/internal/board"
 )
+
+func TestLegacyResultPreservesWorkerNormalizationAndIdentityErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name, kind, output string
+		status             int
+	}{
+		{"plan", "reason", `{"accepted":true,"data":{"intents":[{"from":["origin"],"description":"Observe the fixture"}]}}`, http.StatusOK},
+		{"complete", "reason", `{"accepted":true,"data":{"complete":{"from":["origin"],"description":"Fixture complete"}}}`, http.StatusOK},
+		{"explore", "explore", `{"accepted":true,"data":{"description":"Observed the fixture"}}`, http.StatusForbidden},
+		{"bootstrap", "bootstrap", `{"accepted":true,"data":{"fact":{"description":"Observed the fixture"},"complete":{"description":"Fixture complete"}}}`, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, store := newSnapshotHTTPFixture(t)
+			f.register(tc.kind, nil, 0)
+			// Reproduce an old imported execution whose backend/lease retained
+			// leading whitespace. HTTP's worker field historically trims it.
+			previous := f.lease
+			f.lease = " " + previous
+			if err := store.Do(context.Background(), func(tx *board.Tx) error {
+				if _, err := tx.Exec("UPDATE xloom_executions SET lease=?,backend=? WHERE project_id=? AND id=?", f.lease, " planner", f.project, f.run); err != nil {
+					return err
+				}
+				if tc.kind == "reason" {
+					_, err := tx.Exec("UPDATE projects SET reason_worker=? WHERE id=?", f.lease, f.project)
+					return err
+				}
+				_, err := tx.Exec("UPDATE intents SET worker=? WHERE project_id=? AND id=?", f.lease, f.project, f.intent)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			f.pending(tc.output)
+			before := f.state()
+			response := f.apply(tc.status)
+			after := f.state()
+			if tc.status == http.StatusOK {
+				if len(after.Graph.Intents) != 1 || after.Graph.Intents[0].Creator != previous {
+					t.Fatalf("legacy creator normalization changed: %+v", after.Graph.Intents)
+				}
+			} else if !reflect.DeepEqual(before, after) || !strings.Contains(response, "matching Execute identity") {
+				t.Fatalf("legacy identity error changed or mutated state: %s", response)
+			}
+		})
+	}
+}
+
+func TestIntentIdentityErrorPrecedesMalformedConclusionDescription(t *testing.T) {
+	f := newExecutionProtocolFixture(t)
+	f.register("explore", nil, 0)
+	response := f.request("POST", f.base()+"/intents/"+f.intent+"/conclude", map[string]any{"worker": "different-executor", "description": nil}, true, http.StatusForbidden, nil)
+	if !strings.Contains(response, "matching Execute identity") {
+		t.Fatalf("HTTP error precedence changed: %s", response)
+	}
+}
+
+func TestLegacyFinalPlanAcceptsValidSiblingsOfInvalidDirections(t *testing.T) {
+	for name, invalid := range map[string]string{
+		"missing source":    `{"from":["missing"],"description":"Invalid"}`,
+		"duplicate source":  `{"from":["origin","origin"],"description":"Invalid"}`,
+		"null source":       `{"from":["origin",null],"description":"Invalid"}`,
+		"wrong source type": `{"from":["origin",42],"description":"Invalid"}`,
+		"wrong description": `{"from":["origin"],"description":42}`,
+		"empty description": `{"from":["origin"],"description":"  "}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newExecutionProtocolFixture(t)
+			f.register("reason", nil, 0)
+			f.pending(`{"accepted":true,"data":{"intents":[` + invalid + `,{"from":["origin"],"description":"  Valid sibling  "}]}}`)
+			f.apply(http.StatusOK)
+			f.apply(http.StatusOK)
+			state := f.state()
+			if len(state.Steps) != 1 || state.Steps[0].ID != "i001" || state.Steps[0].Description != "Valid sibling" || state.Revision != 1 || len(legacyEvents(f)) != 1 {
+				t.Fatalf("partial acceptance or replay changed: %+v", state)
+			}
+		})
+	}
+}
+
+func TestLegacyFinalPlanSQLFailureRollsBackAllDirectionsAndReceipt(t *testing.T) {
+	f, store := newSnapshotHTTPFixture(t)
+	f.register("reason", nil, 0)
+	f.pending(`{"accepted":true,"data":{"intents":[{"from":["origin"],"description":"First insertion"},{"from":["origin"],"description":"Fail second insertion"}]}}`)
+	before := f.state()
+	if err := store.Do(context.Background(), func(tx *board.Tx) error {
+		_, err := tx.Exec(`CREATE TRIGGER reject_second_direction BEFORE INSERT ON intents WHEN NEW.description='Fail second insertion' BEGIN SELECT RAISE(ABORT,'injected SQL failure'); END`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.apply(http.StatusInternalServerError)
+	if after := f.state(); !reflect.DeepEqual(before, after) || len(legacyEvents(f)) != 0 {
+		t.Fatalf("SQL failure retained partial state or events: %+v", after)
+	}
+	var stored board.Execution
+	f.request("GET", f.base()+"/executions/"+f.run+"?namespace=protocol-test", nil, false, http.StatusOK, &stored)
+	if stored.Status != "result_pending" {
+		t.Fatalf("SQL failure committed receipt: %s", stored.Status)
+	}
+	if err := store.Do(context.Background(), func(tx *board.Tx) error {
+		_, err := tx.Exec(`DROP TRIGGER reject_second_direction`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.apply(http.StatusOK)
+	state := f.state()
+	if len(state.Steps) != 2 || state.Steps[0].ID != "i001" || state.Steps[1].ID != "i002" || state.Revision != 2 {
+		t.Fatalf("SQL rollback lost counter or transaction replay: %+v", state)
+	}
+}
 
 func legacyEvents(f *executionProtocolFixture) []board.StateEvent {
 	f.t.Helper()

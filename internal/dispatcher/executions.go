@@ -76,18 +76,7 @@ func (s *Scheduler) retryKey(g board.Graph, kind string, intent *board.Intent) s
 	if input, ok := s.schedules[g.Project.ID]; ok {
 		return input.RetryKey
 	}
-	ended := []string{}
-	for _, i := range g.Intents {
-		if i.To != nil || i.ConcludedAt != nil {
-			ended = append(ended, i.ID)
-		}
-	}
-	return kind + ":" + digest(struct {
-		Facts    []board.Fact
-		Hints    []board.Hint
-		Ended    []string
-		Revision int64
-	}{g.Facts, g.Hints, ended, s.stateRevisions[g.Project.ID]})
+	return board.DecisionRetryKey(g, s.stateRevisions[g.Project.ID])
 }
 
 // Scheduling asks the registry only about this input. Historical Jobs and
@@ -103,6 +92,15 @@ func (s *Scheduler) executionCheck(ctx context.Context, g board.Graph, kind stri
 	var check board.ExecutionCheck
 	err := s.Client.Do(ctx, "GET", projectPath(g.Project.ID)+"/executions/check?"+query.Encode(), nil, &check, nil)
 	return check, err
+}
+
+func (s *Scheduler) candidateCheck(ctx context.Context, input board.SchedulePage, g board.Graph, kind string, intent *board.Intent) (board.ExecutionCheck, error) {
+	if check, ok := input.ExecutionChecks[kind+":"+intent.ID]; ok {
+		return check, nil
+	}
+	// Older servers and a bootstrap created after the page was read have no
+	// candidate entry. Preserve their existing targeted query path.
+	return s.executionCheck(ctx, g, kind, intent, "")
 }
 
 func (s *Scheduler) restoreDecisionBoundary(project string, latest *board.ExecutionSummary) {
@@ -303,7 +301,14 @@ func (s *Scheduler) runRegistered(ctx context.Context, t *task, stopHeartbeat fu
 				return "interrupted", err
 			}
 			var err error
-			result, err = s.Runner.Run(ctx, t.Worker, t.Job)
+			// Container startup and same-run recovery must not issue a request
+			// against an input already superseded while the run was queued.
+			if t.Job.Kind == "reason" && t.Job.Decision != nil && t.Job.Decision.Version == 2 {
+				err = s.renewLease(ctx, t)
+			}
+			if err == nil {
+				result, err = s.Runner.Run(ctx, t.Worker, t.Job)
+			}
 			if result.Metrics != nil {
 				slog.Info("decision observation", "project", t.Job.Graph.Project.ID, "run", t.Job.RunID, "metrics", result.Metrics)
 			}
@@ -320,11 +325,17 @@ func (s *Scheduler) runRegistered(ctx context.Context, t *task, stopHeartbeat fu
 				if t.Root != nil && t.Root.Err() != nil {
 					return "interrupted", ctx.Err()
 				}
+				if decisionStateChanged(context.Cause(ctx)) {
+					return "interrupted", context.Cause(ctx) // runTask persists after joining the heartbeat.
+				}
 				s.terminal(t, "cancelled", worker.Result{Status: "failed", FailureKind: "hard_cancelled", Error: ctx.Err().Error()})
 				return "cancelled", ctx.Err()
 			}
 			if err != nil {
 				result = worker.Result{Status: "failed", Retryable: true, FailureKind: "transient_infrastructure", Error: err.Error()}
+				if decisionStateChanged(err) {
+					result.FailureKind, result.Retryable = "state_changed", false
+				}
 			}
 			if result.Status == "success" {
 				break
@@ -374,6 +385,17 @@ func (s *Scheduler) runRegistered(ctx context.Context, t *task, stopHeartbeat fu
 		return "rejected", nil
 	}
 	return "success", nil
+}
+
+func decisionStateChanged(err error) bool {
+	var pe *ProtocolError
+	if !errors.As(err, &pe) || pe.Status != 409 {
+		return false
+	}
+	var response struct {
+		Detail string `json:"detail"`
+	}
+	return json.Unmarshal([]byte(pe.Detail), &response) == nil && strings.HasPrefix(response.Detail, "state_changed:")
 }
 
 // A batch commits the graph and its execution result together. Prefer that

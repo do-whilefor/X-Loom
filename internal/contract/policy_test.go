@@ -243,3 +243,24 @@ func TestLegacyPolicyRejectsMixedOutcomeProtocol(t *testing.T) {
 		}
 	}
 }
+
+func TestPolicyUsesFirstExtractedObject(t *testing.T) {
+	for _, version := range []int{0, 1, 2} {
+		for _, graphRPC := range []bool{false, true} {
+			t.Run(fmt.Sprintf("v%d/rpc=%t", version, graphRPC), func(t *testing.T) {
+				policy := Policy{Version: version, GraphRPC: graphRPC}
+				first := `{"accepted":true,"data":{"decided":true}}`
+				output := "model prose\n```json\n" + first + "\n```\n" + `{"accepted":false}`
+				got, err := ParseWithPolicy(output, "reason", false, 1, 3, policy)
+				if err != nil || got.Kind != "decided" {
+					t.Fatalf("first object changed: %+v, %v", got, err)
+				}
+				// An invalid first object cannot be repaired by a later object.
+				output = `{"accepted":null,"data":null}` + "\n" + first
+				if _, err := ParseWithPolicy(output, "reason", false, 1, 3, policy); err == nil {
+					t.Fatal("skipped an invalid first object")
+				}
+			})
+		}
+	}
+}

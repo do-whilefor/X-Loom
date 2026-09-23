@@ -232,6 +232,12 @@ func TestSummaryQuotesSurviveCompactionCheckpointAndFurtherCompaction(t *testing
 		Checkpoint *ContextCheckpoint `json:"context_checkpoint"`
 	}
 	var saved []byte
+	var journalRecord *CompactionRecord
+	l.Emit = func(event Event) {
+		if event.Type == "context_compacted" {
+			journalRecord = event.Compaction
+		}
+	}
 	l.SaveState = func(history []Message, checkpoint *ContextCheckpoint) (err error) {
 		saved, err = json.Marshal(savedState{history, checkpoint})
 		return err
@@ -247,6 +253,47 @@ func TestSummaryQuotesSurviveCompactionCheckpointAndFurtherCompaction(t *testing
 	if restored.Checkpoint.LastCompaction.Quotes[0] != first {
 		t.Fatal("checkpoint serialization changed original quote")
 	}
+	if journalRecord == nil || !reflect.DeepEqual(journalRecord.View, restored.History) || !reflect.DeepEqual(journalRecord.CompactionCheckpoint, *restored.Checkpoint.LastCompaction) {
+		t.Fatal("journal lost the replayable view or checkpoint metadata")
+	}
+	var legacy map[string]json.RawMessage
+	if err := json.Unmarshal(saved, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	var checkpoint map[string]json.RawMessage
+	if err := json.Unmarshal(legacy["context_checkpoint"], &checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	var metadata map[string]json.RawMessage
+	if err := json.Unmarshal(checkpoint["last_compaction"], &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := metadata["view"]; ok {
+		t.Fatal("session checkpoint retained the duplicate request view")
+	}
+	// The old reader accepts the smaller checkpoint. Its compaction continuation
+	// uses the same metadata; only the unused View is absent.
+	var oldReader struct {
+		History    []Message `json:"history"`
+		Checkpoint struct {
+			LastCompaction *CompactionRecord `json:"last_compaction"`
+		} `json:"context_checkpoint"`
+	}
+	if err := json.Unmarshal(saved, &oldReader); err != nil || oldReader.Checkpoint.LastCompaction == nil || !reflect.DeepEqual(oldReader.Checkpoint.LastCompaction.CompactionCheckpoint, *restored.Checkpoint.LastCompaction) || !reflect.DeepEqual(oldReader.History, restored.History) {
+		t.Fatalf("reduced checkpoint is not readable by the old format: %v", err)
+	}
+	checkpoint["last_compaction"], _ = json.Marshal(journalRecord)
+	legacy["context_checkpoint"], _ = json.Marshal(checkpoint)
+	legacySaved, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restoredLegacy savedState
+	if err := json.Unmarshal(legacySaved, &restoredLegacy); err != nil || !reflect.DeepEqual(restoredLegacy, restored) {
+		t.Fatalf("old full checkpoint changed recovery state: %v", err)
+	}
+	t.Logf("fixed history compacted session: legacy=%d bytes, metadata=%d bytes, saved=%d bytes", len(legacySaved), len(saved), len(legacySaved)-len(saved))
+	restored = restoredLegacy
 	// A later uncommitted event may advance the sequence/attempt counters on
 	// recovery; quote IDs must still refer to the committed record's ID.
 	restored.Checkpoint.CompactionCount = 7
@@ -330,6 +377,17 @@ func TestSummaryCompactionFailureDoesNotAdvanceSavedState(t *testing.T) {
 			if saves != wantSaves || prepared != wantSaves {
 				t.Fatalf("unexpected persistence attempts: saves=%d prepared=%d", saves, prepared)
 			}
+			l.SaveState = nil
+			l.SummaryBytes = 4096
+			l.Provider = summaryTestProvider(func([]Message) (Message, error) {
+				return Text("assistant", `{"notes":"Recovered.","quotes":[{"source":"m3b0","start_line":2,"end_line":2}]}`), nil
+			})
+			if err := l.compact(context.Background()); err != nil {
+				t.Fatalf("rolled-back checkpoint could not continue: %v", err)
+			}
+			if l.Checkpoint.LastCompaction.ID != 1 || l.Checkpoint.LastCompaction.Status != "committed" || committed != 1 || len(l.Checkpoint.LastCompaction.Quotes) != 1 {
+				t.Fatal("continued compaction lost commit state or quotes")
+			}
 		})
 	}
 }
@@ -339,7 +397,7 @@ func TestSummaryLegacyCheckpointRemainsUnverifiedAndUnquotable(t *testing.T) {
 	l := &Loop{
 		TaskPrompt: "Continue.", ContextBytes: 12000, SummaryBytes: 4096, RecentBytes: 128,
 		History:    []Message{Text("user", "Continue."), Text("user", legacy)},
-		Checkpoint: &ContextCheckpoint{Version: 1, LastSequence: 9, CompactionCount: 2, LastCompaction: &CompactionRecord{Version: 1, ID: 2, SourceStart: 2, SourceEnd: 9, AtSequence: 9, Summary: legacy, Status: "committed"}},
+		Checkpoint: &ContextCheckpoint{Version: 1, LastSequence: 9, CompactionCount: 2, LastCompaction: &CompactionCheckpoint{Version: 1, ID: 2, SourceStart: 2, SourceEnd: 9, AtSequence: 9, Summary: legacy, Status: "committed"}},
 	}
 	l.Provider = summaryTestProvider(func(messages []Message) (Message, error) {
 		if sources := summaryRequestSources(t, messages); len(sources) != 0 {
@@ -359,7 +417,7 @@ func TestSummaryRejectsCorruptOrUncommittedRetainedQuotes(t *testing.T) {
 	for _, problem := range []string{"hash", "range", "source hash", "prepared"} {
 		t.Run(problem, func(t *testing.T) {
 			quote := summaryTestSource(summaryFixture()).SummaryQuote
-			record := &CompactionRecord{ID: 1, Status: "committed", Quotes: []SummaryQuote{quote}}
+			record := &CompactionCheckpoint{ID: 1, Status: "committed", Quotes: []SummaryQuote{quote}}
 			switch problem {
 			case "hash":
 				record.Quotes[0].Text = "tampered"

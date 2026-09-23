@@ -318,7 +318,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		// JSON. Resume its uncommitted planning phase without restoring consumed
 		// repair/continuation allowances or deadlines. Execute repair is unchanged.
 		state.Repairing, state.RepairPending = false, false
-		state.RepairReason, state.RepairPrompt = "", ""
+		state.RepairPrompt = ""
 	}
 	if o.ContextBytes <= 0 {
 		o.ContextBytes = envInt("XLOOM_CONTEXT_BYTES", DefaultContextBytes)
@@ -471,7 +471,6 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		state.RepairCount++
 		state.Repairing = true
 		l.Repairing = true
-		state.RepairReason = problem.Reason
 		instruction, err := repairInstruction(j, l.Concluding, state.RepairCount, problem)
 		if err != nil {
 			return "", err
@@ -500,7 +499,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 			state.ContinuationSequence = last.Sequence
 		}
 		state.Repairing, state.RepairPending, l.Repairing = false, false, false
-		state.RepairReason, state.RepairPrompt, l.RepairPrompt = "", "", ""
+		state.RepairPrompt, l.RepairPrompt = "", ""
 		// Persist consumption before the follow-up instruction. Recovery can
 		// then reissue that instruction without replaying tools or buying turns.
 		if err := save(l.History); err != nil {

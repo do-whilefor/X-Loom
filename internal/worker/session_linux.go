@@ -72,7 +72,6 @@ type session struct {
 	Identity               executionIdentity        `json:"identity"`
 	Log                    journalCheckpoint        `json:"log_checkpoint"`
 	ContextCheckpoint      *agent.ContextCheckpoint `json:"context_checkpoint,omitempty"`
-	DecisionMetrics        *DecisionMetrics         `json:"decision_metrics,omitempty"`
 	Replan                 *ReplanObservation       `json:"replan,omitempty"`
 	GraphVersion           string                   `json:"graph_version,omitempty"`
 	DecisionConflict       string                   `json:"decision_conflict,omitempty"`
@@ -95,7 +94,6 @@ type session struct {
 	ConclusionEvidence     []board.EvidenceRef      `json:"conclusion_evidence,omitempty"`
 	Repairing              bool                     `json:"repairing,omitempty"`
 	RepairCount            int                      `json:"repair_count,omitempty"`
-	RepairReason           string                   `json:"repair_reason,omitempty"`
 	RepairPrompt           string                   `json:"repair_prompt,omitempty"`
 	RepairPending          bool                     `json:"repair_pending,omitempty"`
 	ContinuationCount      int                      `json:"continuation_count,omitempty"`
@@ -145,10 +143,6 @@ func (s *session) save(runDir string, journal *eventJournal) error {
 		return err
 	}
 	s.Log = journal.checkpoint()
-	if s.Kind == "reason" {
-		metrics := journal.metrics
-		s.DecisionMetrics = &metrics
-	}
 	s.Phase = "execute"
 	if s.Concluding {
 		s.Phase = "conclude"

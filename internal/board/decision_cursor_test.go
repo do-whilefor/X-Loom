@@ -2,8 +2,39 @@ package board
 
 import (
 	"encoding/json"
+	"slices"
 	"testing"
 )
+
+func TestCursorDecisionOrdersEventsAndDeduplicatesChangedNodes(t *testing.T) {
+	state := overviewState()
+	state.Revision = 4
+	state.Steps = []Step{{ID: "archived", GoalID: "goal", From: []string{"origin"}, Status: "abandoned"}}
+	state.FactRecords = append(state.FactRecords, FactRecord{ID: "new", Description: "The latest observation.", Status: "valid"})
+	cursor := &DecisionCursor{ProjectID: state.Graph.Project.ID, Generation: state.Graph.Project.Generation, Revision: 1}
+	// The Step was reprioritized and then abandoned before the new Fact arrived.
+	events := []StateEvent{{Revision: 4, Op: "fact", ID: "new"}, {Revision: 2, Op: "step", ID: "archived"}, {Revision: 3, Op: "step", ID: "archived"}}
+	decision, err := BuildDecisionContextFromCursor(state, cursor, events, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Mode != "changes" || decision.FromRevision != 1 || decision.ToRevision != 4 {
+		t.Fatalf("wrong revision boundary: %+v", decision)
+	}
+	var body decisionView
+	if err := json.Unmarshal(decision.View, &body); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(body.Changed["fact_records"], []string{"new"}) || !slices.Equal(body.Changed["steps"], []string{"archived"}) || !slices.Equal(body.Changed["event_nodes"], []string{"archived", "new"}) {
+		t.Fatalf("event identities were lost or duplicated: %+v", body.Changed)
+	}
+	if len(body.Steps) != 1 || body.Steps[0].Status != "abandoned" || len(body.Facts) != 1 || body.Facts[0].ID != "new" {
+		t.Fatalf("events did not select current records: steps=%+v facts=%+v", body.Steps, body.Facts)
+	}
+	if body.Removed == nil || len(body.Removed) != 0 {
+		t.Fatalf("removed field lost its empty-object compatibility: %+v", body.Removed)
+	}
+}
 
 func TestCursorDecisionUsesCurrentGraphAndKeepsOlderKnowledgeDiscoverable(t *testing.T) {
 	current := overviewState()
@@ -65,6 +96,20 @@ func TestCursorDecisionFallsBackWithoutInventingMissingHistory(t *testing.T) {
 			}
 			if overviewSection(t, decodeOverview(t, view.View), "facts").Total != 2 {
 				t.Fatal("fallback lost current FGS")
+			}
+			var body struct {
+				UserInputs     []Fact          `json:"user_inputs"`
+				Removed        decisionChanges `json:"removed"`
+				RemovedOmitted map[string]int  `json:"removed_omitted"`
+			}
+			if err := json.Unmarshal(view.View, &body); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(body.UserInputs, state.Graph.Facts) {
+				t.Fatal("fallback lost the original scope or root requirement")
+			}
+			if body.Removed == nil || len(body.Removed) != 0 || body.RemovedOmitted == nil || len(body.RemovedOmitted) != 0 {
+				t.Fatal("fallback removal fields lost their empty-object compatibility")
 			}
 		})
 	}
