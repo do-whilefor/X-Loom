@@ -208,18 +208,25 @@ func buildDecisionChanges(current State, baseline json.RawMessage, result *Decis
 		}
 	}
 	for _, step := range current.Steps {
-		if contextActiveStep(step.Status) || selectedGoals[step.GoalID] || references(step.From) || selectedFacts[Value(step.Result)] {
+		if contextActiveStep(step.Status) || selectedGoals[step.GoalID] || references(step.From) {
 			selectedSteps[step.ID] = true
 		}
 	}
+	// Directly selected or affected Steps retain their results. A Step reached
+	// only as a producer supplies ancestry, not its unrelated sibling outputs.
+	resultSteps := make(map[string]bool, len(selectedSteps))
+	for id := range selectedSteps {
+		resultSteps[id] = true
+	}
+	producers := decisionFactProducers(facts, steps)
 	for _, goal := range current.Goals {
 		if goal.Status == "open" {
 			selectedGoals[goal.ID] = true
 		}
 	}
 	selectedGoals["goal"] = true
-	// Include each selected node's complete causal support, including producers
-	// of Fact results and both ends of refutes/supersedes/narrows chains.
+	// Include each selected node's causal support, including producers of
+	// process Facts and both ends of refutes/supersedes/narrows chains.
 	for {
 		count := len(selectedFacts) + len(selectedGoals) + len(selectedSteps) + len(selectedFindings)
 		for _, finding := range current.Findings {
@@ -232,10 +239,12 @@ func buildDecisionChanges(current State, baseline json.RawMessage, result *Decis
 				selectedFacts[source] = true
 			}
 		}
-		for _, step := range current.Steps {
-			if step.Result != nil && *step.Result != "goal" && selectedFacts[*step.Result] {
-				selectedSteps[step.ID] = true
+		for id := range selectedFacts {
+			if producer := producers[id]; producer != "" {
+				selectedSteps[producer] = true
 			}
+		}
+		for _, step := range current.Steps {
 			if selectedSteps[step.ID] {
 				if step.GoalID != "" {
 					selectedGoals[step.GoalID] = true
@@ -243,7 +252,7 @@ func buildDecisionChanges(current State, baseline json.RawMessage, result *Decis
 				for _, source := range step.From {
 					selectedFacts[source] = true
 				}
-				if step.Result != nil {
+				if resultSteps[step.ID] && step.Result != nil {
 					selectedFacts[*step.Result] = true
 				}
 			}
@@ -263,7 +272,7 @@ func buildDecisionChanges(current State, baseline json.RawMessage, result *Decis
 		}
 	}
 
-	view := decisionView{Version: 1, Revision: current.Revision, DecisionRevision: current.DecisionRevision, Generation: project.Generation, FromRevision: result.FromRevision, Project: project, UserInputs: []Fact{}, Hints: append([]Hint{}, current.Graph.Hints...), Goals: []Goal{}, Steps: []Step{}, Facts: []FactRecord{}, Findings: []Finding{}, Relations: []FactRelation{}, Changed: changed, Removed: removed, Omitted: map[string]int{}, ReadMore: "Read omitted nodes and evidence using read_graph with ids. Omission is not absence; reads are pinned to state_version."}
+	view := decisionView{Version: 1, Revision: current.Revision, DecisionRevision: current.DecisionRevision, Generation: project.Generation, FromRevision: result.FromRevision, Project: project, UserInputs: []Fact{}, Hints: append([]Hint{}, current.Graph.Hints...), Goals: []Goal{}, Steps: []Step{}, Facts: []FactRecord{}, Findings: []Finding{}, Relations: []FactRelation{}, Changed: changed, Removed: removed, Omitted: map[string]int{}, ReadMore: "Read omitted nodes and evidence using read_graph with ids. Omission is not absence; reads are pinned to state_version. Missing or ambiguous producers are not inferred."}
 	// The same bounded discovery index accompanies full and incremental bodies.
 	// Keeping the latter narrow must not erase unrelated historical knowledge.
 	var overview struct {
@@ -322,6 +331,34 @@ func buildDecisionChanges(current State, baseline json.RawMessage, result *Decis
 	}
 	result.View, result.Mode = raw, "changes"
 	return result, nil
+}
+
+// Derive provenance from this version of the graph without rewriting records.
+// Explicit sources take precedence even when they cannot be resolved. Only a
+// unique legacy Result may fill an absent source; inputs are never outputs.
+func decisionFactProducers(facts map[string]FactRecord, steps map[string]Step) map[string]string {
+	producers := make(map[string]string)
+	for _, step := range steps {
+		id := Value(step.Result)
+		fact, exists := facts[id]
+		if !exists || id == "origin" || id == "goal" || fact.SourceStepID != "" {
+			continue
+		}
+		if _, seen := producers[id]; seen {
+			producers[id] = "" // Multiple legacy candidates are not provenance.
+		} else {
+			producers[id] = step.ID
+		}
+	}
+	for id, fact := range facts {
+		if id == "origin" || id == "goal" || fact.SourceStepID == "" {
+			continue
+		}
+		if _, exists := steps[fact.SourceStepID]; exists {
+			producers[id] = fact.SourceStepID
+		}
+	}
+	return producers
 }
 
 func decisionIndex[T any](items []T, key func(T) string) map[string]T {
