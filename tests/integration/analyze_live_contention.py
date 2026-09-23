@@ -27,6 +27,10 @@ def iso(value):
     return datetime.fromtimestamp(value, timezone.utc).isoformat() if value is not None else None
 
 
+def bare_run(value):
+    return (value or "").rsplit("@", 1)[-1]
+
+
 def merge_intervals(intervals, window=None):
     usable = []
     for start, end in intervals:
@@ -218,7 +222,9 @@ def analyze(output):
     observed = read_json(output / "runs.json", []) or []
     state_events = read_json(output / "state-events.json", []) or []
     proxy = read_json(output / "http-observations.json", []) or []
-    validation = read_json(output / "validation.json", {})
+    original_validation = read_json(output / "validation.json", {})
+    reviewed_validation = read_json(output / "validation-reviewed.json")
+    validation = reviewed_validation if reviewed_validation is not None else original_validation
     started = stamp(manifest.get("started"))
     completions = [stamp(event.get("created_at")) for event in state_events if event.get("op") == "complete"]
     completions = [value for value in completions if value is not None]
@@ -240,6 +246,20 @@ def analyze(output):
         tool_intervals.extend(tools)
     requests = [{"run_id": run["run_id"], "run_kind": run["kind"], **call} for run in runs for call in run["requests"]]
     tool_calls = [{"run_id": run["run_id"], **call} for run in runs for call in run["tools"]]
+    event_finished = finished if completions else None
+    # Board events use second-resolution CreatedAt. A successful commit tool
+    # receipt bounds completion more tightly and is the observable end of the
+    # project operation; do not report the rounded event as millisecond exact.
+    completion_commit_window = None
+    if completions:
+        final_event = min((event for event in state_events if event.get("op") == "complete" and stamp(event.get("created_at")) is not None), key=lambda event: stamp(event["created_at"]))
+        matching_commits = [tool for tool in tool_calls if bare_run(tool["run_id"]) == bare_run(final_event.get("run_id")) and tool.get("op") == "commit" and not tool.get("failed") and stamp(tool.get("started")) is not None and stamp(tool.get("finished")) is not None and stamp(tool["started"]) < event_finished + 1 and stamp(tool["finished"]) >= event_finished and any(operation.get("committed") for operation in tool.get("decision_operations", []))]
+        if matching_commits:
+            commit = min(matching_commits, key=lambda tool: stamp(tool["finished"]))
+            finished = stamp(commit["finished"])
+            completion_commit_window = {"started": commit["started"], "finished": commit["finished"],
+                                        "wall_seconds_lower": stamp(commit["started"]) - started, "wall_seconds_upper": finished - started}
+            end_basis = "successful_complete_commit_receipt_observed"
     conflicts = [call for call in tool_calls if call.get("state_changed")]
     external_updates = []
     for run in runs:
@@ -250,11 +270,12 @@ def analyze(output):
             continue
         for event in state_events:
             at = stamp(event.get("created_at"))
-            if event.get("op") in BUSINESS_OPS and event.get("run_id") and event["run_id"] != run["run_id"] and at is not None and begin <= at <= end:
+            if event.get("op") in BUSINESS_OPS and event.get("run_id") and bare_run(event["run_id"]) != bare_run(run["run_id"]) and event.get("revision", 0) > (run.get("input_revision") or 0) and at is not None and begin <= at <= end:
                 external_updates.append({"decision_run_id": run["run_id"], **{key: event.get(key) for key in ("revision", "op", "id", "run_id", "created_at")}})
     attempts = []
     for item in proxy:
-        attempt = {key: item.get(key) for key in ("request_id", "run_id", "model", "max_tokens", "tool_count", "started_at", "finished_at", "http_status", "headers_ms", "first_event_ms", "first_thinking_ms", "last_thinking_ms", "first_output_ms", "last_output_ms", "thinking_chars", "output_chars", "stop_reason", "errors")}
+        attempt = {key: item.get(key) for key in ("request_id", "run_id", "model", "max_tokens", "tool_count", "started_at", "finished_at", "http_status", "headers_ms", "first_event_ms", "first_thinking_ms", "last_thinking_ms", "first_output_ms", "last_output_ms", "thinking_chars", "output_chars", "stop_reason", "errors", "terminal_event", "terminal_event_ms", "closed_after_terminal")}
+        attempt["reported_usage"] = {key: (item.get("usage") or {}).get(key, 0) for key in USAGE_KEYS}
         start, end = stamp(item.get("started_at")), stamp(item.get("finished_at"))
         attempt["duration_ms"] = (end - start) * 1000 if start is not None and end is not None else None
         first_content = [item[key] for key in ("first_thinking_ms", "first_output_ms") if item.get(key) is not None]
@@ -264,8 +285,37 @@ def analyze(output):
             attempt[f"{label}_span_ms"] = max(0, last - first) if first is not None and last is not None else None
         matching = [call for call in requests if call["run_id"] == item.get("run_id") and stamp(call.get("started")) is not None and start is not None and stamp(call["started"]) <= start and (stamp(call.get("finished")) is None or start <= stamp(call["finished"]))]
         attempt["logical_request_index"] = matching[0]["index"] if len(matching) == 1 else None
+        call = matching[0] if len(matching) == 1 else None
+        attempt["logical_call_failed"] = call.get("failed") if call else None
+        errors = set(attempt.get("errors") or [])
+        if (attempt.get("http_status") or 0) >= 400:
+            attempt["error_class"] = "http_attempt_failed"
+        elif not errors:
+            attempt["error_class"] = "none"
+        elif call and call.get("completed_observation") and not call.get("failed") and 200 <= (attempt.get("http_status") or 0) < 300 and errors <= {"upstream_body_read_failed", "request_cancelled"}:
+            attempt["error_class"] = "stream_close_after_app_success"
+        elif call and call.get("failed"):
+            attempt["error_class"] = "proxy_error_with_failed_logical_call"
+        else:
+            attempt["error_class"] = "unconfirmed_proxy_error"
         attempts.append(attempt)
     counts = Counter((a["run_id"], a["logical_request_index"]) for a in attempts if a["logical_request_index"] is not None)
+    usage_comparisons = []
+    for call in requests:
+        matched = [attempt for attempt in attempts if (attempt["run_id"], attempt["logical_request_index"]) == (call["run_id"], call["index"])]
+        # Compare the final HTTP attempt for a logical request, retaining every
+        # attempt separately. Earlier retry attempts must not be added to its
+        # final application response and mislabeled as one response's usage.
+        last = max(matched, key=lambda attempt: attempt.get("request_id") or 0) if matched else None
+        app_usage = call.get("usage")
+        difference = {key: app_usage.get(key, 0) - last["reported_usage"].get(key, 0) for key in USAGE_KEYS} if app_usage is not None and last else None
+        usage_comparisons.append({"run_id": call["run_id"], "logical_request_index": call["index"],
+                                  "http_request_ids": [attempt["request_id"] for attempt in matched],
+                                  "compared_http_request_id": last["request_id"] if last else None,
+                                  "app_reported_usage": app_usage, "proxy_final_attempt_usage": last["reported_usage"] if last else None,
+                                  "app_minus_proxy": difference,
+                                  "status": "different" if difference and any(difference.values()) else "equal" if difference is not None else "not_comparable"})
+    proxy_usage = {key: sum(attempt["reported_usage"].get(key, 0) for attempt in attempts) for key in USAGE_KEYS}
     execute_intervals = [(stamp(run["started"]), stamp(run["finished"])) for run in runs if run["kind"] in {"explore", "bootstrap"}]
     longest = sorted((call for call in requests if call.get("duration_ms") is not None), key=lambda call: call["duration_ms"], reverse=True)[:10]
     budget_failures = [run["run_id"] for run in runs if run.get("failure_kind") == "budget_exhausted"]
@@ -275,8 +325,12 @@ def analyze(output):
               "source_commit": manifest.get("source_commit"), "reasoning_effort": manifest.get("reasoning_effort"),
               "started": iso(started), "finished": iso(finished), "end_basis": end_basis,
               "project_wall_seconds": finished - started,
+              "authoritative_event_wall_seconds_lower_bound": event_finished - started if event_finished is not None else None,
+              "authoritative_event_precision_seconds": 1 if event_finished is not None else None,
+              "completion_commit_window": completion_commit_window,
               "poll_completion_wall_seconds": manifest.get("project_wall_seconds"),
-              "business_validation": validation, "runs": runs,
+              "business_validation": validation, "original_business_validation": original_validation,
+              "validation_review_applied": reviewed_validation is not None, "runs": runs,
               "timing": timeline(model_intervals, tool_intervals, (started, finished)),
               "cumulative_model_duration_ms": sum(call.get("duration_ms", 0) for call in requests),
               "cumulative_tool_duration_ms": sum(tool.get("duration_ms") or 0 for tool in tool_calls),
@@ -287,12 +341,21 @@ def analyze(output):
               "failed_model_calls": sum(bool(call.get("failed")) for call in requests),
               "tool_calls": len(tool_calls), "longest_model_calls": longest,
               "http_attempts": attempts, "http_attempt_count": len(attempts),
+              "proxy_error_class_counts": dict(Counter(attempt["error_class"] for attempt in attempts)),
               "http_retries_in_matched_logical_calls": sum(max(0, count - 1) for count in counts.values()),
               "unmatched_http_attempts": sum(a["logical_request_index"] is None for a in attempts),
               "http_timing_ms": {key: stats(a.get(key) for a in attempts) for key in ("duration_ms", "headers_ms", "first_event_ms", "first_content_ms", "first_thinking_ms", "first_output_ms", "thinking_span_ms", "output_span_ms")},
+              "http_stage_cumulative_seconds": {"to_first_event": sum(attempt.get("first_event_ms") or 0 for attempt in attempts) / 1000,
+                                                 "to_first_content": sum(attempt.get("first_content_ms") or 0 for attempt in attempts) / 1000,
+                                                 "thinking_span": sum(attempt.get("thinking_span_ms") or 0 for attempt in attempts) / 1000,
+                                                 "output_span": sum(attempt.get("output_span_ms") or 0 for attempt in attempts) / 1000},
               "thinking_chars": sum(a.get("thinking_chars") or 0 for a in attempts),
               "output_chars": sum(a.get("output_chars") or 0 for a in attempts),
               "cost_status": "unknown_no_verified_account_pricing_or_bill", "cost_amount": None,
+              "proxy_reported_usage": proxy_usage, "usage_comparisons": usage_comparisons,
+              "usage_difference_calls": sum(item["status"] == "different" for item in usage_comparisons),
+              "usage_uncomparable_calls": sum(item["status"] == "not_comparable" for item in usage_comparisons),
+              "usage_comparison_basis": "application model_call_end vs last matched HTTP attempt; proxy totals include each HTTP attempt once, kept separate from application totals; neither is a verified bill",
               "conflicts": conflicts, "external_business_updates_during_decisions": external_updates,
               "coverage": {"peak_concurrent_execute_runs": peak_concurrency(execute_intervals),
                            "all_run_evidence_present": bool(runs) and not any(run["missing_evidence_files"] for run in runs),
@@ -337,7 +400,9 @@ def render(report):
         data = report["http_timing_ms"][key]
         lines.append(f"| {label} | {data['count']} | {data.get('p50', 0) / 1000:.3f} | {data.get('p95', 0) / 1000:.3f} | {data.get('max', 0) / 1000:.3f} |")
     lines += ["", "这些时间由透明代理读取真实响应字节时记录；首内容块可为空，所以 TTFT 是近似值。thinking 跨度包含流传输与服务端间隔，不是纯 GPU 思考时间；请求前等待也无法分离网络、排队和内部计算。thinking_chars 是字符数，不是 token。报告不保留思考正文。",
+              f"全部 HTTP 尝试累计：到首事件等待 {report['http_stage_cumulative_seconds']['to_first_event']:.3f} 秒；thinking 首末块跨度 {report['http_stage_cumulative_seconds']['thinking_span']:.3f} 秒；输出首末块跨度 {report['http_stage_cumulative_seconds']['output_span']:.3f} 秒。它们累计了并发请求，不等于项目墙钟；首事件到首内容、块间空隙和流尾部不在这三个数中，不能强行相加当作无遗漏分解。",
               f"观测 thinking 字符 {report['thinking_chars']}，输出字符 {report['output_chars']}。",
+              f"代理错误分类：{json.dumps(report['proxy_error_class_counts'], ensure_ascii=False)}。stream_close_after_app_success 表示 HTTP 200 且应用逻辑请求成功，代理仅见读流/取消标记；保留原始标记，不把完成后关流计为模型失败。HTTP 失败、伴随应用失败的代理错误和未确认错误分别列出。",
               "", "## 版本冲突与覆盖", "",
               f"Execute 峰值并发 {coverage['peak_concurrent_execute_runs']}；Decide 运行期间其他 run 的业务更新 {len(report['external_business_updates_during_decisions'])} 条。",
               f"state_changed {coverage['state_changed_count']} 次；读图冲突 {coverage['read_state_changed_count']} 次；preview/commit 冲突 {coverage['preview_commit_conflicts']} 次；这些冲突后旧 run 新模型请求 {coverage['model_calls_after_preview_commit_conflict']} 次。",
@@ -348,8 +413,23 @@ def render(report):
         lines.append("本次并发覆盖不足：未同时满足至少两个 Execute 重叠及 Decide 期间其他 run 的事实更新。")
     if not coverage["all_run_evidence_present"]:
         lines.append("部分 run 原始证据文件缺失；计时、用量及未发现故障结论均不完整。")
-    lines += ["", "## 用量与费用", "", f"provider 返回的输入 {usage['input_tokens']}、输出 {usage['output_tokens']}、缓存读取 {usage['cache_read_input_tokens']}、缓存写入 {usage['cache_creation_input_tokens']} token。覆盖状态 `{report['usage_status']}`，有 usage 的逻辑请求 {report['usage_calls']} 次。",
-              "只累计 model_call_end 的 usage；message_end、摘要记录及代理 HTTP usage 不再重复相加。未返回的 usage、内部失败尝试账单无法据此确认。没有已核实的账号价格和账单，实际金额为未知。", "",
+    if report.get("completion_commit_window"):
+        bounds = report["completion_commit_window"]
+        poll = report.get("poll_completion_wall_seconds")
+        lines.append(f"完成计时采用成功 commit 回执观测；实际服务端提交发生在项目启动后 {bounds['wall_seconds_lower']:.3f}–{bounds['wall_seconds_upper']:.3f} 秒之间。状态事件只有整秒精度，其 {report['authoritative_event_wall_seconds_lower_bound']:.3f} 秒为时间下界；轮询发现完成为 {f'{poll:.3f}' if poll is not None else '未知'} 秒。")
+    if report.get("validation_review_applied"):
+        lines += ["", "业务验收采用保留证据的离线复核结果（validation-reviewed.json），原始 validation.json 未被覆盖。",
+                  "原始失败项：" + "；".join(report["original_business_validation"].get("failures") or ["无"]),
+                  "复核原因：" + str(report["business_validation"].get("review_reason", "见复核文件")) + "。CONT-amount-24 的前缀原先也匹配了 arithmetic-correction Fact，严格 token 边界修正后重新检查相同归档证据。",
+                  "复核失败项：" + "；".join(report["business_validation"].get("failures") or ["无"])]
+    elif report["business_validation"].get("failures"):
+        lines.append("业务验收失败项：" + "；".join(report["business_validation"]["failures"]))
+    proxy_usage = report["proxy_reported_usage"]
+    lines += ["", "## 用量与费用", "", "| 观测来源 | 输入 token | 输出 token | 缓存读取 token | 缓存写入 token |", "| --- | ---: | ---: | ---: | ---: |",
+              f"| 应用逻辑请求 | {usage['input_tokens']} | {usage['output_tokens']} | {usage['cache_read_input_tokens']} | {usage['cache_creation_input_tokens']} |",
+              f"| 代理各 HTTP 尝试 | {proxy_usage['input_tokens']} | {proxy_usage['output_tokens']} | {proxy_usage['cache_read_input_tokens']} | {proxy_usage['cache_creation_input_tokens']} |", "",
+              f"应用覆盖状态 `{report['usage_status']}`，有 usage 的逻辑请求 {report['usage_calls']} 次。逐逻辑请求与最后匹配 HTTP 尝试相比，{report['usage_difference_calls']} 次存在差异，{report['usage_uncomparable_calls']} 次无法比较。两套总量分别列示，不能相加。",
+              "应用只累计 model_call_end 的 usage；message_end、摘要记录不重复累计。当前应用合并流式 usage 时仅用正数覆盖，代理也接受显式零值；若供应商流包含归零，两边可能不同。仅凭这些观测不能确定供应商计费语义或哪边应作为账单。未返回的 usage、内部失败尝试账单无法据此确认；没有已核实的账号价格和账单，实际金额为未知。", "",
               "业务验收明细：`validation.json`；逐次计时：`timing-report.json`；原始证据：`runs.json`、`http-observations.json`、`state-events.json` 和 `workspace/.xloom/runs/`。", ""]
     return "\n".join(lines)
 

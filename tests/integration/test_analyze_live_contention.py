@@ -62,11 +62,13 @@ class TimingAnalysisTests(unittest.TestCase):
                     {"run_id": "execute-a", "kind": "explore", "started": at(4), "finished": at(12), "status": "success"},
                     {"run_id": "execute-b", "kind": "explore", "started": at(8), "finished": at(16), "status": "success"}]
             save("runs.json", runs)
-            save("state-events.json", [{"op": "fact", "run_id": "execute-a", "revision": 3, "created_at": at(10)},
-                                       {"op": "complete", "run_id": "decide", "revision": 4, "created_at": at(19)}])
+            save("state-events.json", [{"op": "fact", "run_id": "live@execute-a", "revision": 3, "created_at": at(10)},
+                                       {"op": "complete", "run_id": "live@decide", "revision": 4, "created_at": at(19)}])
             save("validation.json", {"passed": True, "failures": []})
             save("http-observations.json", [{"request_id": 1, "run_id": "decide", "started_at": at(2), "finished_at": at(3), "http_status": 503, "usage": {"input_tokens": 1000}},
-                                            {"request_id": 2, "run_id": "decide", "started_at": at(4), "finished_at": at(6), "http_status": 200, "usage": {"input_tokens": 1000}}])
+                                            {"request_id": 2, "run_id": "decide", "started_at": at(4), "finished_at": at(6), "http_status": 200,
+                                             "errors": ["upstream_body_read_failed", "request_cancelled"],
+                                             "usage": {"input_tokens": 7, "output_tokens": 3, "cache_read_input_tokens": 0}}])
             for run in runs:
                 path = root / "workspace" / ".xloom" / "runs" / run["run_id"]
                 path.mkdir(parents=True)
@@ -75,16 +77,39 @@ class TimingAnalysisTests(unittest.TestCase):
                 events = []
                 if run["kind"] == "reason":
                     events = [{"type": "model_call_start", "at": at(1), "request": {"kind": "turn"}},
-                              {"type": "model_call_end", "at": at(7), "request": {"kind": "turn", "duration_ms": 6000, "usage": {"input_tokens": 7, "output_tokens": 3}}}]
+                              {"type": "model_call_end", "at": at(7), "request": {"kind": "turn", "duration_ms": 6000, "usage": {"input_tokens": 7, "output_tokens": 3, "cache_read_input_tokens": 100}}},
+                              {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "commit-1", "input": {"op": "commit"}}]}},
+                              {"type": "tool_start", "at": "2026-09-23T00:00:19.100000Z", "tool_id": "commit-1", "tool_name": "graph_action"},
+                              {"type": "decision_operation", "text": json.dumps({"op": "decision_commit", "committed": True})},
+                              {"type": "tool_end", "at": "2026-09-23T00:00:19.400000Z", "tool_id": "commit-1", "tool_name": "graph_action"}]
                 (path / "events.jsonl").write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
             report = analyze(root)
-        self.assertEqual(report["project_wall_seconds"], 19)
+            save("validation-reviewed.json", {"passed": True, "failures": [], "review_reason": "marker suffix correction"})
+            reviewed_report = analyze(root)
+            path = root / "workspace" / ".xloom" / "runs" / "decide" / "events.jsonl"
+            events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            next(event for event in events if event["type"] == "model_call_end")["request"]["failed"] = True
+            path.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+            failed_report = analyze(root)
+        self.assertAlmostEqual(report["project_wall_seconds"], 19.4, places=5)
+        self.assertEqual(report["authoritative_event_wall_seconds_lower_bound"], 19)
+        self.assertEqual(report["end_basis"], "successful_complete_commit_receipt_observed")
         self.assertEqual(report["reported_usage"]["input_tokens"], 7)
         self.assertEqual(report["http_retries_in_matched_logical_calls"], 1)
+        self.assertEqual(report["proxy_reported_usage"]["input_tokens"], 1007)
+        self.assertEqual(report["usage_difference_calls"], 1)
+        self.assertEqual(report["usage_comparisons"][0]["app_minus_proxy"]["cache_read_input_tokens"], 100)
+        self.assertEqual(report["proxy_error_class_counts"]["http_attempt_failed"], 1)
+        self.assertEqual(report["proxy_error_class_counts"]["stream_close_after_app_success"], 1)
+        self.assertEqual(report["http_attempts"][1]["errors"], ["upstream_body_read_failed", "request_cancelled"])
+        self.assertEqual(failed_report["proxy_error_class_counts"]["proxy_error_with_failed_logical_call"], 1)
         self.assertEqual(report["coverage"]["peak_concurrent_execute_runs"], 2)
         self.assertTrue(report["coverage"]["decision_saw_external_fact_updates"])
+        self.assertEqual(len(report["external_business_updates_during_decisions"]), 1)
         self.assertTrue(report["coverage"]["all_run_evidence_present"])
         self.assertIn("本次没有触发版本冲突", render(report))
+        self.assertTrue(reviewed_report["validation_review_applied"])
+        self.assertIn("原始 validation.json 未被覆盖", render(reviewed_report))
 
 
 if __name__ == "__main__":
