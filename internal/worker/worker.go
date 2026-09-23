@@ -140,8 +140,8 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		return Result{}, err
 	}
 	state := session{SchemaVersion: sessionSchemaVersion, Identity: identity, RunID: j.RunID, Kind: j.Kind, StartedAt: o.Now()}
-	if j.Kind == "reason" && j.Decision != nil && j.State != nil {
-		state.GraphVersion = board.DecisionStateVersion(*j.State)
+	if j.Kind == "reason" && j.Decision != nil {
+		state.GraphVersion = j.Decision.StateVersion
 	}
 	if j.Budget.Timeout > 0 {
 		state.ExecutionDeadline = state.StartedAt.Add(time.Duration(j.Budget.Timeout) * time.Second)
@@ -542,7 +542,7 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 				state.Replan.StateVersion, state.Replan.Generation = j.Decision.StateVersion, j.Decision.Generation
 				state.Replan.FromRevision, state.Replan.ToRevision = j.Decision.FromRevision, j.Decision.ToRevision
 			}
-			if j.Decision != nil && j.Decision.Mode == "changes" && j.State != nil && j.Graph.OpenCount() > 0 {
+			if j.Decision != nil && j.Decision.Mode == "changes" && (j.State != nil || j.InputSnapshot != nil) && j.openCount() > 0 {
 				state.Replan.Status = "running"
 				if err = save(l.History); err != nil {
 					return Result{}, err
@@ -656,8 +656,21 @@ func mock(j Job, runDir string) Result {
 	case "explore":
 		data["description"] = "Mock exploration confirmed"
 	case "reason":
-		if len(j.Graph.Facts) > 2 {
-			data["complete"] = map[string]any{"from": []string{j.Graph.Facts[len(j.Graph.Facts)-1].ID}, "description": "Mock goal reached"}
+		facts := j.Graph.Facts
+		if j.InputSnapshot != nil && j.Decision != nil {
+			var view struct {
+				Facts []board.Fact `json:"fact_records"`
+			}
+			_ = json.Unmarshal(j.Decision.View, &view)
+			facts = []board.Fact{{ID: "origin"}, {ID: "goal"}}
+			for _, fact := range view.Facts {
+				if fact.ID != "origin" && fact.ID != "goal" {
+					facts = append(facts, fact)
+				}
+			}
+		}
+		if len(facts) > 2 {
+			data["complete"] = map[string]any{"from": []string{facts[len(facts)-1].ID}, "description": "Mock goal reached"}
 		} else {
 			data["intents"] = []any{map[string]any{"from": []string{"origin"}, "description": "Mock exploration"}}
 		}

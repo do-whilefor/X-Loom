@@ -9,35 +9,44 @@ import (
 	"testing"
 
 	"xloom/internal/board"
-	"xloom/internal/config"
 	"xloom/internal/server"
-	"xloom/internal/worker"
 )
 
 func TestDecisionPreparationQueriesItsCapturedInputRevision(t *testing.T) {
-	state := board.State{Graph: board.Graph{Project: board.Project{ID: "p", Generation: 1}, Facts: []board.Fact{{ID: "origin", Description: "Input"}, {ID: "goal", Description: "Finish"}}}, Revision: 9, DecisionRevision: 7}
-	var expectedKey string
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/projects/p/state" {
-			_ = json.NewEncoder(w).Encode(state)
-			return
+	s, runner, _, graph := batchSchedulerFixture(t, 1)
+	ctx := context.Background()
+	inserted := false
+	s.Client.HTTP = &http.Client{Transport: executionQueryTransport(func(r *http.Request) (*http.Response, error) {
+		if r.Method == "POST" && r.URL.Path == projectPath(graph.Project.ID)+"/executions/prepare" && !inserted {
+			inserted = true
+			// A new human requirement arrives after the dispatch read, but before
+			// the server transaction captures and registers the immutable input.
+			if err := s.Client.Do(ctx, "POST", projectPath(graph.Project.ID)+"/hints", map[string]string{"content": "A newly confirmed requirement", "creator": "user"}, nil, nil); err != nil {
+				return nil, err
+			}
 		}
-		if r.URL.Path != "/projects/p/executions/check" || r.URL.Query().Get("retry_key") != expectedKey || r.URL.Query().Get("state_version") != board.DecisionStateVersion(state) {
-			t.Errorf("decision query did not bind its fresh input: %s", r.URL)
+		if r.URL.Path == projectPath(graph.Project.ID)+"/state" {
+			t.Error("preparing a new run downloaded the complete State")
 		}
-		_ = json.NewEncoder(w).Encode(board.ExecutionCheck{})
-	}))
-	defer api.Close()
-	s := New(config.Config{Server: api.URL}, &batchProtocolRunner{})
-	s.stateRevisions["p"] = state.DecisionRevision
-	expectedKey = s.retryKey(state.Graph, "reason", nil)
-	s.stateRevisions["p"] = 1 // Last dispatch preceded the freshly captured evidence.
-	run := &task{Job: worker.Job{Kind: "reason", Graph: state.Graph}}
-	if err := s.prepareDecision(context.Background(), run, "state_changed"); err != nil {
-		t.Fatal(err)
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+	launched, err := s.dispatch(ctx, graph.Project.ID)
+	if err != nil || !launched {
+		t.Fatalf("dispatch: %v %v", launched, err)
 	}
-	if run.Job.DecisionRevision != state.DecisionRevision || run.Job.State.Revision != state.Revision {
-		t.Fatal("prepared input lost the queried revision")
+	s.wg.Wait()
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if !inserted || len(runner.jobs) != 1 {
+		t.Fatal("fresh input was not captured")
+	}
+	job := runner.jobs[0]
+	if job.State != nil || job.InputSnapshot == nil || job.InputSnapshot.Revision != 1 || job.DecisionRevision != 1 || job.Decision.ToRevision != 1 || job.InputSnapshot.HintCount != 1 {
+		t.Fatal("registered input lost the server-captured revision")
+	}
+	raw, _ := json.Marshal(job)
+	if len(raw) > 64<<10 {
+		t.Fatal("prepared Job was not bounded")
 	}
 }
 

@@ -69,7 +69,7 @@ func outputProblem(j Job, concluding bool, m agent.Message) *outputFailure {
 }
 
 func parseOutput(j Job, concluding bool, text string) (contract.Result, error) {
-	return contract.ParseWithPolicy(text, j.Kind, concluding, j.Graph.OpenCount(), j.Budget.MaxIntents, contract.Policy{Version: j.ResultContractVersion, GraphRPC: j.GraphRPC})
+	return contract.ParseWithPolicy(text, j.Kind, concluding, j.openCount(), j.Budget.MaxIntents, contract.Policy{Version: j.ResultContractVersion, GraphRPC: j.GraphRPC})
 }
 
 // A terminal result can be persisted or replayed only after applying the same

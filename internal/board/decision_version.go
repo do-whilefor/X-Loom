@@ -37,10 +37,11 @@ func DecisionStateVersion(state State) string {
 // A malformed non-null marker must never silently opt a job into legacy writes.
 func DecisionJobVersion(raw json.RawMessage) (string, error) {
 	var job struct {
-		Kind     string `json:"kind"`
-		Graph    Graph  `json:"graph"`
-		State    *State `json:"state"`
-		Decision *struct {
+		Kind          string         `json:"kind"`
+		Graph         Graph          `json:"graph"`
+		State         *State         `json:"state"`
+		InputSnapshot *InputSnapshot `json:"input_snapshot"`
+		Decision      *struct {
 			Version      int    `json:"version"`
 			StateVersion string `json:"state_version"`
 		} `json:"decision"`
@@ -50,6 +51,12 @@ func DecisionJobVersion(raw json.RawMessage) (string, error) {
 	}
 	if job.Decision == nil {
 		return "", nil
+	}
+	if ref := job.InputSnapshot; ref != nil {
+		if job.State != nil || job.Kind != "reason" || (job.Decision.Version != 1 && job.Decision.Version != 2) || len(ref.ID) != 64 || len(ref.StateVersion) != 64 || ref.ProjectID != job.Graph.Project.ID || ref.Generation != job.Graph.Project.Generation || job.Decision.StateVersion != ref.StateVersion {
+			return "", Err(422, "invalid decision snapshot binding")
+		}
+		return ref.StateVersion, nil
 	}
 	if job.Kind != "reason" || (job.Decision.Version != 1 && job.Decision.Version != 2) || job.Decision.StateVersion == "" || job.State == nil {
 		return "", Err(422, "decision requires version 1 or 2 and a bound state snapshot")

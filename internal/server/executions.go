@@ -10,6 +10,9 @@ import (
 )
 
 func (s *Server) registerExecutionRoutes(m *http.ServeMux) {
+	m.HandleFunc("GET /projects/{pid}/scheduling", s.wrap(s.schedulingInput))
+	m.HandleFunc("POST /projects/{pid}/executions/prepare", s.wrap(s.prepareExecution))
+	m.HandleFunc("POST /projects/{pid}/executions/{rid}/input/read", s.wrap(s.snapshotRead))
 	m.HandleFunc("GET /executions", s.wrap(s.executions))
 	m.HandleFunc("GET /executions/pending", s.wrap(s.pendingExecutions))
 	m.HandleFunc("GET /projects/{pid}/executions/check", s.wrap(s.executionCheck))
@@ -55,9 +58,15 @@ func (s *Server) executions(t *b.Tx, q *request, r *http.Request) (int, any, err
 		Workspace             string          `json:"workspace"`
 		GraphRPC              json.RawMessage `json:"graph_rpc"`
 		ResultContractVersion json.RawMessage `json:"result_contract_version"`
+		InputSnapshot         json.RawMessage `json:"input_snapshot"`
+		InputView             json.RawMessage `json:"input_view"`
+		PreparationKey        json.RawMessage `json:"preparation_key"`
 	}
 	if json.Unmarshal(e.Job, &job) != nil || e.ID == "" || e.Namespace == "" || e.Backend == "" || e.Lease == "" || e.RetryKey == "" || job.RunID != e.ID || job.Kind != e.Kind || job.Graph.Project.ID != e.ProjectID || job.Workspace == "" {
 		return 0, nil, b.Err(422, "Invalid execution identity")
+	}
+	if (len(job.InputSnapshot) != 0 || len(job.InputView) != 0 || len(job.PreparationKey) != 0) && !q.prepared {
+		return 0, nil, b.Err(422, "snapshot inputs must be created through execution preparation")
 	}
 	// Absence preserves old jobs. Explicit null or a malformed value must not
 	// silently select the compatibility protocol or poison a durable result.

@@ -340,7 +340,8 @@ func (r *finishingDecisionRunner) Cleanup(context.Context, string, string) error
 
 func (r *finishingDecisionRunner) Run(ctx context.Context, backend config.Worker, job worker.Job) (worker.Result, error) {
 	result, err := r.batchProtocolRunner.Run(ctx, backend, job)
-	if err != nil || job.Kind != "reason" || len(job.Graph.Intents) == 0 || job.Graph.OpenCount() != 0 {
+	steps, open, _ := fixturePlanInput(job)
+	if err != nil || job.Kind != "reason" || steps == 0 || open != 0 {
 		return result, err
 	}
 	r.committed <- job

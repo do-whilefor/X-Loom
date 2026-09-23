@@ -59,14 +59,15 @@ func (r *batchProtocolRunner) Run(ctx context.Context, _ config.Worker, job work
 			return worker.Result{}, errors.New("planner was not registered with decision version 2")
 		}
 		actions := []board.DecisionAction{}
-		if len(job.Graph.Intents) == 0 {
+		steps, open, facts := fixturePlanInput(job)
+		if steps == 0 {
 			for n := 0; n < r.directions; n++ {
 				payload, _ := json.Marshal(map[string]any{"action": "add", "from": []string{"origin"}, "description": fmt.Sprintf("Check independent fixture %d", n)})
 				actions = append(actions, board.DecisionAction{Op: "step", Ref: fmt.Sprintf("check%d", n), Payload: payload})
 			}
-		} else if job.Graph.OpenCount() == 0 {
+		} else if open == 0 {
 			sources := []string{}
-			for _, fact := range job.State.FactRecords {
+			for _, fact := range facts {
 				if fact.SourceStepID != "" {
 					sources = append(sources, fact.ID)
 				}

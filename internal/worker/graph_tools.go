@@ -48,7 +48,10 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 		return result, nil
 	}
 	request := func(ctx context.Context, r GraphRequest) (string, error) {
-		if versioned {
+		frozen := r.Op == "read_snapshot"
+		if frozen && j.InputSnapshot != nil {
+			r.ExpectedVersion = j.InputSnapshot.StateVersion
+		} else if versioned {
 			if r.Op == "graph_action" {
 				r.Action.ExpectedVersion = *o.GraphVersion
 			} else if r.ByteOffset != nil || (r.Section != "" && r.Section != "overview") {
@@ -64,7 +67,7 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 			return "", err
 		}
 		if !j.GraphRPC {
-			if r.Op != "read_graph" {
+			if (r.Op != "read_graph" && !frozen) || j.InputSnapshot != nil {
 				return "", errors.New("live graph submission requires the dispatcher graph bridge")
 			}
 			state := board.State{Graph: j.Graph}
@@ -88,6 +91,9 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 				return "", err
 			}
 			raw, err := json.Marshal(page)
+			if frozen {
+				return string(raw), err
+			}
 			return track(string(raw), err)
 		}
 		if r.Op == "graph_action" {
@@ -99,6 +105,9 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 		}
 		started := time.Now()
 		raw, err := graphRPC(ctx, o.RunDir, o.Output, r)
+		if frozen {
+			return raw, err
+		}
 		if batchDecision(j) && o.decisionEmit != nil {
 			operation := decisionOperation{Op: r.Op, ElapsedMS: time.Since(started).Milliseconds(), Failed: err != nil, StateChanged: err != nil && strings.Contains(err.Error(), "state_changed")}
 			if err == nil && (r.Op == "decision_commit" || r.Op == "decision_receipt") {
@@ -194,6 +203,20 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 	}
 	if j.Graph.Project.Scenario == "pentest" {
 		o.Tools = append(o.Tools, cvssTool())
+	}
+	if j.InputSnapshot != nil {
+		frozen := read
+		frozen.Name = "read_snapshot"
+		frozen.Description = "Read this run's original immutable input using the same section, IDs, pagination and byte continuation as read_graph. The snapshot never refreshes current state or authorizes a current plan."
+		frozen.Execute = func(ctx context.Context, raw json.RawMessage) (string, error) {
+			var r GraphRequest
+			if err := json.Unmarshal(raw, &r); err != nil {
+				return "", err
+			}
+			r.Op = "read_snapshot"
+			return request(ctx, r)
+		}
+		o.Tools = append(o.Tools, frozen)
 	}
 	return nil
 }

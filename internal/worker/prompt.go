@@ -43,6 +43,8 @@ func Prompt(j Job, conclude bool, runDir string) (string, error) {
 		if !j.GraphRPC {
 			context += "This local snapshot has no live graph submission bridge.\n"
 		}
+	} else if j.InputSnapshot != nil {
+		context += "The original input is retained as an immutable snapshot. Use read_snapshot for that input and read_graph for current shared state. Submit verified observations with graph_action; this does not finish the Step. Evidence must reference retained files, not retyped output.\n"
 	} else {
 		graph, exportErr := board.Export(j.Graph, "yaml")
 		if exportErr != nil {
@@ -102,6 +104,18 @@ func intentContext(j Job) string {
 }
 
 func jobContextView(j Job) ([]byte, error) {
+	if j.InputSnapshot != nil {
+		if err := validateSnapshotInput(j); err != nil {
+			return nil, err
+		}
+		if j.Kind == "reason" {
+			return json.Marshal(j.Decision)
+		}
+		return j.InputView, nil
+	}
+	if len(j.InputView) != 0 || j.PreparationKey != "" {
+		return nil, errors.New("missing immutable input snapshot")
+	}
 	if j.Kind == "reason" && j.Decision != nil {
 		if j.State == nil || (j.Decision.Version != 1 && j.Decision.Version != 2) || j.Decision.StateVersion != board.DecisionStateVersion(*j.State) || j.Decision.Generation != j.Graph.Project.Generation || !json.Valid(j.Decision.View) {
 			return nil, errors.New("invalid decision input binding")

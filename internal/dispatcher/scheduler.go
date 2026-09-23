@@ -66,7 +66,7 @@ type Scheduler struct {
 	pendingExecutions []board.ExecutionSummary
 	decisionRevisions map[string]int64
 	stateRevisions    map[string]int64
-	states            map[string]board.State
+	schedules         map[string]board.SchedulePage
 	generations       map[string]int64
 	restartCleaned    map[string]int64
 	leaseTimeout      time.Duration
@@ -75,8 +75,9 @@ type Scheduler struct {
 }
 
 func New(c config.Config, r Runner) *Scheduler {
-	s := &Scheduler{Config: c, Runner: r, Client: &Client{Base: c.Server}, running: map[string]*task{}, admitted: map[string]bool{}, checkpoints: map[string]checkpoint{}, unhealthy: map[string]time.Time{}, rejected: map[string]time.Time{}, cleanup: map[string]string{}, cleaned: map[string]string{}, done: make(chan finished, c.Runtime.MaxWorkers), cleanupDone: make(chan cleaned, c.Runtime.MaxProjects+8), decisionRevisions: map[string]int64{}, stateRevisions: map[string]int64{}, states: map[string]board.State{}}
+	s := &Scheduler{Config: c, Runner: r, Client: &Client{Base: c.Server}, running: map[string]*task{}, admitted: map[string]bool{}, checkpoints: map[string]checkpoint{}, unhealthy: map[string]time.Time{}, rejected: map[string]time.Time{}, cleanup: map[string]string{}, cleaned: map[string]string{}, done: make(chan finished, c.Runtime.MaxWorkers), cleanupDone: make(chan cleaned, c.Runtime.MaxProjects+8), decisionRevisions: map[string]int64{}, stateRevisions: map[string]int64{}}
 	s.configureGraphHandler()
+	s.schedules = map[string]board.SchedulePage{}
 	s.generations = map[string]int64{}
 	s.restartCleaned = map[string]int64{}
 	return s
@@ -171,6 +172,9 @@ func (s *Scheduler) reap() {
 			if f.Outcome == "success" && f.Task.Job.Kind == "reason" && f.Task.Job.Graph.Project.Generation == s.generations[f.Task.Job.Graph.Project.ID] {
 				g := f.Task.Job.Graph
 				s.checkpoints[g.Project.ID] = checkpoint{len(g.Facts), len(g.Hints), g.OpenCount()}
+				if ref := f.Task.Job.InputSnapshot; ref != nil {
+					s.checkpoints[g.Project.ID] = checkpoint{ref.FactCount, ref.HintCount, ref.OpenCount}
+				}
 				s.decisionRevisions[g.Project.ID] = f.Task.Job.DecisionRevision
 			}
 			slog.Info("task finished", "project", f.Task.Job.Graph.Project.ID, "run", f.Task.Job.RunID, "task", f.Task.Job.Kind, "outcome", f.Outcome, "error", f.Err)
@@ -358,7 +362,11 @@ func (s *Scheduler) trigger(g board.Graph, check board.ExecutionCheck) string {
 	}
 	// Legacy To-based draining excludes the planner's own abandonment (To=nil).
 	// Actual scheduling separately filters State.Steps and ConcludedAt.
-	if len(g.Facts) > p.Facts || len(g.Hints) > p.Hints || (p.Open > 0 && g.OpenCount() == 0) || s.stateRevisions[g.Project.ID] > s.decisionRevisions[g.Project.ID] {
+	facts, hints, open := len(g.Facts), len(g.Hints), g.OpenCount()
+	if input, ok := s.schedules[g.Project.ID]; ok {
+		facts, hints, open = input.FactCount, input.HintCount, input.OpenCount
+	}
+	if facts > p.Facts || hints > p.Hints || (p.Open > 0 && open == 0) || s.stateRevisions[g.Project.ID] > s.decisionRevisions[g.Project.ID] {
 		return "new_facts_or_hints_or_finished_intents"
 	}
 	return ""
@@ -374,7 +382,7 @@ func (s *Scheduler) observeGeneration(project board.Project) {
 		delete(s.checkpoints, project.ID)
 		delete(s.decisionRevisions, project.ID)
 		delete(s.stateRevisions, project.ID)
-		delete(s.states, project.ID)
+		delete(s.schedules, project.ID)
 		s.generations[project.ID] = project.Generation
 	}
 }
@@ -428,13 +436,14 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 	if running >= s.Config.Runtime.MaxProjectWorkers {
 		return false, nil
 	}
-	var state board.State
-	err := s.Client.Do(ctx, "GET", projectPath(id)+"/state", nil, &state, nil)
+	input, err := s.scheduleInput(ctx, id)
 	if err != nil {
 		return false, err
 	}
-	g := state.Graph
+	g := board.Graph{Project: input.Project, Intents: input.Intents}
+	state := board.State{Graph: g, Steps: input.Steps, Revision: input.Revision, DecisionRevision: input.DecisionRevision}
 	s.observeGeneration(g.Project)
+	s.schedules[id] = input
 	// Cancellation may take time in a container. Do not start the new round
 	// in the same workspace until every old local execution has actually left.
 	stale := false
@@ -451,7 +460,6 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		return false, nil
 	}
 	s.stateRevisions[id] = state.DecisionRevision
-	s.states[id] = state
 	if g.Project.Status != "active" {
 		return false, nil
 	}
@@ -495,7 +503,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 			}
 		}
 	}
-	if initial(g) && !bootstrapFailed {
+	if input.Initial && !bootstrapFailed {
 		if g.Project.Reason != nil || localReason || localBootstrap {
 			return false, nil
 		}
@@ -649,10 +657,6 @@ func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, inte
 	// A dispatcher deadline measured from container startup could abort before
 	// a long current turn reaches the boundary where soft conclusion begins.
 	t := &task{Job: worker.Job{RunID: id, Kind: kind, WorkerType: w.Type, Graph: g, Intent: intent, Budget: budget, Workspace: "/workspace", GraphRPC: w.Type != "mock", ResultContractVersion: 2, DecisionRevision: s.stateRevisions[g.Project.ID], EnvironmentID: s.environmentID(*w)}, Worker: *w, Lease: lease}
-	if state, ok := s.states[g.Project.ID]; ok {
-		state.Graph = g
-		t.Job.State = &state
-	}
 	if kind == "reason" {
 		if err := s.prepareDecision(ctx, t, trigger); err != nil {
 			_ = s.Client.Do(ctx, "POST", s.leasePath(t)+"/release", map[string]string{"worker": lease.Run}, nil, nil)

@@ -75,9 +75,10 @@ func scanExecutionSummary(s scanner, prefix ...any) (ExecutionSummary, error) {
 
 func executionInputMetadata(raw json.RawMessage) (ExecutionSummary, error) {
 	var job struct {
-		Graph            Graph  `json:"graph"`
-		State            *State `json:"state"`
-		DecisionRevision int64  `json:"decision_revision"`
+		Graph            Graph          `json:"graph"`
+		State            *State         `json:"state"`
+		DecisionRevision int64          `json:"decision_revision"`
+		InputSnapshot    *InputSnapshot `json:"input_snapshot"`
 	}
 	if err := json.Unmarshal(raw, &job); err != nil {
 		return ExecutionSummary{}, err
@@ -89,6 +90,11 @@ func executionInputMetadata(raw json.RawMessage) (ExecutionSummary, error) {
 		// Legacy jobs can contain State without Decision. Repeated-input checks
 		// must hash that state too, rather than depending on a protocol marker.
 		e.StateVersion = DecisionStateVersion(*job.State)
+	}
+	if ref := job.InputSnapshot; ref != nil {
+		e.Generation, e.InputRevision, e.DecisionRevision = ref.Generation, ref.Revision, ref.DecisionRevision
+		e.StateVersion, e.HasState = ref.StateVersion, true
+		e.FactCount, e.HintCount, e.OpenCount = ref.FactCount, ref.HintCount, ref.OpenCount
 	}
 	return e, nil
 }

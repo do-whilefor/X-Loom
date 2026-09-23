@@ -39,6 +39,7 @@ func TestProviderTransientFailureResumesSameRunWithoutRepeatingTools(t *testing.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			j, runDir := outcomeJob(t, "explore"), t.TempDir()
+			j = bindingSnapshotJob(t, j)
 			j.Budget.Timeout = 60
 			calls, toolCalls := 0, 0
 			recovering := false
@@ -68,6 +69,7 @@ func TestProviderTransientFailureResumesSameRunWithoutRepeatingTools(t *testing.
 				t.Fatalf("failure cannot recover: result=%+v err=%v tool calls=%d requests=%d", first, err, toolCalls, calls)
 			}
 			before := outcomeSession(t, runDir)
+			assertSnapshotResumeRejectsChangedInput(t, j, opts)
 			recovering = true
 			last, err := Run(context.Background(), j, opts)
 			after := outcomeSession(t, runDir)

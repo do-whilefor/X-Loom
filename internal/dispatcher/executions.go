@@ -73,6 +73,9 @@ func (s *Scheduler) retryKey(g board.Graph, kind string, intent *board.Intent) s
 		}
 		return kind + ":" + intent.ID
 	}
+	if input, ok := s.schedules[g.Project.ID]; ok {
+		return input.RetryKey
+	}
 	ended := []string{}
 	for _, i := range g.Intents {
 		if i.To != nil || i.ConcludedAt != nil {
@@ -131,17 +134,16 @@ func (s *Scheduler) loadExecutions(ctx context.Context) error {
 }
 
 func (s *Scheduler) register(ctx context.Context, t *task) error {
-	check, err := s.executionCheck(ctx, t.Job.Graph, t.Job.Kind, t.Job.Intent, "")
-	if err != nil {
-		return err
-	}
-	t.Job.PreviousRunID = check.PreviousRunID
+	// New runs have one server-owned immutable snapshot. Templates never carry
+	// graph data; recovery continues to use the exact registered Job below.
+	t.Job.Graph = board.Graph{Project: t.Job.Graph.Project}
+	t.Job.State = nil
 	raw, err := json.Marshal(t.Job)
 	if err != nil {
 		return err
 	}
 	e := board.Execution{ProjectID: t.Job.Graph.Project.ID, ID: t.Job.RunID, Namespace: s.namespace(), Backend: t.Worker.Name, Kind: t.Job.Kind, Intent: t.Lease.Intent, Lease: t.Lease.Run, Job: raw, RetryKey: s.retryKey(t.Job.Graph, t.Job.Kind, t.Job.Intent)}
-	if err = s.Client.Do(ctx, "POST", projectPath(e.ProjectID)+"/executions", e, &t.Execution, &t.Lease); err != nil {
+	if err = s.Client.Do(ctx, "POST", projectPath(e.ProjectID)+"/executions/prepare", e, &t.Execution, &t.Lease); err != nil {
 		return err
 	}
 	// The HTTP decoder canonicalizes embedded JSON objects. Run exactly the
@@ -400,8 +402,9 @@ func (s *Scheduler) decisionFinishAllowed(ctx context.Context, t *task) bool {
 	// A human stop or a new generation always overrides this delivery grace.
 	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	g, err := s.Client.Get(readCtx, t.Job.Graph.Project.ID)
-	return err == nil && g.Project.Generation == t.Job.Graph.Project.Generation && (g.Project.Status == "active" || g.Project.Status == "completed")
+	var input board.SchedulePage
+	err = s.Client.Do(readCtx, "GET", projectPath(t.Job.Graph.Project.ID)+"/scheduling", nil, &input, nil)
+	return err == nil && input.Project.Generation == t.Job.Graph.Project.Generation && (input.Project.Status == "active" || input.Project.Status == "completed")
 }
 
 func (s *Scheduler) observeDecision(ctx context.Context, t *task, metrics *worker.DecisionMetrics) {
@@ -456,11 +459,15 @@ func (s *Scheduler) configureGraphHandler() {
 				result.Results = nil
 			}
 			return result, err
-		case "read_graph":
+		case "read_graph", "read_snapshot":
 			// Bound the HTTP response too: a current FGS may exceed the client
 			// limit even though the requested graph/evidence page is small.
 			var page json.RawMessage
-			err := s.Client.Do(ctx, "POST", base+"/state/read", request, &page, &lease)
+			path := base + "/state/read"
+			if request.Op == "read_snapshot" {
+				path = base + "/executions/" + url.PathEscape(j.RunID) + "/input/read"
+			}
+			err := s.Client.Do(ctx, "POST", path, request, &page, &lease)
 			return page, err
 		case "graph_action":
 			var result board.StateActionResult

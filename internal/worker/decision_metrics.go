@@ -220,7 +220,7 @@ func (m DecisionMetrics) finish(j Job, r Result, started, ended time.Time) Decis
 	if r.Status != "success" || m.GraphActions > 0 {
 		return m // An interrupted/failed action may have reached the server.
 	}
-	parsed, err := contract.Parse(r.Text, j.Kind, r.Conclude, j.Graph.OpenCount(), j.Budget.MaxIntents)
+	parsed, err := contract.Parse(r.Text, j.Kind, r.Conclude, j.openCount(), j.Budget.MaxIntents)
 	if err != nil {
 		return m
 	}

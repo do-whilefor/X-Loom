@@ -2,6 +2,7 @@
 package worker
 
 import (
+	"encoding/json"
 	"errors"
 	"xloom/internal/board"
 	"xloom/internal/config"
@@ -36,10 +37,21 @@ type Job struct {
 	WorkerType            string                 `json:"worker_type"`
 	Graph                 board.Graph            `json:"graph"`
 	State                 *board.State           `json:"state,omitempty"`
+	InputSnapshot         *board.InputSnapshot   `json:"input_snapshot,omitempty"`
+	InputView             json.RawMessage        `json:"input_view,omitempty"`
+	PreparationKey        string                 `json:"preparation_key,omitempty"`
 	Intent                *board.Intent          `json:"intent,omitempty"`
 	Budget                config.Task            `json:"budget"`
 	Workspace             string                 `json:"workspace"`
 }
+
+func (j Job) openCount() int {
+	if j.InputSnapshot != nil {
+		return j.InputSnapshot.OpenCount
+	}
+	return j.Graph.OpenCount()
+}
+
 type Result struct {
 	Type         string           `json:"type"`
 	Text         string           `json:"text"`

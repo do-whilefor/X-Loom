@@ -64,7 +64,7 @@ func ValidateGraphRequest(j Job, r GraphRequest) error {
 		}
 		return nil
 	}
-	if r.Op == "read_graph" {
+	if r.Op == "read_graph" || r.Op == "read_snapshot" {
 		if err := validateGraphIDs(r); err != nil {
 			return err
 		}

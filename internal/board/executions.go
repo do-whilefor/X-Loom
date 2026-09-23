@@ -18,7 +18,7 @@ const executionSchema = `CREATE TABLE IF NOT EXISTS xloom_executions(
 CREATE TABLE IF NOT EXISTS xloom_paused_executions(
  project_id TEXT NOT NULL,execution_id TEXT NOT NULL,
  PRIMARY KEY(project_id,execution_id),
- FOREIGN KEY(project_id,execution_id) REFERENCES xloom_executions(project_id,id) ON DELETE CASCADE);`
+ FOREIGN KEY(project_id,execution_id) REFERENCES xloom_executions(project_id,id) ON DELETE CASCADE);` + inputSnapshotSchema
 
 // Execution contains no backend environment or model credentials. Job is the
 // immutable input supplied to the Worker, not a newly loaded project snapshot.
@@ -81,6 +81,21 @@ func (t *Tx) Executions(namespace string) ([]Execution, error) {
 	return out, rows.Err()
 }
 func (t *Tx) RegisterExecution(e Execution) error {
+	var snapshotJob struct {
+		InputSnapshot *InputSnapshot `json:"input_snapshot"`
+	}
+	if err := json.Unmarshal(e.Job, &snapshotJob); err != nil {
+		return Err(422, "invalid execution job")
+	}
+	if ref := snapshotJob.InputSnapshot; ref != nil {
+		saved, err := t.InputSnapshotMetadata(e.ProjectID, ref.ID)
+		if err != nil {
+			return err
+		}
+		if *saved != *ref {
+			return Err(422, "execution snapshot binding mismatch")
+		}
+	}
 	if _, err := DecisionJobVersion(e.Job); err != nil {
 		return err
 	}

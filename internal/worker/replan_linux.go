@@ -23,7 +23,7 @@ var errReplanBudget = errors.New("replan check exhausted its call or read allowa
 // A shadow check reads the original immutable snapshot, never the live graph.
 // Its transcript cannot supply evidence or instructions to the real planner.
 func runReplanCheck(ctx context.Context, j Job, o Options, observation *ReplanObservation, emit agent.Emit, save func() error) error {
-	if j.Kind != "reason" || j.Decision == nil || j.State == nil {
+	if j.Kind != "reason" || j.Decision == nil || (j.State == nil && j.InputSnapshot == nil) {
 		observation.Status, observation.Fallback, observation.Error = "invalid_input", "decide", "replan check requires a bound decision snapshot"
 		return nil
 	}
@@ -42,13 +42,22 @@ func runReplanCheck(ctx context.Context, j Job, o Options, observation *ReplanOb
 	}()
 	observed := replanVisibleIDs(j.Decision.View)
 	snapshot := j
-	snapshot.GraphRPC = false
+	snapshot.GraphRPC = j.InputSnapshot != nil
 	version := j.Decision.StateVersion
-	local := Options{GraphVersion: &version}
+	local := Options{GraphVersion: &version, RunDir: o.RunDir, Output: o.Output}
 	if err := ConfigureRuntimeTools(snapshot, &local); err != nil {
 		return err
 	}
 	read := local.Tools[0]
+	if j.InputSnapshot != nil {
+		for _, tool := range local.Tools {
+			if tool.Name == "read_snapshot" {
+				read = tool
+				break
+			}
+		}
+		read.Name = "read_graph"
+	}
 	read.Description = "Read the same frozen decision snapshot using section+ids, or section+offset/limit (1-50) when IDs are unknown. It cannot refresh live state. Omitted information is not proof of absence."
 	readCall := read.Execute
 	reads := 0

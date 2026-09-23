@@ -34,15 +34,16 @@ func (r *coldStartRunner) Run(ctx context.Context, backend config.Worker, job wo
 	data := map[string]any{}
 	switch job.Kind {
 	case "reason":
-		if len(job.Graph.Intents) == 0 {
+		steps, open, facts := fixturePlanInput(job)
+		if steps == 0 {
 			directions := []any{}
 			for i := 0; i < r.directions; i++ {
 				directions = append(directions, map[string]any{"from": []string{"origin"}, "description": fmt.Sprintf("Check independent fixture %d", i)})
 			}
 			data["intents"] = directions
-		} else if job.Graph.OpenCount() == 0 {
+		} else if open == 0 {
 			sources := []string{}
-			for _, fact := range job.Graph.Facts {
+			for _, fact := range facts {
 				if fact.ID != "origin" && fact.ID != "goal" {
 					sources = append(sources, fact.ID)
 				}
