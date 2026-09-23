@@ -302,6 +302,8 @@ func (l *Loop) execute(ctx context.Context, calls []Block, truncated bool) []Blo
 		case t == nil:
 			err = fmt.Errorf("unknown tool %q", c.Name)
 		default:
+			// Validate the schema once at dispatch; executors retain semantic
+			// checks such as file paths, hashes, cancellation and business scope.
 			if err = ValidateArguments(t.Schema, c.Input); err == nil {
 				text, err = invoke(ctx, t, c.Input)
 			}

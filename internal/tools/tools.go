@@ -32,12 +32,7 @@ type Set struct {
 
 func (s *Set) All() []agent.Tool {
 	def := func(name, desc, schema string, parallel bool, fn func(context.Context, json.RawMessage) (string, error)) agent.Tool {
-		return agent.Tool{Definition: agent.Definition{Name: name, Description: desc, Schema: json.RawMessage(schema)}, Parallel: parallel, Execute: func(ctx context.Context, raw json.RawMessage) (string, error) {
-			if err := agent.ValidateArguments(json.RawMessage(schema), raw); err != nil {
-				return "", err
-			}
-			return fn(ctx, raw)
-		}}
+		return agent.Tool{Definition: agent.Definition{Name: name, Description: desc, Schema: json.RawMessage(schema)}, Parallel: parallel, Execute: fn}
 	}
 	return []agent.Tool{
 		def("read", "Read a text file with optional 1-based offset and line limit.", `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}`, true, s.read),
