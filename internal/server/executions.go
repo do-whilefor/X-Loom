@@ -11,6 +11,13 @@ import (
 
 func (s *Server) registerExecutionRoutes(m *http.ServeMux) {
 	m.HandleFunc("GET /executions", s.wrap(s.executions))
+	m.HandleFunc("GET /executions/pending", s.wrap(s.pendingExecutions))
+	m.HandleFunc("GET /projects/{pid}/executions/check", s.wrap(s.executionCheck))
+	m.HandleFunc("GET /projects/{pid}/executions/{rid}", s.wrap(s.executionDetail))
+	m.HandleFunc("GET /projects/{pid}/executions/{rid}/identity", func(w http.ResponseWriter, r *http.Request) {
+		r.SetPathValue("execution_identity", "true")
+		s.wrap(s.executionDetail)(w, r)
+	})
 	m.HandleFunc("POST /projects/{pid}/executions", s.wrap(s.executions))
 	for _, op := range []string{"status", "resume", "apply", "retry"} {
 		m.HandleFunc("POST /projects/{pid}/executions/{rid}/"+op, func(w http.ResponseWriter, r *http.Request) {
@@ -85,14 +92,7 @@ func (s *Server) executions(t *b.Tx, q *request, r *http.Request) (int, any, err
 	return 201, saved, err
 }
 func (s *Server) executionAction(t *b.Tx, q *request, r *http.Request) (int, any, error) {
-	e, err := t.Execution(r.PathValue("pid"), r.PathValue("rid"))
-	if err != nil {
-		return 0, nil, err
-	}
 	op := r.PathValue("execution_op")
-	// Retry is a project-management operation, never a Worker tool. Automatic
-	// Decide recovery has a separate server-enforced bound; human retry remains
-	// explicit. Both retain the old record and enable one subsequent attempt.
 	if op == "retry" {
 		if r.Header.Get("X-Xloom-Run") != "" {
 			return 0, nil, b.Err(403, "retry authorization is a project-management operation")
@@ -103,9 +103,19 @@ func (s *Server) executionAction(t *b.Tx, q *request, r *http.Request) (int, any
 				return 0, nil, b.Err(422, "automatic must be a boolean")
 			}
 			if automatic {
+				e := b.Execution{ProjectID: r.PathValue("pid"), ID: r.PathValue("rid")}
 				return 200, map[string]string{"previous_run_id": e.ID}, t.RequestAutomaticDecisionRetry(e)
 			}
 		}
+	}
+	e, err := t.Execution(r.PathValue("pid"), r.PathValue("rid"))
+	if err != nil {
+		return 0, nil, err
+	}
+	// Retry is a project-management operation, never a Worker tool. Automatic
+	// Decide recovery has a separate server-enforced bound; human retry remains
+	// explicit. Both retain the old record and enable one subsequent attempt.
+	if op == "retry" {
 		if e.Status != "failed" && e.Status != "rejected" && e.Status != "cancelled" {
 			return 0, nil, b.Err(409, "Only failed, rejected or cancelled executions can be retried")
 		}

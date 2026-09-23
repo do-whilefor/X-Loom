@@ -186,12 +186,17 @@ func (t *Tx) State(project string) (State, error) {
 		s.Findings[n].SupportValid = len(s.Findings[n].Sources) > 0 && s.ValidateFactSources(s.Findings[n].Sources, true) == nil
 	}
 	latest := map[string]Execution{}
-	rows, err := t.Query("SELECT "+executionColumns+" FROM xloom_executions WHERE project_id=? AND kind!='reason' ORDER BY rowid", project)
+	// A graph read needs only the latest runtime state of each existing Step.
+	// Never materialize archived Job/Result bodies to build the current FGS.
+	rows, err := t.Query(`SELECT e.id,e.intent,e.lease,e.status FROM intents i JOIN xloom_executions e ON e.rowid=(
+		SELECT rowid FROM xloom_executions WHERE project_id=i.project_id AND intent=i.id AND kind!='reason' ORDER BY rowid DESC LIMIT 1
+	) WHERE i.project_id=?`, project)
 	if err != nil {
 		return State{}, err
 	}
 	for rows.Next() {
-		execution, err := scanExecution(rows)
+		var execution Execution
+		err := rows.Scan(&execution.ID, &execution.Intent, &execution.Lease, &execution.Status)
 		if err != nil {
 			rows.Close()
 			return State{}, err
@@ -221,7 +226,6 @@ func (t *Tx) State(project string) (State, error) {
 		}
 		if execution, ok := latest[i.ID]; ok && i.To == nil && step.Status != "abandoned" && slices.Contains([]string{"failed", "rejected", "cancelled"}, execution.Status) {
 			step.Status = "failed"
-			step.Reason = executionFailureDescription(execution.Status, execution.Result)
 			// A terminal delivery error cannot overwrite a pending result. Its
 			// diagnostic lives in the failure event instead of that result blob.
 			var detail string
@@ -230,6 +234,13 @@ func (t *Tx) State(project string) (State, error) {
 				step.Reason = detail
 			} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return State{}, err
+			} else {
+				// Older runs predate failure events. Project only their bounded
+				// failure fields, not the saved input or complete model response.
+				step.Reason, err = t.legacyExecutionFailure(project, execution)
+				if err != nil {
+					return State{}, err
+				}
 			}
 		}
 		for _, id := range step.From {
@@ -243,6 +254,30 @@ func (t *Tx) State(project string) (State, error) {
 		s.Steps = append(s.Steps, step)
 	}
 	return s, nil
+}
+
+func (t *Tx) legacyExecutionFailure(project string, execution Execution) (string, error) {
+	var raw []byte
+	err := t.QueryRow(`WITH failure AS (
+		SELECT CASE WHEN json_valid(result) THEN result ELSE '{}' END AS body,
+		char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288) AS whitespace
+		FROM xloom_executions WHERE project_id=? AND id=?)
+		SELECT json_object(
+		'error',substr(trim(json_extract(body,'$.error'),whitespace),1,2048),
+		'failure_kind',substr(json_extract(body,'$.failure_kind'),1,2048),
+		'text',json_object('reason',substr(trim(json_extract(CASE WHEN json_valid(json_extract(body,'$.text')) THEN json_extract(body,'$.text') ELSE '{}' END,'$.reason'),whitespace),1,2048)))
+		FROM failure`, project, execution.ID).Scan(&raw)
+	if err != nil {
+		return "", err
+	}
+	// The legacy result's text field is a JSON string, not an embedded object.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return "", err
+	}
+	fields["text"], _ = json.Marshal(string(fields["text"]))
+	raw, err = json.Marshal(fields)
+	return executionFailureDescription(execution.Status, raw), err
 }
 
 func executionFailureDescription(status string, raw json.RawMessage) string {

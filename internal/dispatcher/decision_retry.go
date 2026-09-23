@@ -2,45 +2,28 @@ package dispatcher
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/url"
 
 	"xloom/internal/board"
-	"xloom/internal/worker"
 )
 
-// Only the scheduler goroutine reads/updates its registry snapshot. The server
-// grants and consumes retries durably, including when this dispatcher restarts
-// between authorization and launch.
-func (s *Scheduler) automaticDecisionRetry(ctx context.Context, g *board.Graph) error {
-	key := s.retryKey(*g, "reason", nil)
-	attempts, candidate := 0, -1
-	for n, e := range s.executions {
-		if e.ProjectID != g.Project.ID || e.Kind != "reason" {
-			continue
-		}
-		var job worker.Job
-		if json.Unmarshal(e.Job, &job) != nil || job.Graph.Project.Generation != g.Project.Generation {
-			continue
-		}
-		if e.Pending() || e.Status == "retry_requested" {
+// The Server counts every historical attempt and grants one successor
+// transactionally. A dispatcher restart cannot replenish that allowance.
+func (s *Scheduler) automaticDecisionRetry(ctx context.Context, g *board.Graph, check *board.ExecutionCheck) error {
+	// Let recovery settle before authorizing a fresh attempt. Its terminal
+	// failure is observed on the next tick, just as with normal worker reaping.
+	for _, pending := range s.pendingExecutions {
+		if pending.ProjectID == g.Project.ID && pending.Kind == "reason" && pending.Generation == g.Project.Generation {
 			return nil
 		}
-		if e.RetryKey != key {
-			continue
-		}
-		attempts++
-		if board.AutomaticDecisionRetryEligible(e) {
-			candidate = n
-		}
 	}
-	if attempts != 1 || candidate < 0 {
+	if check.Pending || check.PreviousRunID != "" || check.Attempts != 1 || check.AutomaticRetryID == "" {
 		return nil
 	}
-	e := &s.executions[candidate]
-	err := s.Client.Do(ctx, "POST", projectPath(g.Project.ID)+"/executions/"+url.PathEscape(e.ID)+"/retry", map[string]bool{"automatic": true}, nil, nil)
+	id := check.AutomaticRetryID
+	err := s.Client.Do(ctx, "POST", projectPath(g.Project.ID)+"/executions/"+url.PathEscape(id)+"/retry", map[string]bool{"automatic": true}, nil, nil)
 	if err != nil {
 		var protocol *ProtocolError
 		if errors.As(err, &protocol) && (protocol.Status == 403 || protocol.Status == 404 || protocol.Status == 409) {
@@ -48,10 +31,10 @@ func (s *Scheduler) automaticDecisionRetry(ctx context.Context, g *board.Graph) 
 		}
 		return err
 	}
-	e.Status = "retry_requested"
-	if g.Project.Reason != nil && g.Project.Reason.Worker == e.Lease {
-		g.Project.Reason = nil
-	}
-	slog.Info("decision automatic retry authorized", "project", e.ProjectID, "previous_run", e.ID)
+	check.PreviousRunID, check.Blocked = id, false
+	// Successful authorization already checked and released this attempt's
+	// lease in the same transaction. A competing lease would have rejected it.
+	g.Project.Reason = nil
+	slog.Info("decision automatic retry authorized", "project", g.Project.ID, "previous_run", id)
 	return nil
 }

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"xloom/internal/agent"
@@ -36,6 +37,7 @@ type task struct {
 	Root         context.Context
 	Execution    board.Execution
 	LeaseTimeout time.Duration
+	committedAt  atomic.Int64
 }
 type finished struct {
 	Task    *task
@@ -61,7 +63,7 @@ type Scheduler struct {
 	cleanupDone       chan cleaned
 	wg                sync.WaitGroup
 	cursor            int
-	executions        []board.Execution
+	pendingExecutions []board.ExecutionSummary
 	decisionRevisions map[string]int64
 	stateRevisions    map[string]int64
 	states            map[string]board.State
@@ -234,7 +236,15 @@ func (s *Scheduler) Step(ctx context.Context) error {
 		}
 	}
 	for _, t := range s.running {
-		if states[t.Job.Graph.Project.ID] != "active" || t.Job.Graph.Project.Generation != s.generations[t.Job.Graph.Project.ID] {
+		id := t.Job.Graph.Project.ID
+		if t.Job.Graph.Project.Generation != s.generations[id] {
+			t.Cancel()
+			continue
+		}
+		if states[id] != "active" {
+			if states[id] == "completed" && s.decisionFinishAllowed(ctx, t) {
+				continue
+			}
 			t.Cancel()
 		}
 	}
@@ -253,6 +263,15 @@ func (s *Scheduler) Step(ctx context.Context) error {
 		state := states[id]
 		if state == "active" {
 			continue
+		}
+		if state == "completed" {
+			finishing := false
+			for _, t := range s.running {
+				finishing = finishing || t.Job.Graph.Project.ID == id
+			}
+			if finishing {
+				continue // Let the committed planner return its final observation.
+			}
 		}
 		if state == "" {
 			state = "deleted"
@@ -329,8 +348,8 @@ func initial(g board.Graph) bool {
 	}
 	return true
 }
-func (s *Scheduler) trigger(g board.Graph) string {
-	if s.previous(g, "reason", nil) != "" {
+func (s *Scheduler) trigger(g board.Graph, check board.ExecutionCheck) string {
+	if check.PreviousRunID != "" {
 		return "explicit_retry"
 	}
 	p, ok := s.checkpoints[g.Project.ID]
@@ -436,8 +455,13 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 	if g.Project.Status != "active" {
 		return false, nil
 	}
+	reasonCheck, err := s.executionCheck(ctx, g, "reason", nil, "")
+	if err != nil {
+		return false, err
+	}
+	s.restoreDecisionBoundary(id, reasonCheck.LatestDecision)
 	if !localReason {
-		if err := s.automaticDecisionRetry(ctx, &g); err != nil {
+		if err := s.automaticDecisionRetry(ctx, &g, &reasonCheck); err != nil {
 			return false, err
 		}
 	}
@@ -447,7 +471,14 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 	// attempt alone, just as the original bootstrap gate does.
 	for n := range g.Intents {
 		i := &g.Intents[n]
-		if bootstrap(*i) && s.previous(g, "bootstrap", i) != "" {
+		if !bootstrap(*i) {
+			continue
+		}
+		check, err := s.executionCheck(ctx, g, "bootstrap", i, "")
+		if err != nil {
+			return false, err
+		}
+		if check.PreviousRunID != "" {
 			if running > 0 || g.Project.Reason != nil || i.Worker != nil {
 				return false, nil
 			}
@@ -497,7 +528,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		return s.launch(ctx, g, "bootstrap", boot, "")
 	}
 	if g.Project.Reason == nil && !localReason {
-		if trigger := s.trigger(g); trigger != "" {
+		if trigger := s.trigger(g, reasonCheck); trigger != "" {
 			if ok, err := s.launch(ctx, g, "reason", nil, trigger); ok || err != nil {
 				return ok, err
 			}
@@ -510,7 +541,14 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 	var newest *board.Intent
 	for n := range g.Intents {
 		i := &g.Intents[n]
-		if i.To != nil || i.ConcludedAt != nil || i.Worker != nil || bootstrap(*i) || stepState[i.ID].Status == "abandoned" || len(stepState[i.ID].InvalidSources) > 0 || s.executionBlocked(g, "explore", i) {
+		if i.To != nil || i.ConcludedAt != nil || i.Worker != nil || bootstrap(*i) || stepState[i.ID].Status == "abandoned" || len(stepState[i.ID].InvalidSources) > 0 {
+			continue
+		}
+		check, err := s.executionCheck(ctx, g, "explore", i, "")
+		if err != nil {
+			return false, err
+		}
+		if check.Blocked {
 			continue
 		}
 		local := false
@@ -568,7 +606,11 @@ func (s *Scheduler) choose(project, kind string) *config.Worker {
 	return &candidates[0]
 }
 func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, intent *board.Intent, trigger string) (bool, error) {
-	if s.executionBlocked(g, kind, intent) {
+	check, err := s.executionCheck(ctx, g, kind, intent, "")
+	if err != nil {
+		return false, err
+	}
+	if check.Blocked {
 		return false, nil
 	}
 	w := s.choose(g.Project.ID, kind)
@@ -683,6 +725,18 @@ func (s *Scheduler) heartbeat(ctx context.Context, t *task, cancel context.Cance
 			}
 			var pe *ProtocolError
 			if errors.As(err, &pe) && (pe.Status == 403 || pe.Status == 404 || pe.Status == 409) || time.Since(last) >= timeout-interval {
+				if s.decisionFinishAllowed(ctx, t) {
+					// A commit revokes its lease before the Worker receives the
+					// acknowledgement. Give that reply and metrics a bounded drain.
+					timer := time.NewTimer(time.Until(time.Unix(0, t.committedAt.Load()).Add(decisionFinishGrace)))
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+					case <-timer.C:
+						cancel()
+					}
+					return
+				}
 				cancel()
 				return
 			}

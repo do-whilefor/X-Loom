@@ -116,6 +116,28 @@ func BuildDecisionContext(current State, previous *State, events []StateEvent, m
 		changed["project"] = []string{project.ID}
 	}
 
+	return buildDecisionChanges(current, baseline, result, changed, removed, ordered, before.FactRelations, maxBytes)
+}
+
+// The view is built from the current FGS. Previous relations are used only by
+// the legacy snapshot-comparison entry point for removed edges.
+func buildDecisionChanges(current State, baseline json.RawMessage, result *DecisionContext, changed, removed decisionChanges, ordered []StateEvent, previousRelations []FactRelation, maxBytes int) (*DecisionContext, error) {
+	current = contextState(current)
+	project := current.Graph.Project
+	project.Reason = nil
+	facts := decisionIndex(current.FactRecords, func(v FactRecord) string { return v.ID })
+	goals := decisionIndex(current.Goals, func(v Goal) string { return v.ID })
+	steps := decisionIndex(current.Steps, func(v Step) string { return v.ID })
+	findings := decisionIndex(current.Findings, func(v Finding) string { return v.ID })
+	relations := decisionIndex(current.FactRelations, decisionRelationKey)
+	fallback := func(reason string) (*DecisionContext, error) {
+		view, err := decisionFallbackView(current, baseline, changed, removed, maxBytes)
+		if err != nil {
+			return nil, err
+		}
+		result.View, result.Fallback = view, reason
+		return result, nil
+	}
 	selectedFacts, selectedGoals, selectedSteps, selectedFindings := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
 	seed := func(changes decisionChanges) {
 		for _, id := range append(append([]string{}, changes["facts"]...), changes["fact_records"]...) {
@@ -137,7 +159,7 @@ func BuildDecisionContext(current State, previous *State, events []StateEvent, m
 		relation := relations[key]
 		selectedFacts[relation.Source], selectedFacts[relation.Target] = true, true
 	}
-	oldRelations := decisionIndex(before.FactRelations, decisionRelationKey)
+	oldRelations := decisionIndex(previousRelations, decisionRelationKey)
 	for _, key := range removed["fact_relations"] {
 		relation := oldRelations[key]
 		selectedFacts[relation.Source], selectedFacts[relation.Target] = true, true
@@ -241,7 +263,7 @@ func BuildDecisionContext(current State, previous *State, events []StateEvent, m
 		}
 	}
 
-	view := decisionView{Version: 1, Revision: current.Revision, DecisionRevision: current.DecisionRevision, Generation: project.Generation, FromRevision: previous.Revision, Project: project, UserInputs: []Fact{}, Hints: append([]Hint{}, current.Graph.Hints...), Goals: []Goal{}, Steps: []Step{}, Facts: []FactRecord{}, Findings: []Finding{}, Relations: []FactRelation{}, Changed: changed, Removed: removed, Omitted: map[string]int{}, ReadMore: "Read omitted nodes and evidence using read_graph with ids. Omission is not absence; reads are pinned to state_version."}
+	view := decisionView{Version: 1, Revision: current.Revision, DecisionRevision: current.DecisionRevision, Generation: project.Generation, FromRevision: result.FromRevision, Project: project, UserInputs: []Fact{}, Hints: append([]Hint{}, current.Graph.Hints...), Goals: []Goal{}, Steps: []Step{}, Facts: []FactRecord{}, Findings: []Finding{}, Relations: []FactRelation{}, Changed: changed, Removed: removed, Omitted: map[string]int{}, ReadMore: "Read omitted nodes and evidence using read_graph with ids. Omission is not absence; reads are pinned to state_version."}
 	// The same bounded discovery index accompanies full and incremental bodies.
 	// Keeping the latter narrow must not erase unrelated historical knowledge.
 	var overview struct {

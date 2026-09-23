@@ -91,7 +91,12 @@ CTF 模式内置 TSEC flag 提交说明：仅依据证据、高置信时提交�
 - 事实被反驳或替代后，未启动的依赖 Step 显示 `needs_review`／`invalid_sources`，认领、登记和启动时都会复核。已运行的 Step 保留原输入及独立观察，由 Decide 决定是否放弃；撤销后拒绝迟到结果。
 - Finding 默认合并支持；复核已有 Finding 时，可保持 `claim`／`scope`，使用 `replace_support:true`、非空 `reason` 和有效 `sources`，显式以本次 `sources`／`evidence` 替换当前支持。原事实、证据快照和事件历史保留。完全相同的 Finding 支持／状态／理由或事实纠正关系，即使使用不同请求 key，也返回 `unchanged:true`，不新增业务事件或推进版本。
 - 根目标来自用户输入。Decide 可在同一批次中说明理由、撤回辅助计划并完成项目；仍须引用有效观察，不能靠空队列或耗尽预算自动完成。结构校验保证状态一致性，证据是否充分覆盖用户要求仍需模型或用户判断。
-- 每轮 Decide 保留原始根条件和有限全局概览；大图明确标出省略数量及分页补读入口。执行记录提供读取、草稿、预览、提交、冲突及模型耗时等观测数据。Mock 验证协议和故障行为，不代表已证明真实模型的规划质量或成本改善。
+- 每轮 Decide 从当前 FGS、原始根条件、有限全局概览和修订变化索引构造干净上下文，不读取上轮 Job 或会话作为记忆。成功运行仅确认其原始输入修订，运行期间出现的新信息仍可触发下一轮；变化索引缺失或过大时退回当前图的有限概览。
+- `read_graph` 在服务端按实际响应字节数分页，使用返回的 `next_offset` 继续读取。单条 Fact／Finding 的支持数组过大时返回 `evidence_omitted`／`sources_omitted` 和数量；使用 `section:evidence` 或 `section:sources`、`ids:[该记录ID]` 分页补读。单条正文、证据项或概览仍过大时返回 `record_omitted`；沿用 section／ids，设置 `offset:record_offset`、`byte_offset:0`，带回 `state_version`（作为 `expected_version`）和 `record_version`，按 `next_byte_offset` 拼接 `content` 得到完整 JSON。版本变化会拒绝续读。证据字节不截断，省略不表示不存在。超大写入的成功回执保留身份、版本及 `result_omitted`，完整实体通过图接口读取。
+- Dispatcher 使用有界执行摘要、当前输入的定向查询和按 ID 的身份查询；当前 FGS 的 Step 状态仅查询各 Step 最新执行的状态和必要失败字段，已完成 Job 正文不进入日常调度或图工具调用。原始 Job 和单次会话仍用于对应运行的恢复与审计。数据库升级会一次性从原 Job 提取不可变的调度元数据并创建索引，不修改原始输入。每个新 Job 仍保存完整不可变输入；改用共享快照引用属于后续存储优化。
+- Decide 的读取、草稿、预览、提交、冲突及模型耗时等指标独立附加到成功执行记录，不重新写入业务结果。提交后给予 Worker 最多 10 秒回传收尾指标，人工停止和重启仍立即取消；进程故障可能留下缺失的观测，缺失不代表零调用。Mock 验证协议和故障行为，不代表已证明真实模型的规划质量或成本改善。
+
+运行查询接口：`GET /executions/pending?namespace=...&after=...&limit=100` 返回摘要及 `next_cursor`；`GET /projects/{pid}/executions/{rid}?namespace=...` 获取单次详情，末尾加 `/identity` 获取身份摘要。`GET /projects/{pid}/executions/check` 用于按任务和输入查询调度条件；`GET /projects/{pid}/state/changes?after=...&through=...` 返回最多 1000 条变化索引，可用最后一项 revision 作为 after 继续。`POST /projects/{pid}/state/read` 接收 `read_graph` 请求并返回有界图页，Worker 桥接不再先下载完整 State。原 `/executions?namespace=...` 保留旧版完整历史接口，Dispatcher 不再调用它；旧 Web 使用的项目执行展示接口保持兼容。
 
 已登记的旧版任务继续按原合同恢复；旧 HTTP 接口保留兼容映射，并为业务写入生成事件。心跳、租约活动和无变化重放不增加业务事件。新版运行不能通过旧收尾接口降级为无证据结论。原 Web 静态页面保持不变，扩展状态可通过 `/projects/{id}/state` 读取。
 

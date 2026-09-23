@@ -66,7 +66,15 @@ func (c *Client) Do(ctx context.Context, method, path string, input, output any,
 		_, err = io.Copy(io.Discard, res.Body)
 		return err
 	}
-	return json.NewDecoder(io.LimitReader(res.Body, 32<<20)).Decode(output)
+	const maxResponseBytes = 32 << 20
+	data, err := io.ReadAll(io.LimitReader(res.Body, maxResponseBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > maxResponseBytes {
+		return fmt.Errorf("board response exceeds %d-byte limit", maxResponseBytes)
+	}
+	return json.Unmarshal(data, output)
 }
 func (c *Client) List(ctx context.Context) ([]board.Summary, error) {
 	var p []board.Summary

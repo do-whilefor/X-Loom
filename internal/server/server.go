@@ -75,6 +75,7 @@ func New(store *b.Store) http.Handler {
 	}
 	s.registerStateRoutes(m)
 	s.registerExecutionRoutes(m)
+	s.registerObservationRoutes(m)
 	s.registerUIRoutes(m)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, pattern := m.Handler(r)

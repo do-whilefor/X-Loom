@@ -56,6 +56,9 @@ func (c *Client) graphBridge(parent context.Context, name, runDir string, j work
 				result, err = handler(ctx, j, request)
 				if err == nil {
 					response.Result, err = json.Marshal(result)
+					if err == nil && request.Op == "graph_action" {
+						response.Result, err = worker.CompactGraphActionResult(response.Result)
+					}
 				}
 			}
 		}

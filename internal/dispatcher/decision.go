@@ -2,33 +2,12 @@ package dispatcher
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"strconv"
 
 	"xloom/internal/board"
-	"xloom/internal/worker"
 )
-
-// The durable baseline is the successful execution's original input, never
-// the graph at its completion time or a page read by the model mid-decision.
-func (s *Scheduler) previousDecision(state board.State) *board.State {
-	var previous *board.State
-	for _, e := range s.executions {
-		if e.ProjectID != state.Graph.Project.ID || e.Kind != "reason" || e.Status != "succeeded" {
-			continue
-		}
-		var job worker.Job
-		if json.Unmarshal(e.Job, &job) != nil || job.Graph.Project.Generation != state.Graph.Project.Generation {
-			continue
-		}
-		// A newer legacy execution with no full state invalidates an older
-		// baseline instead of silently skipping an untraceable decision.
-		previous = job.State
-	}
-	return previous
-}
 
 func (s *Scheduler) prepareDecision(ctx context.Context, t *task, trigger string) error {
 	var state board.State
@@ -39,10 +18,21 @@ func (s *Scheduler) prepareDecision(ctx context.Context, t *task, trigger string
 	if state.Graph.Project.ID != t.Job.Graph.Project.ID || state.Graph.Project.Generation != t.Job.Graph.Project.Generation {
 		return errors.New("state_changed: project round changed before decision preparation")
 	}
-	previous := s.previousDecision(state)
+	// The claim and state read can race new evidence. Query retry metadata for
+	// the same immutable input that registration will persist below.
+	s.stateRevisions[state.Graph.Project.ID] = state.DecisionRevision
+	query, err := s.executionCheck(ctx, state.Graph, "reason", nil, board.DecisionStateVersion(state))
+	if err != nil {
+		return err
+	}
+	previous := query.LatestDecision
+	var cursor *board.DecisionCursor
+	if previous != nil && previous.HasState {
+		cursor = &board.DecisionCursor{ProjectID: previous.ProjectID, Generation: previous.Generation, Revision: previous.InputRevision}
+	}
 	var events []board.StateEvent
-	if previous != nil && previous.Revision < state.Revision {
-		err := s.Client.Do(ctx, "GET", base+"/state/events?after="+strconv.FormatInt(previous.Revision, 10), nil, &events, &t.Lease)
+	if cursor != nil && cursor.Revision < state.Revision {
+		err := s.Client.Do(ctx, "GET", base+"/state/changes?after="+strconv.FormatInt(cursor.Revision, 10)+"&through="+strconv.FormatInt(state.Revision, 10), nil, &events, &t.Lease)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -58,7 +48,7 @@ func (s *Scheduler) prepareDecision(ctx context.Context, t *task, trigger string
 			}
 		}
 	}
-	view, err := board.BuildDecisionContext(state, previous, events, board.DefaultContextViewBytes)
+	view, err := board.BuildDecisionContextFromCursor(state, cursor, events, board.DefaultContextViewBytes)
 	if err != nil {
 		return err
 	}
@@ -71,19 +61,10 @@ func (s *Scheduler) prepareDecision(ctx context.Context, t *task, trigger string
 	t.Job.DecisionRevision = state.DecisionRevision
 	t.Job.DecisionTrigger = trigger
 	t.Job.DecisionTriggers = decisionTriggers(state, previous, trigger)
-	for _, e := range s.executions {
-		if e.ProjectID != state.Graph.Project.ID || e.Kind != "reason" {
-			continue
-		}
-		var job worker.Job
-		if json.Unmarshal(e.Job, &job) == nil && job.State != nil && board.DecisionStateVersion(*job.State) == view.StateVersion {
-			t.Job.DecisionRepeated = true
-			break
-		}
-	}
+	t.Job.DecisionRepeated = query.Repeated
+
 	// Registration retry identity and the successful checkpoint share exactly
 	// this snapshot; newer evidence remains eligible for a subsequent run.
-	s.stateRevisions[state.Graph.Project.ID] = state.DecisionRevision
 	slog.Info("decision input", "project", state.Graph.Project.ID, "run", t.Job.RunID,
 		"trigger", trigger, "causes", t.Job.DecisionTriggers, "mode", view.Mode,
 		"fallback", view.Fallback, "from_revision", view.FromRevision, "to_revision", view.ToRevision,
@@ -91,7 +72,7 @@ func (s *Scheduler) prepareDecision(ctx context.Context, t *task, trigger string
 	return nil
 }
 
-func decisionTriggers(state board.State, previous *board.State, trigger string) []string {
+func decisionTriggers(state board.State, previous *board.ExecutionSummary, trigger string) []string {
 	if previous == nil {
 		return []string{trigger}
 	}
@@ -99,13 +80,13 @@ func decisionTriggers(state board.State, previous *board.State, trigger string) 
 	if trigger == "explicit_retry" {
 		causes = append(causes, trigger)
 	}
-	if len(state.Graph.Facts) > len(previous.Graph.Facts) {
+	if len(state.Graph.Facts) > previous.FactCount {
 		causes = append(causes, "new_facts")
 	}
-	if len(state.Graph.Hints) > len(previous.Graph.Hints) {
+	if len(state.Graph.Hints) > previous.HintCount {
 		causes = append(causes, "new_hints")
 	}
-	if previous.Graph.OpenCount() > 0 && state.Graph.OpenCount() == 0 {
+	if previous.OpenCount > 0 && state.Graph.OpenCount() == 0 {
 		causes = append(causes, "intents_finished")
 	}
 	if state.DecisionRevision > previous.DecisionRevision {

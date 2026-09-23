@@ -125,6 +125,11 @@ func Open(path string) (*Store, error) {
 			return nil, err
 		}
 	}
+	if err = migrateExecutionMetadata(migration); err != nil {
+		migration.Rollback()
+		db.Close()
+		return nil, err
+	}
 	if err = migration.Commit(); err != nil {
 		db.Close()
 		return nil, err

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -85,62 +86,56 @@ func (s *Scheduler) retryKey(g board.Graph, kind string, intent *board.Intent) s
 		Revision int64
 	}{g.Facts, g.Hints, ended, s.stateRevisions[g.Project.ID]})
 }
-func (s *Scheduler) previous(g board.Graph, kind string, intent *board.Intent) string {
-	iid := ""
+
+// Scheduling asks the registry only about this input. Historical Jobs and
+// Results remain on the Server and never accumulate in a dispatcher snapshot.
+func (s *Scheduler) executionCheck(ctx context.Context, g board.Graph, kind string, intent *board.Intent, stateVersion string) (board.ExecutionCheck, error) {
+	query := url.Values{"namespace": {s.namespace()}, "generation": {strconv.FormatInt(g.Project.Generation, 10)}, "kind": {kind}, "retry_key": {s.retryKey(g, kind, intent)}}
 	if intent != nil {
-		iid = intent.ID
+		query.Set("intent", intent.ID)
 	}
-	id := ""
-	for _, e := range s.executions {
-		if e.ProjectID == g.Project.ID && e.Kind == kind && e.Intent == iid && e.Status == "retry_requested" {
-			id = e.ID
-		}
+	if stateVersion != "" {
+		query.Set("state_version", stateVersion)
 	}
-	return id
+	var check board.ExecutionCheck
+	err := s.Client.Do(ctx, "GET", projectPath(g.Project.ID)+"/executions/check?"+query.Encode(), nil, &check, nil)
+	return check, err
 }
-func (s *Scheduler) executionBlocked(g board.Graph, kind string, intent *board.Intent) bool {
-	key := s.retryKey(g, kind, intent)
-	explicit := s.previous(g, kind, intent) != ""
-	for _, e := range s.executions {
-		if e.ProjectID != g.Project.ID || e.Kind != kind {
-			continue
-		}
-		same := kind == "reason" || (intent != nil && e.Intent == intent.ID)
-		if same && e.Pending() {
-			return true
-		}
-		if e.RetryKey == key && e.Status != "retry_requested" && e.Status != "retried" && !explicit {
-			return true
-		}
+
+func (s *Scheduler) restoreDecisionBoundary(project string, latest *board.ExecutionSummary) {
+	if latest == nil || latest.Generation != s.generations[project] {
+		return
 	}
-	return false
+	s.checkpoints[project] = checkpoint{latest.FactCount, latest.HintCount, latest.OpenCount}
+	s.decisionRevisions[project] = latest.DecisionRevision
 }
+
 func (s *Scheduler) loadExecutions(ctx context.Context) error {
-	var list []board.Execution
-	if err := s.Client.Do(ctx, "GET", "/executions?namespace="+url.QueryEscape(s.namespace()), nil, &list, nil); err != nil {
+	s.pendingExecutions = nil
+	var after int64
+	for {
+		var page board.ExecutionPage
+		query := url.Values{"namespace": {s.namespace()}, "after": {strconv.FormatInt(after, 10)}, "limit": {"100"}}
+		if err := s.Client.Do(ctx, "GET", "/executions/pending?"+query.Encode(), nil, &page, nil); err != nil {
+			return err
+		}
+		s.pendingExecutions = append(s.pendingExecutions, page.Items...)
+		if page.NextCursor == 0 {
+			return nil
+		}
+		if page.NextCursor <= after {
+			return errors.New("execution pending cursor did not advance")
+		}
+		after = page.NextCursor
+	}
+}
+
+func (s *Scheduler) register(ctx context.Context, t *task) error {
+	check, err := s.executionCheck(ctx, t.Job.Graph, t.Job.Kind, t.Job.Intent, "")
+	if err != nil {
 		return err
 	}
-	s.executions = list
-	// A restart must not forget the last decision's input boundary. New evidence
-	// received during that decision is deliberately not swallowed by this point.
-	for _, e := range list {
-		if e.Kind != "reason" || e.Status != "succeeded" {
-			continue
-		}
-		var j worker.Job
-		if json.Unmarshal(e.Job, &j) != nil {
-			continue
-		}
-		if j.Graph.Project.Generation != s.generations[e.ProjectID] {
-			continue
-		}
-		s.checkpoints[e.ProjectID] = checkpoint{len(j.Graph.Facts), len(j.Graph.Hints), j.Graph.OpenCount()}
-		s.decisionRevisions[e.ProjectID] = j.DecisionRevision
-	}
-	return nil
-}
-func (s *Scheduler) register(ctx context.Context, t *task) error {
-	t.Job.PreviousRunID = s.previous(t.Job.Graph, t.Job.Kind, t.Job.Intent)
+	t.Job.PreviousRunID = check.PreviousRunID
 	raw, err := json.Marshal(t.Job)
 	if err != nil {
 		return err
@@ -154,7 +149,6 @@ func (s *Scheduler) register(ctx context.Context, t *task) error {
 	if err = json.Unmarshal(t.Execution.Job, &t.Job); err != nil {
 		return err
 	}
-	s.executions = append(s.executions, t.Execution)
 	return nil
 }
 func (s *Scheduler) start(ctx context.Context, t *task) {
@@ -201,20 +195,17 @@ func (s *Scheduler) terminal(t *task, status string, result worker.Result) {
 	_ = s.status(ctx, t, status, result)
 }
 func (s *Scheduler) recoverExecutions(ctx context.Context, states map[string]string) error {
-	for _, e := range s.executions {
+	for _, e := range s.pendingExecutions {
 		if !e.Pending() || s.running[e.ID] != nil {
 			continue
 		}
-		var j worker.Job
-		if err := json.Unmarshal(e.Job, &j); err != nil {
-			return fmt.Errorf("execution %s has invalid job: %w", e.ID, err)
-		}
-		t := &task{Job: j, Execution: e, Lease: Lease{Run: e.Lease, Kind: e.Kind, Intent: e.Intent}}
-		if states[e.ProjectID] != "active" || j.Graph.Project.Generation != s.generations[e.ProjectID] {
+		project := board.Project{ID: e.ProjectID, Generation: e.Generation}
+		t := &task{Job: worker.Job{RunID: e.ID, Graph: board.Graph{Project: project}}, Lease: Lease{Run: e.Lease, Kind: e.Kind, Intent: e.Intent}}
+		if states[e.ProjectID] != "active" || e.Generation != s.generations[e.ProjectID] {
 			s.terminal(t, "cancelled", worker.Result{Status: "failed", FailureKind: "hard_cancelled", Error: "project is not active"})
 			continue
 		}
-		if !s.restartReady(ctx, j.Graph.Project) {
+		if !s.restartReady(ctx, project) {
 			continue
 		}
 		if len(s.running) >= s.Config.Runtime.MaxWorkers {
@@ -228,7 +219,7 @@ func (s *Scheduler) recoverExecutions(ctx context.Context, states map[string]str
 		for _, running := range s.running {
 			if running.Job.Graph.Project.ID == e.ProjectID {
 				projectCount++
-				staleRound = staleRound || running.Job.Graph.Project.Generation != j.Graph.Project.Generation
+				staleRound = staleRound || running.Job.Graph.Project.Generation != e.Generation
 			}
 			if running.Worker.Name == e.Backend {
 				backendCount++
@@ -245,11 +236,28 @@ func (s *Scheduler) recoverExecutions(ctx context.Context, states map[string]str
 				break
 			}
 		}
-		if !found || !slices.Contains(t.Worker.TaskTypes, e.Kind) || j.EnvironmentID != s.environmentID(t.Worker) {
+		if !found || !slices.Contains(t.Worker.TaskTypes, e.Kind) {
 			s.terminal(t, "failed", worker.Result{Status: "failed", FailureKind: "configuration", Error: "registered execution environment changed"})
 			continue
 		}
 		if backendCount >= t.Worker.MaxRunning || time.Now().Before(s.unhealthy[t.Worker.Name]) {
+			continue
+		}
+		if err := s.Client.Do(ctx, "GET", executionPath(t)+"?namespace="+url.QueryEscape(s.namespace()), nil, &t.Execution, nil); err != nil {
+			var pe *ProtocolError
+			if errors.As(err, &pe) && pe.Status == 404 {
+				continue // A project restart may have removed this page's record.
+			}
+			return err
+		}
+		if !t.Execution.Pending() {
+			continue
+		}
+		if err := json.Unmarshal(t.Execution.Job, &t.Job); err != nil {
+			return fmt.Errorf("execution %s has invalid job: %w", e.ID, err)
+		}
+		if t.Job.EnvironmentID != s.environmentID(t.Worker) {
+			s.terminal(t, "failed", worker.Result{Status: "failed", FailureKind: "configuration", Error: "registered execution environment changed"})
 			continue
 		}
 		err := s.Client.Do(ctx, "POST", executionPath(t)+"/resume", map[string]any{}, &t.Execution, &t.Lease)
@@ -299,6 +307,7 @@ func (s *Scheduler) runRegistered(ctx context.Context, t *task, stopHeartbeat fu
 			}
 			if committed, receiptErr := s.decisionCommitted(ctx, t); committed || receiptErr != nil {
 				if committed {
+					s.observeDecision(ctx, t, result.Metrics)
 					return "success", nil
 				}
 				return "interrupted", receiptErr
@@ -375,7 +384,35 @@ func (s *Scheduler) decisionCommitted(ctx context.Context, t *task) (bool, error
 	defer cancel()
 	var receipt board.DecisionReceipt
 	err := s.Client.Do(readCtx, "GET", projectPath(t.Job.Graph.Project.ID)+"/state/decisions/receipt", nil, &receipt, &t.Lease)
+	if err == nil && receipt.Committed {
+		t.committedAt.CompareAndSwap(0, time.Now().UnixNano())
+	}
 	return receipt.Committed, err
+}
+
+const decisionFinishGrace = 10 * time.Second
+
+func (s *Scheduler) decisionFinishAllowed(ctx context.Context, t *task) bool {
+	committed, err := s.decisionCommitted(ctx, t)
+	if err != nil || !committed || time.Since(time.Unix(0, t.committedAt.Load())) >= decisionFinishGrace {
+		return false
+	}
+	// A human stop or a new generation always overrides this delivery grace.
+	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	g, err := s.Client.Get(readCtx, t.Job.Graph.Project.ID)
+	return err == nil && g.Project.Generation == t.Job.Graph.Project.Generation && (g.Project.Status == "active" || g.Project.Status == "completed")
+}
+
+func (s *Scheduler) observeDecision(ctx context.Context, t *task, metrics *worker.DecisionMetrics) {
+	if metrics == nil {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := s.Client.Do(writeCtx, "POST", executionPath(t)+"/observation", map[string]any{"metrics": metrics}, nil, &t.Lease); err != nil {
+		slog.Warn("decision observation could not be saved", "project", t.Job.Graph.Project.ID, "run", t.Job.RunID, "error", err)
+	}
 }
 
 func (s *Scheduler) configureGraphHandler() {
@@ -387,26 +424,21 @@ func (s *Scheduler) configureGraphHandler() {
 	}
 	setter.SetGraphHandler(func(ctx context.Context, j worker.Job, request worker.GraphRequest) (any, error) {
 		// The job, not model-generated fields, supplies project and lease identity.
-		backend := ""
 		// Worker identity is registered on the Server; avoid reading Scheduler maps
 		// from Runner goroutines, which would race with dispatch/reaping.
-		var entries []board.Execution
-		if err := s.Client.Do(ctx, "GET", "/executions?namespace="+url.QueryEscape(s.namespace()), nil, &entries, nil); err != nil {
+		var identity board.ExecutionSummary
+		path := projectPath(j.Graph.Project.ID) + "/executions/" + url.PathEscape(j.RunID) + "/identity?namespace=" + url.QueryEscape(s.namespace())
+		if err := s.Client.Do(ctx, "GET", path, nil, &identity, nil); err != nil {
 			return nil, err
 		}
-		for _, e := range entries {
-			if e.ProjectID == j.Graph.Project.ID && e.ID == j.RunID {
-				backend = e.Backend
-				break
-			}
+		intent := ""
+		if j.Intent != nil {
+			intent = j.Intent.ID
 		}
-		if backend == "" {
+		if identity.ProjectID != j.Graph.Project.ID || identity.Generation != j.Graph.Project.Generation || identity.ID != j.RunID || identity.Namespace != s.namespace() || identity.Kind != j.Kind || identity.Intent != intent || identity.Lease == "" {
 			return nil, errors.New("graph request has no registered execution")
 		}
-		lease := Lease{Run: backend + "@" + j.RunID, Kind: j.Kind}
-		if j.Intent != nil {
-			lease.Intent = j.Intent.ID
-		}
+		lease := Lease{Run: identity.Lease, Kind: identity.Kind, Intent: identity.Intent}
 		base := projectPath(j.Graph.Project.ID)
 		switch request.Op {
 		case "decision_preview", "decision_commit", "decision_receipt":
@@ -425,11 +457,11 @@ func (s *Scheduler) configureGraphHandler() {
 			}
 			return result, err
 		case "read_graph":
-			var state board.State
-			if err := s.Client.Do(ctx, "GET", base+"/state", nil, &state, &lease); err != nil {
-				return nil, err
-			}
-			return worker.GraphPage(state, request)
+			// Bound the HTTP response too: a current FGS may exceed the client
+			// limit even though the requested graph/evidence page is small.
+			var page json.RawMessage
+			err := s.Client.Do(ctx, "POST", base+"/state/read", request, &page, &lease)
+			return page, err
 		case "graph_action":
 			var result board.StateActionResult
 			err := s.Client.Do(ctx, "POST", base+"/state/actions", request.Action, &result, &lease)

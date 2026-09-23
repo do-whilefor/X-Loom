@@ -84,6 +84,10 @@ func (t *Tx) RegisterExecution(e Execution) error {
 	if _, err := DecisionJobVersion(e.Job); err != nil {
 		return err
 	}
+	metadata, err := executionInputMetadata(e.Job)
+	if err != nil {
+		return Err(422, "invalid execution job")
+	}
 	g, err := t.Load(e.ProjectID)
 	if err != nil {
 		return err
@@ -93,17 +97,7 @@ func (t *Tx) RegisterExecution(e Execution) error {
 	}
 	// A new lease can race a restart after the dispatcher read its input. Check
 	// the immutable job's round, even if that newly claimed lease is valid.
-	var round struct {
-		Graph struct {
-			Project struct {
-				Generation int64 `json:"generation"`
-			} `json:"project"`
-		} `json:"graph"`
-	}
-	if json.Unmarshal(e.Job, &round) != nil {
-		return Err(422, "invalid execution job")
-	}
-	if round.Graph.Project.Generation != g.Project.Generation {
+	if metadata.Generation != g.Project.Generation {
 		return Err(409, "Execution input belongs to a previous project round")
 	}
 	if err = t.CheckExecution(g, e.Fence()); err != nil {
@@ -139,9 +133,9 @@ func (t *Tx) RegisterExecution(e Execution) error {
 	if err = json.Unmarshal(e.Job, &job); err != nil {
 		return Err(422, "invalid execution job")
 	}
-	var grant *Execution
+	var grant *ExecutionSummary
 	if job.PreviousRunID != "" {
-		previous, err := t.Execution(e.ProjectID, job.PreviousRunID)
+		previous, err := t.GetExecutionSummary(e.Namespace, e.ProjectID, job.PreviousRunID)
 		if err != nil {
 			return err
 		}
@@ -165,7 +159,9 @@ func (t *Tx) RegisterExecution(e Execution) error {
 			return err
 		}
 	}
-	_, err = t.Exec(`INSERT INTO xloom_executions(`+executionColumns+`) VALUES(?,?,?,?,?,?,?,?,?,'prepared',NULL,0,?,?)`, e.ProjectID, e.ID, e.Namespace, e.Backend, e.Kind, e.Intent, e.Lease, []byte(e.Job), e.RetryKey, t.Now, t.Now)
+	args := []any{e.ProjectID, e.ID, e.Namespace, e.Backend, e.Kind, e.Intent, e.Lease, []byte(e.Job), e.RetryKey, t.Now, t.Now}
+	args = append(args, executionMetadataValues(metadata)...)
+	_, err = t.Exec(`INSERT INTO xloom_executions(`+executionColumns+`,`+executionMetadataColumns+`,metadata_version) VALUES(?,?,?,?,?,?,?,?,?,'prepared',NULL,0,?,?,?,?,?,?,?,?,?,?,1)`, args...)
 	return err
 }
 func (t *Tx) ExecutionStatus(e Execution, status string, result json.RawMessage) error {

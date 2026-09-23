@@ -1,23 +1,30 @@
 package worker
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"xloom/internal/board"
 )
 
 const MaxGraphRPCBytes = 128 << 10
 
+// Leave room for the request ID and the GraphResponse envelope.
+const maxGraphPageBytes = MaxGraphRPCBytes - 1024
+
 type GraphRequest struct {
 	RequestID       string               `json:"request_id"`
 	Op              string               `json:"op"`
 	Section         string               `json:"section,omitempty"`
 	Offset          int                  `json:"offset,omitempty"`
+	ByteOffset      *int                 `json:"byte_offset,omitempty"`
+	RecordVersion   string               `json:"record_version,omitempty"`
 	Limit           int                  `json:"limit,omitempty"`
 	ExpectedVersion string               `json:"expected_version,omitempty"`
 	IDs             []string             `json:"ids,omitempty"`
@@ -61,10 +68,10 @@ func ValidateGraphRequest(j Job, r GraphRequest) error {
 		if err := validateGraphIDs(r); err != nil {
 			return err
 		}
-		if r.Offset < 0 || r.Limit < 0 || r.Limit > 50 {
-			return errors.New("graph page requires offset >= 0 and limit <= 50")
+		if err := validateGraphOffsets(r); err != nil {
+			return err
 		}
-		if !slices.Contains([]string{"", "overview", "facts", "goals", "steps", "findings", "relations", "hints"}, r.Section) {
+		if !slices.Contains([]string{"", "overview", "facts", "goals", "steps", "findings", "relations", "hints", "evidence", "sources"}, r.Section) {
 			return errors.New("unknown graph section")
 		}
 		return nil
@@ -88,8 +95,9 @@ func ValidateGraphRequest(j Job, r GraphRequest) error {
 	return nil
 }
 
-// GraphPage retains complete objects and reports the page boundary explicitly.
-// The dispatcher obtains State under the current execution fence before calling.
+// GraphPage retains complete objects when they fit. Oversized evidence/support
+// arrays have explicit omission markers and their own lossless detail pages.
+// The server obtains State under the current execution fence before calling.
 func GraphPage(s board.State, r GraphRequest) (any, error) {
 	if err := validateGraphIDs(r); err != nil {
 		return nil, err
@@ -98,8 +106,8 @@ func GraphPage(s board.State, r GraphRequest) (any, error) {
 	if r.ExpectedVersion != "" && r.ExpectedVersion != version {
 		return nil, errors.New("state_changed: graph changed since the previous view; read overview and re-read affected evidence before deciding")
 	}
-	if r.Offset < 0 || r.Limit < 0 || r.Limit > 50 {
-		return nil, errors.New("invalid graph page")
+	if err := validateGraphOffsets(r); err != nil {
+		return nil, err
 	}
 	if r.Section == "" {
 		r.Section = "overview"
@@ -124,6 +132,17 @@ func GraphPage(s board.State, r GraphRequest) (any, error) {
 			Counts           map[string]int `json:"counts"`
 		}{s.Graph.Project, inputs, s.Revision, s.DecisionRevision, version, map[string]int{"facts": len(s.FactRecords), "goals": len(s.Goals), "steps": len(s.Steps), "findings": len(s.Findings), "relations": len(s.FactRelations), "hints": len(s.Graph.Hints)}}
 	} else {
+		if r.Section == "evidence" || r.Section == "sources" {
+			items, found, err := graphDetails(s, r)
+			if err != nil {
+				return nil, err
+			}
+			missing := []string{}
+			if !found {
+				missing = append(missing, r.IDs[0])
+			}
+			return graphItemsPage(s, r, version, items, missing)
+		}
 		var items []json.RawMessage
 		var raw []byte
 		var err error
@@ -175,27 +194,240 @@ func GraphPage(s board.State, r GraphRequest) (any, error) {
 				}
 			}
 		}
-		total := len(items)
-		start := min(r.Offset, total)
-		end := min(start+r.Limit, total)
-		page := items[start:end]
-		if page == nil {
-			page = []json.RawMessage{}
-		}
-		value := graphPage{Section: r.Section, Offset: start, Total: total, Items: page, Revision: s.Revision, Generation: s.Graph.Project.Generation, StateVersion: version, RequestedIDs: r.IDs, MissingIDs: missing}
-		if end < total {
-			value.NextOffset = &end
-		}
-		data = value
+		return graphItemsPage(s, r, version, items, missing)
 	}
 	raw, err := json.Marshal(data)
 	if err != nil {
 		return nil, err
 	}
-	if len(raw) > MaxGraphRPCBytes-1024 {
-		return nil, fmt.Errorf("graph page exceeds %d bytes; request a smaller limit or narrower section", MaxGraphRPCBytes-1024)
+	if r.ByteOffset != nil {
+		if r.Offset != 0 {
+			return nil, errors.New("overview record offset must be zero")
+		}
+		return graphRecordContent(r, version, raw)
+	}
+	if len(raw) > maxGraphPageBytes {
+		return graphRecordReference{true, 0, len(raw), version, graphRecordVersion(raw), graphRecordReadMore}, nil
 	}
 	return data, nil
+}
+
+// byte_offset addresses UTF-8 bytes in the JSON encoding of one complete record,
+// before support compaction. The state version binds every fragment to that input.
+func validateGraphOffsets(r GraphRequest) error {
+	if r.Offset < 0 || r.Limit < 0 || r.Limit > 50 {
+		return errors.New("graph page requires offset >= 0 and limit <= 50")
+	}
+	if r.ByteOffset != nil && (*r.ByteOffset < 0 || r.ExpectedVersion == "") {
+		return errors.New("byte pages require byte_offset >= 0 and expected_version from the original page")
+	}
+	if r.ByteOffset != nil && *r.ByteOffset > 0 && r.RecordVersion == "" {
+		return errors.New("byte continuation requires record_version from the original page")
+	}
+	return nil
+}
+
+func graphItemsPage(s board.State, r GraphRequest, version string, items []json.RawMessage, missing []string) (any, error) {
+	if r.ByteOffset != nil {
+		if r.Offset >= len(items) {
+			return nil, errors.New("graph record offset is outside the selected records")
+		}
+		return graphRecordContent(r, version, items[r.Offset])
+	}
+	return boundedGraphPage(s, r, version, items, missing)
+}
+
+const graphRecordReadMore = "Read the same section and ids with offset:record_offset, byte_offset:0, expected_version:state_version and record_version. Concatenate content fragments, following next_byte_offset until absent, then parse the complete JSON record."
+
+type graphRecordReference struct {
+	RecordOmitted bool   `json:"record_omitted"`
+	RecordOffset  int    `json:"record_offset"`
+	RecordBytes   int    `json:"record_bytes"`
+	StateVersion  string `json:"state_version"`
+	RecordVersion string `json:"record_version"`
+	ReadMore      string `json:"read_more"`
+}
+
+type graphContentPage struct {
+	StateVersion   string `json:"state_version"`
+	RecordVersion  string `json:"record_version"`
+	Section        string `json:"section"`
+	Offset         int    `json:"offset"`
+	ByteOffset     int    `json:"byte_offset"`
+	TotalBytes     int    `json:"total_bytes"`
+	NextByteOffset *int   `json:"next_byte_offset,omitempty"`
+	Content        string `json:"content"`
+}
+
+func graphRecordContent(r GraphRequest, version string, raw []byte) (graphContentPage, error) {
+	recordVersion := graphRecordVersion(raw)
+	if r.RecordVersion != "" && r.RecordVersion != recordVersion {
+		return graphContentPage{}, errors.New("state_changed: record changed since the previous fragment; re-read this record from byte_offset 0")
+	}
+	start := *r.ByteOffset
+	if start > len(raw) || (start < len(raw) && !utf8.RuneStart(raw[start])) {
+		return graphContentPage{}, errors.New("byte_offset must be within the record at a UTF-8 boundary")
+	}
+	// JSON-encoded JSON text can expand through quoting and escaping. Keep each
+	// fragment small enough even when every byte needs escaping in the envelope.
+	end := start + min(len(raw)-start, (maxGraphPageBytes-1024)/6)
+	for end < len(raw) && !utf8.RuneStart(raw[end]) {
+		end--
+	}
+	page := graphContentPage{StateVersion: version, RecordVersion: recordVersion, Section: r.Section, Offset: r.Offset, ByteOffset: start, TotalBytes: len(raw), Content: string(raw[start:end])}
+	if end < len(raw) {
+		page.NextByteOffset = &end
+	}
+	return page, nil
+}
+
+func graphRecordVersion(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func graphDetails(s board.State, r GraphRequest) ([]json.RawMessage, bool, error) {
+	var value any
+	found := false
+	if r.Section == "evidence" {
+		for _, fact := range s.FactRecords {
+			if fact.ID == r.IDs[0] {
+				value, found = fact.Evidence, true
+				break
+			}
+		}
+	}
+	if !found {
+		for _, finding := range s.Findings {
+			if finding.ID == r.IDs[0] {
+				value, found = finding.Evidence, true
+				if r.Section == "sources" {
+					value = finding.Sources
+				}
+				break
+			}
+		}
+	}
+	var items []json.RawMessage
+	if found {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil, false, err
+		}
+		if err = json.Unmarshal(raw, &items); err != nil {
+			return nil, false, err
+		}
+	}
+	return items, found, nil
+}
+
+func boundedGraphPage(s board.State, r GraphRequest, version string, items []json.RawMessage, missing []string) (graphPage, error) {
+	total := len(items)
+	start := min(r.Offset, total)
+	end := min(start+r.Limit, total)
+	value := graphPage{Section: r.Section, Offset: start, Total: total, Revision: s.Revision, Generation: s.Graph.Project.Generation, StateVersion: version, RequestedIDs: r.IDs, MissingIDs: missing}
+	// Echoing the filter is optional; missing IDs are authoritative. Repeating
+	// maximally escaped IDs in both fields can consume the entire response frame.
+	if raw, err := json.Marshal(value); err != nil {
+		return graphPage{}, err
+	} else if len(raw) > maxGraphPageBytes/2 {
+		value.RequestedIDs = nil
+	}
+	for {
+		value.Items = items[start:end]
+		if value.Items == nil {
+			value.Items = []json.RawMessage{}
+		}
+		value.NextOffset = nil
+		if end < total {
+			next := end
+			value.NextOffset = &next
+		}
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return graphPage{}, err
+		}
+		if len(raw) <= maxGraphPageBytes {
+			return value, nil
+		}
+		if end-start > 1 {
+			end--
+			continue
+		}
+		if end > start {
+			compact, err := compactGraphRecord(r.Section, items[start])
+			if err != nil {
+				return graphPage{}, err
+			}
+			value.Items = []json.RawMessage{compact}
+			raw, err = json.Marshal(value)
+			if err != nil {
+				return graphPage{}, err
+			}
+			if len(raw) <= maxGraphPageBytes {
+				return value, nil
+			}
+			reference, err := json.Marshal(graphRecordReference{true, start, len(items[start]), version, graphRecordVersion(items[start]), graphRecordReadMore})
+			if err != nil {
+				return graphPage{}, err
+			}
+			value.Items = []json.RawMessage{reference}
+			return value, nil
+		}
+		return graphPage{}, fmt.Errorf("graph %s record at offset %d has scalar content exceeding the response budget; reducing limit cannot retrieve it", r.Section, start)
+	}
+}
+
+func compactGraphRecord(section string, raw json.RawMessage) (json.RawMessage, error) {
+	if section != "facts" && section != "findings" {
+		return raw, nil
+	}
+	var record map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return nil, err
+	}
+	omitted := false
+	for _, field := range []string{"evidence", "sources"} {
+		var entries []json.RawMessage
+		if len(record[field]) == 0 {
+			continue
+		}
+		if err := json.Unmarshal(record[field], &entries); err != nil {
+			return nil, err
+		}
+		if len(entries) == 0 {
+			continue
+		}
+		delete(record, field)
+		record[field+"_omitted"] = json.RawMessage("true")
+		record[field+"_count"], _ = json.Marshal(len(entries))
+		omitted = true
+	}
+	if omitted {
+		record["read_more"], _ = json.Marshal("Omitted support is not absent. Use read_graph with section evidence or sources, ids:[this record's id], offset:0, then follow next_offset until absent. Sources pages apply to Findings.")
+	}
+	return json.Marshal(record)
+}
+
+// CompactGraphActionResult keeps the successful write acknowledgement within
+// the bridge frame. The saved entity remains available through graph pages.
+func CompactGraphActionResult(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) <= maxGraphPageBytes {
+		return raw, nil
+	}
+	var result board.StateActionResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	return json.Marshal(struct {
+		Op            string `json:"op"`
+		ID            string `json:"id"`
+		Revision      int64  `json:"revision"`
+		StateVersion  string `json:"state_version,omitempty"`
+		Unchanged     bool   `json:"unchanged,omitempty"`
+		ResultOmitted bool   `json:"result_omitted"`
+		ReadMore      string `json:"read_more"`
+	}{result.Op, result.ID, result.Revision, result.StateVersion, result.Unchanged, true, "Write succeeded. Read this entity by id in its graph section; follow any evidence_omitted or sources_omitted detail pages. Do not resubmit the write because its entity payload is omitted."})
 }
 
 type graphPage struct {
@@ -212,6 +444,9 @@ type graphPage struct {
 }
 
 func validateGraphIDs(r GraphRequest) error {
+	if (r.Section == "evidence" || r.Section == "sources") && len(r.IDs) != 1 {
+		return errors.New("evidence and sources pages require exactly one record ID; evidence accepts Fact or Finding IDs, sources accepts a Finding ID")
+	}
 	if len(r.IDs) > 50 {
 		return errors.New("at most 50 graph IDs are allowed")
 	}
