@@ -475,7 +475,12 @@ func (s *Server) reason(t *b.Tx, q *request, r *http.Request) (int, any, error) 
 	case "release":
 		g.Project.Reason = nil
 	}
-	return 200, g.Project, t.Save(g)
+	if reason := g.Project.Reason; reason != nil {
+		_, err = t.Exec("UPDATE projects SET reason_worker=?,reason_trigger=?,reason_started_at=?,reason_last_heartbeat_at=? WHERE id=?", reason.Worker, reason.Trigger, reason.StartedAt, reason.Heartbeat, g.Project.ID)
+	} else {
+		_, err = t.Exec("UPDATE projects SET reason_worker=NULL,reason_trigger=NULL,reason_started_at=NULL,reason_last_heartbeat_at=NULL WHERE id=?", g.Project.ID)
+	}
+	return 200, g.Project, err
 }
 func (s *Server) hint(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 	content, creator := q.text("content"), q.text("creator")
@@ -614,7 +619,8 @@ func changeIntent(t *b.Tx, project, intent string, fence b.ExecutionFence, op, w
 		}
 		if op == "release" {
 			i.Worker = nil
-			return 200, *i, t.Save(g)
+			_, err = t.Exec("UPDATE intents SET worker=NULL WHERE project_id=? AND id=?", g.Project.ID, i.ID)
+			return 200, *i, err
 		}
 		if op == "heartbeat" && i.Worker == nil {
 			if err := t.StepReady(g.Project.ID, i.ID); err != nil {
@@ -624,7 +630,8 @@ func changeIntent(t *b.Tx, project, intent string, fence b.ExecutionFence, op, w
 		i.Worker = b.Ptr(worker)
 		i.Heartbeat = b.Ptr(t.Now)
 		if op == "heartbeat" {
-			return 200, *i, t.Save(g)
+			_, err = t.Exec("UPDATE intents SET worker=?,last_heartbeat_at=? WHERE project_id=? AND id=?", worker, t.Now, g.Project.ID, i.ID)
+			return 200, *i, err
 		}
 		if err := t.CheckLegacyConclusion(g.Project.ID, worker); err != nil {
 			return 0, nil, err
