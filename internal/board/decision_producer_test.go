@@ -57,62 +57,44 @@ func assertProducerNodes(t *testing.T, body decisionView, steps, facts []string)
 }
 
 func TestDecisionProcessFactProducerClosure(t *testing.T) {
-	for _, entry := range []string{"cursor", "snapshot"} {
-		for _, test := range []struct {
-			name   string
-			from   []string
-			facts  []string
-			legacy bool
-		}{
-			{"process", []string{"F2"}, []string{"F1", "F2"}, false},
-			{"final", []string{"F3"}, []string{"F1", "F3"}, false},
-			{"multiple_process", []string{"F2", "F4"}, []string{"F1", "F2", "F4"}, false},
-			{"legacy_result", []string{"F3"}, []string{"F1", "F3"}, true},
-		} {
-			t.Run(entry+"/"+test.name, func(t *testing.T) {
-				s := decisionProducerState(test.from...)
-				if test.legacy {
-					s.FactRecords[2].SourceStepID = ""
-					s.FactRecords[2].Legacy = true
-				}
-				original, _ := json.Marshal(s)
-				var decision *DecisionContext
-				var body decisionView
-				if entry == "cursor" {
-					decision, body = producerDecision(t, s, 0)
-				} else {
-					previous := s
-					previous.Revision = 1
-					previous.Steps = s.Steps[:1]
-					var err error
-					decision, err = BuildDecisionContext(s, &previous, []StateEvent{{Revision: 2, Op: "step", ID: "S2"}}, 0)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if err := json.Unmarshal(decision.View, &body); err != nil {
-						t.Fatal(err)
+	for _, test := range []struct {
+		name   string
+		from   []string
+		facts  []string
+		legacy bool
+	}{
+		{"process", []string{"F2"}, []string{"F1", "F2"}, false},
+		{"final", []string{"F3"}, []string{"F1", "F3"}, false},
+		{"multiple_process", []string{"F2", "F4"}, []string{"F1", "F2", "F4"}, false},
+		{"legacy_result", []string{"F3"}, []string{"F1", "F3"}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := decisionProducerState(test.from...)
+			if test.legacy {
+				s.FactRecords[2].SourceStepID = ""
+				s.FactRecords[2].Legacy = true
+			}
+			original, _ := json.Marshal(s)
+			decision, body := producerDecision(t, s, 0)
+			if decision.Mode != "changes" || decision.FromRevision != 1 || decision.ToRevision != 2 {
+				t.Fatalf("wrong context boundary: %+v", decision)
+			}
+			assertProducerNodes(t, body, []string{"S1", "S2"}, test.facts)
+			if !reflect.DeepEqual(body.Steps, s.Steps) {
+				t.Fatal("producer records were rewritten")
+			}
+			for _, fact := range body.Facts {
+				for _, originalFact := range s.FactRecords {
+					if fact.ID == originalFact.ID && !reflect.DeepEqual(fact, originalFact) {
+						t.Fatal("fact provenance or evidence was rewritten")
 					}
 				}
-				if decision.Mode != "changes" || decision.FromRevision != 1 || decision.ToRevision != 2 {
-					t.Fatalf("wrong context boundary: %+v", decision)
-				}
-				assertProducerNodes(t, body, []string{"S1", "S2"}, test.facts)
-				if !reflect.DeepEqual(body.Steps, s.Steps) {
-					t.Fatal("producer records were rewritten")
-				}
-				for _, fact := range body.Facts {
-					for _, originalFact := range s.FactRecords {
-						if fact.ID == originalFact.ID && !reflect.DeepEqual(fact, originalFact) {
-							t.Fatal("fact provenance or evidence was rewritten")
-						}
-					}
-				}
-				after, _ := json.Marshal(s)
-				if !bytes.Equal(original, after) {
-					t.Fatal("context construction mutated authoritative state")
-				}
-			})
-		}
+			}
+			after, _ := json.Marshal(s)
+			if !bytes.Equal(original, after) {
+				t.Fatal("context construction mutated authoritative state")
+			}
+		})
 	}
 }
 

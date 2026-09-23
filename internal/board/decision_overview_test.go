@@ -54,7 +54,8 @@ func TestDecisionOverviewRevealsUnchangedFactsAndFindings(t *testing.T) {
 	current := previous
 	current.FactRecords = append(append([]FactRecord{}, previous.FactRecords...), FactRecord{ID: "new", Description: "The status endpoint is reachable.", Status: "valid"})
 	current.Revision++
-	decision, err := BuildDecisionContext(current, &previous, []StateEvent{{Revision: 2, ID: "new"}}, DefaultContextViewBytes)
+	cursor := &DecisionCursor{ProjectID: current.Graph.Project.ID, Generation: current.Graph.Project.Generation, Revision: previous.Revision}
+	decision, err := BuildDecisionContextFromCursor(current, cursor, []StateEvent{{Revision: 2, Op: "fact", ID: "new"}}, DefaultContextViewBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +112,7 @@ func TestDecisionOverviewPreservesCorrectionsAndAffectedPlans(t *testing.T) {
 		{ID: "running", GoalID: "goal", From: []string{"first"}, Status: "running", Description: "Inspect the proxy log policy.", InvalidSources: []string{"first"}},
 	}
 	state.Findings[0].SupportValid = false
-	decision, err := BuildDecisionContext(state, nil, nil, 12<<10)
+	decision, err := BuildDecisionContextFromCursor(state, nil, nil, 12<<10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,16 +150,22 @@ func TestDecisionOverviewPreservesCorrectionsAndAffectedPlans(t *testing.T) {
 }
 
 func TestDecisionOverviewBoundsLargePlansAndChangeIndexes(t *testing.T) {
-	previous := overviewState()
-	current := previous
-	current.FactRecords = append([]FactRecord{}, previous.FactRecords...)
+	current := overviewState()
+	// The first 1000 pairs predate the cursor. The latest 500 pairs fill the
+	// production event page with 1000 continuous fact and step revisions.
+	cursor := &DecisionCursor{ProjectID: current.Graph.Project.ID, Generation: current.Graph.Project.Generation, Revision: 2001}
+	var events []StateEvent
 	for i := 0; i < 1500; i++ {
-		current.Steps = append(current.Steps, Step{ID: fmt.Sprintf("step-%04d", i), GoalID: "goal", Status: "open", From: []string{"first"}, Description: "Inspect one bounded part of the agreed scope."})
-		current.FactRecords = append(current.FactRecords, FactRecord{ID: fmt.Sprintf("fact-%04d", i), Description: strings.Repeat("Evidence detail. ", 100), Status: "valid"})
+		stepID, factID := fmt.Sprintf("step-%04d", i), fmt.Sprintf("fact-%04d", i)
+		current.Steps = append(current.Steps, Step{ID: stepID, GoalID: "goal", Status: "open", From: []string{"first"}, Description: "Inspect one bounded part of the agreed scope."})
+		current.FactRecords = append(current.FactRecords, FactRecord{ID: factID, Description: strings.Repeat("Evidence detail. ", 100), Status: "valid"})
+		current.Revision += 2
+		if i >= 1000 {
+			events = append(events, StateEvent{Revision: current.Revision - 1, Op: "step", ID: stepID}, StateEvent{Revision: current.Revision, Op: "fact", ID: factID})
+		}
 	}
-	current.Revision++
 	const budget = 16 << 10
-	decision, err := BuildDecisionContext(current, &previous, []StateEvent{{Revision: 2, ID: "fact-0000"}}, budget)
+	decision, err := BuildDecisionContextFromCursor(current, cursor, events, budget)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +219,7 @@ func TestDecisionOverviewMarksTruncatedTextAndReferences(t *testing.T) {
 func TestDecisionContextNeverTruncatesUserRequirementsToFit(t *testing.T) {
 	state := overviewState()
 	state.Graph.Facts[0].Description = strings.Repeat("Required scope and constraints. ", 2000)
-	if _, err := BuildDecisionContext(state, nil, nil, 4096); err == nil {
+	if _, err := BuildDecisionContextFromCursor(state, nil, nil, 4096); err == nil {
 		t.Fatal("oversized original requirements should fail explicitly instead of being silently shortened")
 	}
 }

@@ -26,7 +26,7 @@ func TestDecideFirstRequestPreservesOriginalRequirements(t *testing.T) {
 			if mode == "v2" {
 				job.GraphRPC, job.ResultContractVersion = true, 2
 				job.State = &board.State{Graph: job.Graph}
-				decision, err := board.BuildDecisionContext(*job.State, nil, nil, board.DefaultContextViewBytes)
+				decision, err := board.BuildDecisionContextFromCursor(*job.State, nil, nil, board.DefaultContextViewBytes)
 				if err != nil {
 					t.Fatal(err)
 				}

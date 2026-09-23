@@ -22,9 +22,9 @@ func BuildDecisionContextFromCursor(current State, cursor *DecisionCursor, event
 		return nil, err
 	}
 	result := &DecisionContext{Version: 1, StateVersion: DecisionStateVersion(current), View: baseline, Mode: "full", ToRevision: current.Revision, Generation: current.Graph.Project.Generation, BaselineBytes: len(baseline)}
-	changed, removed := decisionChanges{}, decisionChanges{}
+	changed := decisionChanges{}
 	fallback := func(reason string) (*DecisionContext, error) {
-		view, err := decisionFallbackView(current, baseline, changed, removed, maxBytes)
+		view, err := decisionFallbackView(current, baseline, changed, maxBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -91,5 +91,5 @@ func BuildDecisionContextFromCursor(current State, cursor *DecisionCursor, event
 		}
 		changed[key] = unique
 	}
-	return buildDecisionChanges(current, baseline, result, changed, removed, ordered, nil, maxBytes)
+	return buildDecisionChanges(current, baseline, result, changed, ordered, maxBytes)
 }

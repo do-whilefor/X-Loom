@@ -426,7 +426,7 @@ func draftRunJob(t *testing.T) Job {
 	job.Intent, job.Graph.Intents = nil, nil
 	job.GraphRPC, job.ResultContractVersion, job.Budget.Timeout = true, 2, 60
 	job.State = &board.State{Graph: job.Graph}
-	decision, err := board.BuildDecisionContext(*job.State, nil, nil, board.DefaultContextViewBytes)
+	decision, err := board.BuildDecisionContextFromCursor(*job.State, nil, nil, board.DefaultContextViewBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
