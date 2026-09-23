@@ -572,10 +572,9 @@ func (s *Server) intentAction(t *b.Tx, q *request, r *http.Request) (int, any, e
 	}
 	worker := q.text("worker")
 	fence := decisionFence(r)
-	if fence.Run != "" {
-		if fence.Lease == "reason" || fence.Run != worker || fence.Intent != r.PathValue("iid") {
-			return 0, nil, b.Err(403, "Step operations require the matching Execute identity")
-		}
+	// Check before reading description to preserve the HTTP error precedence.
+	if err := intentIdentity(fence, r.PathValue("iid"), worker); err != nil {
+		return 0, nil, err
 	}
 	desc := ""
 	if op == "conclude" {
@@ -588,6 +587,9 @@ func (s *Server) intentAction(t *b.Tx, q *request, r *http.Request) (int, any, e
 }
 
 func changeIntent(t *b.Tx, project, intent string, fence b.ExecutionFence, op, worker, desc string) (int, any, error) {
+	if err := intentIdentity(fence, intent, worker); err != nil {
+		return 0, nil, err
+	}
 	g, err := t.Load(project)
 	if err != nil {
 		return 0, nil, err
@@ -648,6 +650,13 @@ func changeIntent(t *b.Tx, project, intent string, fence b.ExecutionFence, op, w
 		return 200, result, t.SaveLegacyMutation(g, "step_completed", i.ID, worker, map[string]string{"fact_id": fid, "description": desc}, result)
 	}
 	return 0, nil, b.Err(404, "Intent not found")
+}
+
+func intentIdentity(fence b.ExecutionFence, intent, worker string) error {
+	if fence.Run != "" && (fence.Lease == "reason" || fence.Run != worker || fence.Intent != intent) {
+		return b.Err(403, "Step operations require the matching Execute identity")
+	}
+	return nil
 }
 func (s *Server) complete(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 	from, desc, worker := q.sources(), q.text("description"), q.text("worker")

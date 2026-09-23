@@ -296,6 +296,9 @@ func applyExecution(t *b.Tx, e b.Execution) (int, any, error) {
 		return 0, nil, b.Err(409, "Decide version 2 requires a committed decision batch")
 	}
 	status := "succeeded"
+	// The legacy HTTP field parser normalized creator/worker strings. Retain
+	// that boundary when applying old executions through typed business calls.
+	legacyWorker := strings.TrimSpace(e.Lease)
 	if parsed.Kind == "rejected" {
 		status = "rejected"
 	} else if e.Kind == "reason" {
@@ -316,7 +319,7 @@ func applyExecution(t *b.Tx, e b.Execution) (int, any, error) {
 				if validationErr != nil {
 					continue
 				}
-				if _, _, err = createIntent(t, e.ProjectID, e.Fence(), from, desc, e.Lease, nil); err != nil {
+				if _, _, err = createIntent(t, e.ProjectID, e.Fence(), from, desc, legacyWorker, nil); err != nil {
 					var validation *b.APIError
 					if errors.As(err, &validation) && (validation.Status == 400 || validation.Status == 404 || validation.Status == 422) {
 						continue
@@ -333,7 +336,7 @@ func applyExecution(t *b.Tx, e b.Execution) (int, any, error) {
 			if validationErr != nil {
 				return 0, nil, validationErr
 			}
-			if _, _, err = completeProject(t, e.ProjectID, e.Fence(), from, desc, e.Lease); err != nil {
+			if _, _, err = completeProject(t, e.ProjectID, e.Fence(), from, desc, legacyWorker); err != nil {
 				return 0, nil, err
 			}
 		case "noop":
@@ -353,7 +356,7 @@ func applyExecution(t *b.Tx, e b.Execution) (int, any, error) {
 		if job.ResultContractVersion == 2 {
 			out, err = t.ConcludeEvidenceStep(e.ProjectID, e.Fence(), parsed.FactID, parsed.FactPayload)
 		} else {
-			_, out, err = changeIntent(t, e.ProjectID, e.Intent, e.Fence(), "conclude", e.Lease, parsed.Fact)
+			_, out, err = changeIntent(t, e.ProjectID, e.Intent, e.Fence(), "conclude", legacyWorker, parsed.Fact)
 		}
 		if err != nil {
 			return 0, nil, err
@@ -364,7 +367,7 @@ func applyExecution(t *b.Tx, e b.Execution) (int, any, error) {
 			// for this final completion operation, never for arbitrary writes.
 			fence := e.Fence()
 			fence.AllowConcluded = true
-			if _, _, err = completeProject(t, e.ProjectID, fence, []string{conclusion.Fact.ID}, parsed.Complete.Description, e.Lease); err != nil {
+			if _, _, err = completeProject(t, e.ProjectID, fence, []string{conclusion.Fact.ID}, parsed.Complete.Description, legacyWorker); err != nil {
 				return 0, nil, err
 			}
 		}
