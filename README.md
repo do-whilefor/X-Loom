@@ -74,6 +74,12 @@ docker compose down
 
 默认 `docker compose up -d` 启动 Server 与 Dispatcher；Worker 容器由 Dispatcher 按任务动态创建。
 
+新项目从 Decide（配置名 `reason`）开始：简单任务规划一个有边界的 Step，复杂任务根据当前信息规划少量互补方向，再由 Execute（`explore`）执行。Step 完成表示指定探索结束；有证据支持的阴性观察也能完成 Step，运行失败不能当作观察，项目完成仍需满足用户根目标及范围。最终报告在实质探索结束后规划，用户要求中期报告时除外。
+
+创建项目的 `bootstrap_enabled` 参数已废弃：缺省、`true` 和 `false` 均保存并返回 `false`，原有合法布尔转换输入仍接受，无效类型仍拒绝。原 Web 的初始探索复选框暂时保留，已不能改变新项目启动顺序。历史项目保存的启动策略不变，停止后恢复、reopen 和 restart 继续沿用原策略；旧 bootstrap 执行仍按登记时的身份、预算与结果合同恢复。
+
+示例 Worker 只启用 `reason`、`explore`；配置缺少 `reason` 能力会报错。需要继续处理历史 bootstrap 项目时，将 `bootstrap` 加回 Worker 的 `task_types`，并添加 `tasks.bootstrap: {timeout: 0, conclude_timeout: 60}`。
+
 ## 测试与 CI
 
 GitHub Actions 会在推送代码、提交 PR 或手动触发时，在新的 Linux 环境中检出对应提交，执行单元测试、Mock 集成测试、竞态检查、`go vet` 和程序编译。

@@ -114,8 +114,8 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("task timeout must be nonnegative (0 disables the execution deadline)")
 		}
 	}
-	if c.Tasks.Bootstrap.ConcludeTimeout <= 0 || c.Tasks.Explore.ConcludeTimeout <= 0 || c.Tasks.Reason.MaxIntents <= 0 {
-		return fmt.Errorf("conclude timeouts and max_intents must be positive")
+	if c.Tasks.Explore.ConcludeTimeout <= 0 || c.Tasks.Reason.MaxIntents <= 0 {
+		return fmt.Errorf("explore conclude_timeout and reason max_intents must be positive")
 	}
 	if c.Container.Image == "" || c.Container.Network == "" || !slices.Contains([]string{"stop", "remove"}, c.Container.CompletedAction) {
 		return fmt.Errorf("invalid container configuration")
@@ -129,6 +129,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("at least one worker is required")
 	}
 	seen := map[string]bool{}
+	capabilities := map[string]bool{}
 	for n := range c.Workers {
 		w := &c.Workers[n]
 		if strings.TrimSpace(w.Name) == "" || seen[w.Name] || w.MaxRunning <= 0 || w.Priority < 0 {
@@ -150,6 +151,7 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("invalid task types for %q", w.Name)
 			}
 			types[typ] = true
+			capabilities[typ] = true
 		}
 		env := map[string]string{}
 		for k, v := range c.CommonEnv {
@@ -182,6 +184,12 @@ func (c *Config) Validate() error {
 				}
 			}
 		}
+	}
+	if !capabilities["reason"] {
+		return fmt.Errorf("at least one worker must support reason (Decide) to plan projects")
+	}
+	if capabilities["bootstrap"] && c.Tasks.Bootstrap.ConcludeTimeout <= 0 {
+		return fmt.Errorf("bootstrap conclude_timeout must be positive when a worker supports legacy bootstrap runs")
 	}
 	return nil
 }

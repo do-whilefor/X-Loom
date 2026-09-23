@@ -8,9 +8,8 @@ runtime:
   healthcheck_timeout: 30
   worker_healthcheck: startup_only
 tasks:
-  bootstrap:
-    timeout: 0
-    conclude_timeout: 60
+  # For historical bootstrap projects, also enable bootstrap in task_types
+  # and restore its budget: bootstrap: {timeout: 0, conclude_timeout: 60}.
   reason:
     # Maximum reasoning can span several model requests and graph reads.
     timeout: 300
@@ -35,7 +34,7 @@ common_env:
 workers:
   - name: general
     type: go
-    task_types: [bootstrap, reason, explore]
+    task_types: [reason, explore]
     # Per-backend limit shared across all projects; still bounded by runtime limits.
     max_running: 16
     priority: 0

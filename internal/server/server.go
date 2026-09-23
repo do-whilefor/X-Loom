@@ -239,25 +239,23 @@ func (r *request) integer(key string) int {
 	return n
 }
 func (r *request) bootstrap() bool {
+	// New projects always start with Decide. Keep validating the deprecated
+	// creation field, including the original boolean-compatible inputs, so a
+	// stale Web client can create projects without restoring bootstrap mode.
 	v, exists := r.fields["bootstrap_enabled"]
 	if !exists {
-		return true
+		return false
 	}
 	switch x := v.(type) {
 	case bool:
-		return x
+		return false
 	case json.Number:
-		if x == "1" {
-			return true
-		}
-		if x == "0" {
+		if x == "1" || x == "0" {
 			return false
 		}
 	case string:
 		switch strings.ToLower(x) {
-		case "true", "1", "yes", "on", "y", "t":
-			return true
-		case "false", "0", "no", "off", "n", "f":
+		case "true", "1", "yes", "on", "y", "t", "false", "0", "no", "off", "n", "f":
 			return false
 		}
 	}
