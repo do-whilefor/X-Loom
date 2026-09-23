@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -103,6 +104,77 @@ func TestGenerateStillRetriesUnavailableHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestGenerateRetriesHTTPTimeoutBeforeResponse(t *testing.T) {
+	var calls int
+	p := testProvider(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return testResponse(req, http.StatusRequestTimeout, "application/json", `{}`), nil
+		}
+		return testResponse(req, http.StatusOK, "application/json", `{"role":"assistant","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn"}`), nil
+	})
+	got, err := p.Generate(context.Background(), []agent.Message{agent.Text("user", "Reply OK")}, nil, nil)
+	if err != nil || calls != 2 || got.Text() != "OK" {
+		t.Fatalf("calls=%d, response=%q, error=%v", calls, got.Text(), err)
+	}
+}
+
+func TestEndpointErrorClassificationPreservesStatus(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		kind   agent.ErrorKind
+	}{
+		{http.StatusRequestTimeout, agent.ErrorTransport},
+		{http.StatusTooManyRequests, agent.ErrorRateLimit},
+		{http.StatusServiceUnavailable, agent.ErrorUnavailable},
+		{http.StatusBadRequest, agent.ErrorProvider},
+		{http.StatusUnauthorized, agent.ErrorProvider},
+	} {
+		err := classifyEndpointError(tc.status, nil)
+		var httpErr *HTTPError
+		if err.Kind != tc.kind || !errors.As(err, &httpErr) || httpErr.Status != tc.status {
+			t.Fatalf("status=%d error=%+v", tc.status, err)
+		}
+	}
+}
+
+type failingReader struct{ err error }
+
+func (r failingReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestResponseReadFailuresPreserveCauseAndDoNotReplay(t *testing.T) {
+	for _, contentType := range []string{"application/json", "text/event-stream"} {
+		for _, cause := range []error{syscall.ECONNRESET, io.ErrUnexpectedEOF, context.DeadlineExceeded} {
+			t.Run(contentType+"/"+cause.Error(), func(t *testing.T) {
+				calls := 0
+				p := testProvider(func(req *http.Request) (*http.Response, error) {
+					calls++
+					res := testResponse(req, http.StatusOK, contentType, "")
+					res.Body = io.NopCloser(failingReader{cause})
+					return res, nil
+				})
+				_, err := p.Generate(context.Background(), []agent.Message{agent.Text("user", "Reply OK")}, nil, nil)
+				var modelErr *agent.ModelError
+				if calls != 1 || !errors.As(err, &modelErr) || modelErr.Kind != agent.ErrorTransport || !errors.Is(err, cause) {
+					t.Fatalf("calls=%d error=%v", calls, err)
+				}
+			})
+		}
+	}
+}
+
+func TestMalformedJSONRemainsPermanentAndPreservesCause(t *testing.T) {
+	p := testProvider(func(req *http.Request) (*http.Response, error) {
+		return testResponse(req, http.StatusOK, "application/json", `{"role":!}`), nil
+	})
+	_, err := p.Generate(context.Background(), nil, nil, nil)
+	var modelErr *agent.ModelError
+	var syntax *json.SyntaxError
+	if !errors.As(err, &modelErr) || modelErr.Kind != agent.ErrorProvider || !errors.As(err, &syntax) {
+		t.Fatalf("malformed JSON was retryable or lost its cause: %v", err)
+	}
+}
+
 func TestGenerateDoesNotRetryExpiredContext(t *testing.T) {
 	var calls int
 	p := testProvider(func(req *http.Request) (*http.Response, error) {
@@ -126,7 +198,7 @@ func TestGenerateDoesNotRetryPermanentTransportError(t *testing.T) {
 	})
 	_, err := p.Generate(context.Background(), []agent.Message{agent.Text("user", "Reply OK")}, nil, nil)
 	var modelErr *agent.ModelError
-	if calls != 1 || !errors.As(err, &modelErr) || modelErr.Kind != agent.ErrorTransport {
+	if calls != 1 || !errors.As(err, &modelErr) || modelErr.Kind != agent.ErrorProvider {
 		t.Fatalf("calls=%d, error=%v", calls, err)
 	}
 }

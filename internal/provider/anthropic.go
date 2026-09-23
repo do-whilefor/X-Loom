@@ -156,7 +156,11 @@ func (p *Anthropic) generate(ctx context.Context, messages []agent.Message, tool
 		res, err = client.Do(req)
 		if err != nil {
 			if attempt >= 2 || ctx.Err() != nil || !retryableTransport(err) {
-				return agent.Message{}, &agent.ModelError{Kind: agent.ErrorTransport, Err: err}
+				kind := agent.ErrorProvider
+				if retryableTransport(err) {
+					kind = agent.ErrorTransport
+				}
+				return agent.Message{}, &agent.ModelError{Kind: kind, Err: err}
 			}
 		} else {
 			if res.StatusCode >= 200 && res.StatusCode < 300 {
@@ -169,7 +173,7 @@ func (p *Anthropic) generate(ctx context.Context, messages []agent.Message, tool
 			if classified.Kind == agent.ErrorContextOverflow {
 				return agent.Message{}, classified
 			}
-			if attempt >= 2 || (status != 429 && status < 500) {
+			if attempt >= 2 || !retryableStatus(status) {
 				return agent.Message{}, classified
 			}
 		}
@@ -204,10 +208,10 @@ func (p *Anthropic) generate(ctx context.Context, messages []agent.Message, tool
 		}
 		if err != nil {
 			kind := agent.ErrorProvider
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) {
+			if retryableTransport(err) {
 				kind = agent.ErrorTransport
 			}
-			return agent.Message{}, &agent.ModelError{Kind: kind, Err: errors.New("invalid or incomplete model response body")}
+			return agent.Message{}, &agent.ModelError{Kind: kind, Err: fmt.Errorf("invalid or incomplete model response body: %w", err)}
 		}
 		if m.Role != "assistant" || len(m.Content) == 0 || m.Stop == "" {
 			return agent.Message{}, &agent.ModelError{Kind: agent.ErrorProvider, Err: errors.New("invalid model response")}
@@ -247,6 +251,10 @@ func waitRetry(ctx context.Context, attempt int) error {
 	}
 }
 
+func retryableStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+}
+
 func classifyEndpointError(status int, body []byte) *agent.ModelError {
 	var detail struct {
 		Error struct {
@@ -258,6 +266,8 @@ func classifyEndpointError(status int, body []byte) *agent.ModelError {
 	kind := agent.ErrorProvider
 	if status == 429 {
 		kind = agent.ErrorRateLimit
+	} else if status == http.StatusRequestTimeout {
+		kind = agent.ErrorTransport
 	} else if status >= 500 {
 		kind = agent.ErrorUnavailable
 	}
@@ -413,7 +423,11 @@ func consumeSSE(ctx context.Context, reader io.Reader, emit agent.Emit) (agent.M
 		}
 	}
 	if err := scan.Err(); err != nil {
-		return m, &agent.ModelError{Kind: agent.ErrorTransport, Err: errors.New("model stream read failed")}
+		kind := agent.ErrorProvider
+		if retryableTransport(err) {
+			kind = agent.ErrorTransport
+		}
+		return m, &agent.ModelError{Kind: kind, Err: fmt.Errorf("model stream read failed: %w", err)}
 	}
 	if err := consume(); err != nil {
 		return m, err
