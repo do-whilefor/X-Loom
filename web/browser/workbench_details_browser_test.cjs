@@ -2,7 +2,7 @@
 
 // Loads the service's embedded assets while intercepting every project API call.
 // Safe to run against a populated development service: no project data is written.
-// XLOOM_WEB_URL=http://127.0.0.1:8000 node --test web/workbench_details_browser_test.cjs
+// XLOOM_WEB_URL=http://127.0.0.1:8000 node --test web/browser/workbench_details_browser_test.cjs
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
@@ -51,7 +51,7 @@ test('workbench collapses long logs and filters cards without losing the canvas 
   const browser = await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined});
   const page = await browser.newPage({viewport:{width:1440,height:960},deviceScaleFactor:1});
   page.setDefaultTimeout(10000);
-  const screenshots = path.resolve(__dirname,'../tmp/web-workbench-details');
+  const screenshots = path.resolve(__dirname,'../../tmp/web-workbench-details');
   await fs.mkdir(screenshots,{recursive:true});
   const {state,runs} = fixture(), errors = [], writes = [], assetErrors = [];
   let stateUnavailable = false;

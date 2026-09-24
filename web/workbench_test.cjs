@@ -14,6 +14,25 @@ const snapshot = (id, generation = 0, revision = 1) => ({graph:{project:project(
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return {promise,resolve}; };
 const settle = async () => { for (let i = 0; i < 4; i++) await new Promise(resolve => setImmediate(resolve)); };
 
+// Only read opening tags and attributes; quote style and attribute order are not contracts.
+function markupValues(markup, attribute, tag) {
+  const values = [];
+  for (const [, name, attrs] of markup.replace(/<!--[\s\S]*?-->/g, '').matchAll(/<([a-z][\w:-]*)\b((?:[^"'<>]|"[^"]*"|'[^']*')*)>/gi)) {
+    if (tag && name.toLowerCase() !== tag) continue;
+    for (const [, key, double, single, unquoted] of attrs.matchAll(/\s+([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/g)) {
+      if (key.toLowerCase() === attribute) values.push(double ?? single ?? unquoted);
+    }
+  }
+  return values;
+}
+
+function assertEmbeddedIcons(markup, scripts, dynamicIcons = []) {
+  const symbols = new Set(markupValues(markup, 'id', 'symbol'));
+  const literals = [...scripts.matchAll(/\bicon\s*\(\s*(['"])([^'"]+)\1\s*\)/g)].map(match => '#i-' + match[2]);
+  const references = [...markupValues(markup, 'href', 'use'), ...literals, ...dynamicIcons.map(name => '#i-' + name)];
+  for (const reference of references) assert.ok(symbols.has(reference.slice(1)), 'missing icon ' + reference);
+}
+
 // A small DOM adapter exercises the actual app orchestration without a browser
 // dependency. Layout and pointer interaction are verified in browser tests.
 class Element {
@@ -37,13 +56,14 @@ class Element {
   closest() { return null; }
 }
 
-function harness(handler, selected = 'A') {
-  const elements = new Map([...html.matchAll(/id="([^"]+)"/g)].map(match => [match[1], new Element()]));
+function harness(handler, selected = 'A', markup = html) {
+  const elements = new Map(markupValues(markup, 'id').map(id => [id, new Element()]));
   const tabs = ['board','system','result'].map(name => { const element = elements.get('tab-' + name); element.dataset.tab = name; return element; });
   const dialogs = ['create','hint','confirm'].map(name => elements.get(name + '-dialog'));
   const timers = new Map(), calls = [], projections = [], displayed = []; let timerID = 0, graph;
   const document = {
-    hidden:false, getElementById:id => elements.get(id), createElement:tag => new Element(tag), createElementNS:(_,tag) => new Element(tag), createTextNode:text => new Element('#text'),
+    hidden:false, getElementById:id => { assert.ok(elements.has(id), 'missing workbench element ' + id); return elements.get(id); },
+    createElement:tag => new Element(tag), createElementNS:(_,tag) => new Element(tag), createTextNode:text => new Element('#text'),
     querySelectorAll:selector => selector === '[data-tab]' ? tabs : selector === 'dialog' ? dialogs : [], querySelector:() => null, addEventListener() {}
   };
   document.createTextNode = text => { const node = new Element('#text'); node.textContent = text; return node; };
@@ -82,17 +102,27 @@ function standard(url, states, extra = () => undefined) {
 }
 
 test('workbench and graph icons resolve to embedded symbols', () => {
-  const symbols = new Set([...html.matchAll(/<symbol id="i-([^"]+)"/g)].map(match => match[1]));
   const graphSource = fs.readFileSync(path.join(__dirname, 'static/graph.js'), 'utf8');
-  const explicit = [...(app + graphSource).matchAll(/(?:this\.)?icon\('([^']+)'\)/g)].map(match => match[1]);
-  const markup = [...html.matchAll(/<use href="#i-([^"]+)"/g)].map(match => match[1]);
-  for (const icon of [...explicit,...markup,'shield','code','flag','graph','pause','play','restart','stop','trash','node','file','check']) assert.ok(symbols.has(icon), 'missing icon ' + icon);
+  assertEmbeddedIcons(html, app + graphSource,
+    ['shield','code','flag','graph','pause','play','restart','stop','trash','node','file','check']);
 });
 
-test('desktop workbench removes mobile navigation and optional topbar controls', () => {
-  for (const id of ['mobile-menu','sidebar-scrim','connection-state','refresh-project','about-button','about-dialog']) {
-    assert.ok(!html.includes('id="' + id + '"'), id + ' must be absent');
-    assert.ok(!app.includes("$('" + id + "')"), id + ' must not retain a script binding');
+test('icon checks still detect broken references after quote and attribute formatting changes', () => {
+  const markup = `<symbol viewBox='0 0 24 24' id = 'i-check'></symbol><use class="icon" href = '#i-check'/>`;
+  assert.doesNotThrow(() => assertEmbeddedIcons(markup, `icon ( "check" ); this.icon( 'check' );`));
+  assert.throws(() => assertEmbeddedIcons(markup, `this.icon ( "missing" )`), /missing icon #i-missing/);
+  assert.throws(() => assertEmbeddedIcons(markup.replace("href = '#i-check'", 'href = "#i-missing"'), ''), /missing icon #i-missing/);
+  assert.throws(() => assertEmbeddedIcons(markup.replace("id = 'i-check'", "data-id='i-check'"), ''), /missing icon #i-check/);
+});
+
+test('desktop workbench runs without removed navigation elements or stale bindings', async () => {
+  for (const markup of [html, html.replace(/\bid="([^"]+)"/g, "id = '$1'")]) {
+    const h = harness(url => standard(url, {A:snapshot('A')}), 'A', markup); await settle();
+    for (const id of ['mobile-menu','sidebar-scrim','connection-state','refresh-project','about-button','about-dialog']) {
+      assert.equal(h.elements.has(id), false, id + ' must be absent');
+    }
+    assert.equal(h.elements.get('project-title').textContent, 'A');
+    await h.elements.get('new-project').click(); assert.equal(h.elements.get('create-dialog').open, true);
   }
 });
 

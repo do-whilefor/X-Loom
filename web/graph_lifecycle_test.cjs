@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const {XLoomGraph} = require('./static/graph.js');
 
 // Minimal deterministic DOM/event clock: browser geometry and rendering are
-// covered by browser_test.cjs; this exercises lifecycle and update contracts.
+// covered by browser/canvas_browser_test.cjs; this exercises lifecycle and update contracts.
 class Target {
   constructor() { this.events = new Map(); }
   addEventListener(type, fn) { if (!this.events.has(type)) this.events.set(type, new Set()); this.events.get(type).add(fn); }

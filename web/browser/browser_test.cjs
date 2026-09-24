@@ -1,7 +1,7 @@
 'use strict';
 
 // Start xloom serve with a dedicated empty database, then run:
-// XLOOM_WEB_URL=http://127.0.0.1:18767 node --test web/browser_test.cjs
+// XLOOM_WEB_URL=http://127.0.0.1:18767 node --test web/browser/browser_test.cjs
 // PLAYWRIGHT_MODULE and PLAYWRIGHT_CHROMIUM_EXECUTABLE optionally select local dependencies.
 // This test creates real projects and removes only the projects it created.
 const test = require('node:test');
@@ -18,7 +18,7 @@ test('workbench persists project operations through the real HTTP service', {
   const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
   const projectPath = id => '/projects/' + encodeURIComponent(id);
   const created = new Map();
-  const screenshots = path.resolve(__dirname, '../tmp/web-workbench-integration');
+  const screenshots = path.resolve(__dirname, '../../tmp/web-workbench-integration');
   const request = async (endpoint, options = {}) => {
     const response = await fetch(new URL(endpoint, base), {signal: AbortSignal.timeout(10000), ...options});
     const body = await response.text();

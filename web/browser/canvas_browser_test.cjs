@@ -2,9 +2,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 // Run against the embedded assets in a disposable Linux xloom serve instance.
+// XLOOM_WEB_URL=http://127.0.0.1:18767 node --test web/browser/canvas_browser_test.cjs
 // Browser dependencies stay outside the product's zero-build static bundle.
 test('embedded canvas handles live graph changes and unrestricted pointer movement', {
-  skip: !process.env.XLOOM_WEB_URL, timeout:90000
+  skip: process.env.XLOOM_WEB_URL ? false : 'Set XLOOM_WEB_URL to load the embedded canvas assets', timeout:90000
 }, async t => {
   const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
   const browser = await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE});

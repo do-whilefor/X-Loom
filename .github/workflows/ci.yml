@@ -31,7 +31,8 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Check workbench scripts and regressions
+      # Browser acceptance is opt-in under web/browser; this step needs no browser.
+      - name: Check workbench scripts and Node regressions
         run: |
           for script in web/static/*.js; do node --check "$script"; done
           node --test web/*_test.cjs
