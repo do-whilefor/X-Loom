@@ -2,27 +2,12 @@ package board
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"slices"
 )
 
-// AutomaticDecisionRetryEligible distinguishes exhausted infrastructure/time
-// recovery from a refusal, invalid plan, configuration error or human stop.
-func AutomaticDecisionRetryEligible(e Execution) bool {
-	if e.Kind != "reason" || e.Status != "failed" {
-		return false
-	}
-	var result struct {
-		Status      string `json:"status"`
-		FailureKind string `json:"failure_kind"`
-	}
-	if json.Unmarshal(e.Result, &result) != nil || result.Status != "failed" {
-		return false
-	}
-	return automaticDecisionRetryEligible(e.Kind, e.Status, result.Status, result.FailureKind)
-}
-
+// Distinguish exhausted infrastructure/time recovery from a refusal, invalid
+// plan, configuration error or human stop.
 func automaticDecisionRetryEligible(kind, status, resultStatus, failureKind string) bool {
 	return kind == "reason" && status == "failed" && resultStatus == "failed" && slices.Contains([]string{"recovery_exhausted", "budget_exhausted", "request_timeout", "transient_infrastructure", "transport", "rate_limit", "unavailable"}, failureKind)
 }

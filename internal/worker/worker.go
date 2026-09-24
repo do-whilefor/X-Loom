@@ -344,6 +344,24 @@ func Run(parent context.Context, j Job, o Options) (Result, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		// A soft stop can precede the first model request. Seed the same pinned
+		// task used by normal execution before appending the phase-only input.
+		if l.TaskPrompt == "" {
+			if len(l.History) > 0 {
+				l.TaskPrompt = l.History[0].Text()
+			} else {
+				var err error
+				l.TaskPrompt, err = Prompt(j, false, o.RunDir)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		if len(l.History) == 0 {
+			if err := l.AppendInstruction(l.TaskPrompt); err != nil {
+				return nil, err
+			}
+		}
 		wasConcluding := state.Concluding
 		state.Concluding = true
 		l.Concluding = true

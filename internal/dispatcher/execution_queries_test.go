@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -35,10 +36,20 @@ func TestDispatcherIgnoresLargeUnrelatedExecutionHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var oldHistory []board.Execution
-	err = s.Client.Do(context.Background(), "GET", "/executions?namespace=xloom", nil, &oldHistory, nil)
-	if err == nil || !strings.Contains(err.Error(), "exceeds 33554432-byte limit") {
-		t.Fatalf("fixture did not exceed the unchanged response limit: %v", err)
+	var retainedBytes int64
+	if err = store.Do(context.Background(), func(tx *board.Tx) error {
+		return tx.QueryRow("SELECT SUM(LENGTH(job)+COALESCE(LENGTH(result),0)) FROM xloom_executions WHERE namespace=?", "xloom").Scan(&retainedBytes)
+	}); err != nil || retainedBytes <= 32<<20 {
+		t.Fatalf("fixture did not retain more than 32 MiB: bytes=%d err=%v", retainedBytes, err)
+	}
+	var protocol *ProtocolError
+	err = s.Client.Do(context.Background(), "GET", "/executions?namespace=xloom", nil, nil, nil)
+	if !errors.As(err, &protocol) || protocol.Status != http.StatusNotFound {
+		t.Fatalf("whole-history endpoint was not retired: %v", err)
+	}
+	var pending board.ExecutionPage
+	if err = s.Client.Do(context.Background(), "GET", "/executions/pending?namespace=xloom&after=0&limit=100", nil, &pending, nil); err != nil || len(pending.Items) != 0 || pending.NextCursor != 0 {
+		t.Fatalf("pending page fetched unrelated terminal history: %+v err=%v", pending, err)
 	}
 	state := finishBatchFixture(t, s, graph.Project.ID)
 	if state.Graph.Project.Status != "completed" || len(runner.seen) < 4 {
@@ -209,9 +220,7 @@ func TestLiveGraphReadPagesBeforeDispatcherResponseLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	execution := board.Execution{ProjectID: graph.Project.ID, ID: job.RunID, Namespace: "xloom", Backend: "retry-fixture", Kind: "reason", Lease: lease.Run, Job: raw, RetryKey: "reason:large-graph"}
-	if err = s.Client.Do(ctx, "POST", projectPath(graph.Project.ID)+"/executions", execution, nil, &lease); err != nil {
-		t.Fatal(err)
-	}
+	registerLegacyExecution(t, store, execution)
 	// Existing executions must still read small graph/evidence pages after the
 	// live FGS grows beyond the whole-response limit. The immutable Job is small.
 	evidence := board.EvidenceRef{RunID: "source", Path: "retained/large.txt", Excerpt: strings.Repeat("x", 33<<20)}
@@ -354,7 +363,7 @@ func (r *finishingDecisionRunner) Run(ctx context.Context, backend config.Worker
 }
 
 func TestCompletedDecisionReturnsObservationBeforeCancellation(t *testing.T) {
-	s, _, transport, graph := batchSchedulerFixture(t, 1)
+	s, _, transport, graph, _ := batchSchedulerFixture(t, 1)
 	runner := &finishingDecisionRunner{batchProtocolRunner: batchProtocolRunner{directions: 1}, committed: make(chan worker.Job, 1), finish: make(chan struct{}), managed: graph.Project.ID}
 	s.Runner = runner
 	s.configureGraphHandler()
@@ -423,7 +432,7 @@ type executionQueryTransport func(*http.Request) (*http.Response, error)
 func (f executionQueryTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestObservationFailureNeverRetriesCommittedBusinessResult(t *testing.T) {
-	s, _, transport, graph := batchSchedulerFixture(t, 1)
+	s, _, transport, graph, store := batchSchedulerFixture(t, 1)
 	runner := &finishingDecisionRunner{batchProtocolRunner: batchProtocolRunner{directions: 1}, committed: make(chan worker.Job, 1), finish: make(chan struct{})}
 	close(runner.finish)
 	s.Runner = runner
@@ -437,7 +446,7 @@ func TestObservationFailureNeverRetriesCommittedBusinessResult(t *testing.T) {
 		return transport.RoundTrip(r)
 	})
 	finishBatchFixture(t, s, graph.Project.ID)
-	assertBatchExecutionReceipts(t, s, transport, graph.Project.ID)
+	assertBatchExecutionReceipts(t, store, transport, graph.Project.ID)
 	if observations.Load() != 1 {
 		t.Fatalf("observation failure retried the execution: %d observation attempts", observations.Load())
 	}

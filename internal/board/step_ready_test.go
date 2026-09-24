@@ -3,6 +3,7 @@ package board
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -44,6 +45,28 @@ func TestInvalidPremiseBlocksQueuedStepAndRegistration(t *testing.T) {
 	err = f.store.Do(context.Background(), func(tx *Tx) error { return tx.RegisterExecution(e) })
 	if err == nil || !strings.Contains(err.Error(), "not effective evidence") {
 		t.Fatalf("registration accepted invalid premise: %v", err)
+	}
+}
+
+func TestStepReadyPreservesAbandonedAndMissingErrors(t *testing.T) {
+	f := newPlanFixture(t)
+	id := f.action("step", "plan", stepInput("Inspect a valid premise", []string{"f001"}, "goal", 0)).ID
+	f.tx(func(tx *Tx) error { return tx.StepReady("proj_001", id) })
+	f.action("step", "abandon", map[string]any{"action": "abandon", "id": id, "reason": "This direction is no longer needed"})
+	invalidatePlanSource(f)
+	for _, test := range []struct {
+		step   string
+		status int
+		detail string
+	}{
+		{id, 409, "Step was abandoned"},
+		{"missing", 404, "Step not found"},
+	} {
+		err := f.store.Do(context.Background(), func(tx *Tx) error { return tx.StepReady("proj_001", test.step) })
+		var api *APIError
+		if !errors.As(err, &api) || api.Status != test.status || api.Error() != test.detail {
+			t.Fatalf("step %s: expected %d %q, got %v", test.step, test.status, test.detail, err)
+		}
 	}
 }
 

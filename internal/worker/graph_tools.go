@@ -174,7 +174,7 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 	}
 	if o.decision != nil {
 		allowed = append(allowed, "complete", "preview", "commit", "reset")
-		description += " Actions are private drafts until commit. Keys for draft actions are letters/digits/underscore/hyphen, start with a letter, at most 64 characters. New goal/step returns $key: use this alias in later reference fields. complete payload {from:[fact IDs],description:proof} must be last; first explicitly abandon unnecessary active Steps and withdraw only auxiliary subgoals. preview validates without publishing; commit publishes the entire batch and ends this run; reset discards uncommitted draft. preview/commit/reset use payload {}. A state_changed conflict at preview/commit ends this attempt for replanning from fresh input. InvalidSources mark premises requiring review, never silently assume they remain effective."
+		description += " Actions are private drafts until commit. Keys for draft actions are letters/digits/underscore/hyphen, start with a letter, at most 64 characters. New goal/step returns $key: use this alias in later reference fields. complete payload {from:[fact IDs],description:proof} must be last; first explicitly abandon unnecessary active Steps and withdraw only auxiliary subgoals. Completion requires preview and a later model turn reviewing completion_review before commit. preview validates protocol without publishing; commit publishes the entire batch and ends this run, including an unchanged plan; reset discards uncommitted draft. preview/commit/reset use payload {}. A state_changed conflict at preview/commit ends this attempt for replanning from fresh input. InvalidSources mark premises requiring review before further execution, never silently assume they remain effective."
 	} else if j.Kind != "reason" && j.ResultContractVersion >= 2 {
 		description += " Reuse a published evidence Fact in the final completed.data.fact_id to finish this Step without duplicating observations."
 	}
@@ -213,6 +213,15 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 	}
 	if j.Graph.Project.Scenario == "pentest" {
 		o.Tools = append(o.Tools, cvssTool())
+	}
+	if j.Graph.Project.Scenario == "ctf" {
+		// Options may reuse a caller-owned tool slice across runs.
+		o.Tools = append([]agent.Tool(nil), o.Tools...)
+		for n := range o.Tools {
+			if o.Tools[n].Name == "bash" {
+				o.Tools[n].Description += "\n" + ctfExecution
+			}
+		}
 	}
 	if j.InputSnapshot != nil {
 		frozen := read

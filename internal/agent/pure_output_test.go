@@ -48,7 +48,7 @@ func TestPureOutputPhasesRejectToolsAndResumeSettledResults(t *testing.T) {
 				}}
 				var saved []byte
 				loop := Loop{Provider: provider, Tools: []Tool{tool}, Concluding: phase == "conclude", Repairing: phase == "repair",
-					Save: func(history []Message) (err error) {
+					SaveState: func(history []Message, _ *ContextCheckpoint) (err error) {
 						saved, err = json.Marshal(history)
 						return err
 					}}

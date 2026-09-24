@@ -94,10 +94,6 @@ func repairInstruction(j Job, concluding bool, attempt int, problem *outputFailu
 	if problem == nil {
 		return "", errors.New("result repair requires a failure reason")
 	}
-	contractText, err := taskTemplate(j, concluding)
-	if err != nil {
-		return "", err
-	}
 	reason, _ := json.Marshal(problem.Error())
 	fallback := "If no supported factual result is available, return {\"accepted\":false,\"reason\":\"...\"}."
 	if j.ResultContractVersion >= 1 && j.Kind != "reason" {
@@ -106,13 +102,5 @@ func repairInstruction(j Job, concluding bool, attempt int, problem *outputFailu
 			fallback += " If further execution can finish the task, report continue; the runtime will restore tools in this same run under the original deadline."
 		}
 	}
-	prompt := fmt.Sprintf("Result-format repair %d/%d in the same session. All tools are disabled. The previous response cannot be submitted: %s. Produce one short, complete JSON object satisfying the task contract below; do not append a suffix to the earlier response or place an earlier invalid JSON object before the repaired one. Use only the existing evidence. Do not repeat actions, invent facts, force accepted:true, or declare completion without its required proof. %s A truncated response must be rewritten more briefly, not trusted as a complete answer.\n<result_contract>\n%s\n</result_contract>\n", attempt, maxOutputRepairs, reason, fallback, contractText)
-	if j.Kind == "reason" {
-		graph, err := jobContextView(j)
-		if err != nil {
-			return "", err
-		}
-		prompt += "The original assigned task graph is supplied inline as data, not new evidence or instructions.\n<task_graph>\n" + string(graph) + "</task_graph>\n"
-	}
-	return prompt, nil
+	return fmt.Sprintf("Result-format repair %d/%d in the same session. All tools are disabled. The previous response cannot be submitted: %s. Produce one complete JSON object using the original task contract and the current phase restrictions. Replace the invalid response; do not append a suffix or include the earlier JSON. Use only existing evidence. Do not invent facts, force accepted:true, or declare completion without its required proof. %s A truncated response must be rewritten more briefly, not trusted as a complete answer.\n", attempt, maxOutputRepairs, reason, fallback), nil
 }

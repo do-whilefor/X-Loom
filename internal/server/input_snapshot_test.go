@@ -23,7 +23,7 @@ func newSnapshotHTTPFixture(t *testing.T) (*executionProtocolFixture, *board.Sto
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	store.Now = func() time.Time { return time.Date(2026, 9, 22, 10, 0, 0, 0, time.UTC) }
-	f := &executionProtocolFixture{t: t, handler: New(store), run: "snapshot-run", lease: "planner@snapshot-run"}
+	f := &executionProtocolFixture{t: t, handler: New(store), store: store, run: "snapshot-run", lease: "planner@snapshot-run"}
 	var graph board.Graph
 	f.request("POST", "/projects", map[string]any{"title": "Frozen input", "origin": "Synthetic input", "goal": "Inspect the fixture", "bootstrap_enabled": false}, false, http.StatusCreated, &graph)
 	f.project = graph.Project.ID
@@ -171,13 +171,17 @@ func TestPrepareSnapshotRejectsClientSuppliedInputAndCrossRoundTemplates(t *test
 			fields[name] = value
 			forged := template
 			forged.Job, _ = json.Marshal(fields)
-			f.request("POST", f.base()+"/executions/prepare", forged, true, http.StatusUnprocessableEntity, nil)
+			// A client-provided marker cannot authorize its own input snapshot.
+			raw, _ := json.Marshal(forged)
+			var request map[string]any
+			_ = json.Unmarshal(raw, &request)
+			request["prepared"] = true
+			f.request("POST", f.base()+"/executions/prepare", request, true, http.StatusUnprocessableEntity, nil)
 		})
 	}
 	saved, _ := prepareSnapshot(t, f, template)
-	// Even a structurally valid reference cannot be supplied to the legacy
-	// registration endpoint; only server-side preparation may create one.
-	f.request("POST", f.base()+"/executions", saved, true, http.StatusUnprocessableEntity, nil)
+	// A valid server-generated reference is still not a client job template.
+	f.request("POST", f.base()+"/executions/prepare", saved, true, http.StatusUnprocessableEntity, nil)
 	f.request("POST", f.base()+"/restart", map[string]int{"expected_generation": 0}, false, http.StatusOK, nil)
 	oldRun := f.run
 	f.run, f.lease = "new-round-run", "planner@new-round-run"
@@ -189,34 +193,6 @@ func TestPrepareSnapshotRejectsClientSuppliedInputAndCrossRoundTemplates(t *test
 	template.Job, _ = json.Marshal(stale)
 	f.request("POST", f.base()+"/executions/prepare", template, true, http.StatusConflict, nil)
 	f.request("POST", f.base()+"/executions/"+oldRun+"/input/read", worker.GraphRequest{RequestID: strings.Repeat("c", 32), Op: "read_snapshot", Section: "overview"}, true, http.StatusNotFound, nil)
-}
-
-func TestSnapshotMarkersCannotDowngradeToLegacyRegistrationWithoutSnapshot(t *testing.T) {
-	for _, marker := range []string{"input_snapshot", "input_view", "preparation_key"} {
-		t.Run(marker, func(t *testing.T) {
-			f, _ := newSnapshotHTTPFixture(t)
-			template := snapshotTemplate(f, "explore")
-			template.RetryKey = "explore:" + f.intent
-			var fields map[string]any
-			_ = json.Unmarshal(template.Job, &fields)
-			if marker == "input_view" {
-				fields[marker] = map[string]int{"version": 1}
-			} else {
-				fields[marker] = strings.Repeat("e", 64)
-			}
-			template.Job, _ = json.Marshal(fields)
-			f.request("POST", f.base()+"/executions", template, true, http.StatusUnprocessableEntity, nil)
-			// Presence, including explicit null, cannot be disguised as a legacy
-			// job or enabled with a client-supplied prepared field.
-			fields[marker] = nil
-			template.Job, _ = json.Marshal(fields)
-			raw, _ := json.Marshal(template)
-			var registration map[string]any
-			_ = json.Unmarshal(raw, &registration)
-			registration["prepared"] = true
-			f.request("POST", f.base()+"/executions", registration, true, http.StatusUnprocessableEntity, nil)
-		})
-	}
 }
 
 func TestPrepareSnapshotKeepsRegistrationSmallBeyondEightMiBEvidence(t *testing.T) {

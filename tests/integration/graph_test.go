@@ -316,8 +316,8 @@ func TestDockerGraphBridgeDecideAndExecute(t *testing.T) {
 			mu.Unlock()
 			t.Fatalf("graph chain timed out; model errors: %v", diagnostics)
 		case <-ticker.C:
-			g, err := client.Get(ctx, project.Project.ID)
-			if err != nil {
+			var g board.Graph
+			if err := client.Do(ctx, "GET", "/projects/"+project.Project.ID, nil, &g, nil); err != nil {
 				t.Fatal(err)
 			}
 			if g.Project.Status != "completed" {
@@ -332,8 +332,8 @@ func TestDockerGraphBridgeDecideAndExecute(t *testing.T) {
 			if len(modelErrors) > 0 || !observedMidTask || !completionReviewed || executionRun == "" || len(decisionRuns) < 2 || len(state.Findings) != 1 || state.Findings[0].Status != "verified" {
 				t.Fatalf("incomplete acceptance: errors=%v midway=%t reviewed=%t decide=%d findings=%+v", modelErrors, observedMidTask, completionReviewed, len(decisionRuns), state.Findings)
 			}
-			var runs []board.Execution
-			if err := client.Do(ctx, "GET", "/executions?namespace="+c.Container.Namespace, nil, &runs, nil); err != nil {
+			runs, err := testExecutions(ctx, store, c.Container.Namespace)
+			if err != nil {
 				t.Fatal(err)
 			}
 			decided := false

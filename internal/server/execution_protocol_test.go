@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 type executionProtocolFixture struct {
 	t       *testing.T
 	handler http.Handler
+	store   *board.Store
 	project string
 	run     string
 	lease   string
@@ -34,7 +36,7 @@ func newExecutionProtocolFixture(t *testing.T) *executionProtocolFixture {
 	t.Cleanup(func() { _ = store.Close() })
 	// A fixed clock keeps these tests independent of heartbeat timing.
 	store.Now = func() time.Time { return time.Date(2026, 9, 22, 10, 0, 0, 0, time.UTC) }
-	f := &executionProtocolFixture{t: t, handler: New(store), run: "protocol-run", lease: "planner@protocol-run"}
+	f := &executionProtocolFixture{t: t, handler: New(store), store: store, run: "protocol-run", lease: "planner@protocol-run"}
 	var graph board.Graph
 	f.request("POST", "/projects", map[string]any{"title": "Protocol regression", "origin": "Synthetic local input", "goal": "Verify a synthetic result", "bootstrap_enabled": false}, false, http.StatusCreated, &graph)
 	f.project = graph.Project.ID
@@ -44,6 +46,11 @@ func newExecutionProtocolFixture(t *testing.T) *executionProtocolFixture {
 func (f *executionProtocolFixture) base() string { return "/projects/" + f.project }
 
 func (f *executionProtocolFixture) request(method, path string, body any, fenced bool, want int, out any) string {
+	f.t.Helper()
+	return f.requestWithHandler(f.handler, method, path, body, fenced, want, out)
+}
+
+func (f *executionProtocolFixture) requestWithHandler(handler http.Handler, method, path string, body any, fenced bool, want int, out any) string {
 	f.t.Helper()
 	var raw []byte
 	var err error
@@ -60,7 +67,7 @@ func (f *executionProtocolFixture) request(method, path string, body any, fenced
 		r.Header.Set("X-Xloom-Intent", f.intent)
 	}
 	w := httptest.NewRecorder()
-	f.handler.ServeHTTP(w, r)
+	handler.ServeHTTP(w, r)
 	if w.Code != want {
 		f.t.Fatalf("%s %s: HTTP %d, want %d: %s", method, path, w.Code, want, w.Body.String())
 	}
@@ -70,6 +77,59 @@ func (f *executionProtocolFixture) request(method, path string, body any, fenced
 		}
 	}
 	return w.Body.String()
+}
+
+// Legacy jobs remain recoverable after their registration route is retired.
+// Seed them through the internal transaction boundary without exposing an HTTP API.
+func (f *executionProtocolFixture) registerLegacy(body any, want int) string {
+	f.t.Helper()
+	server := &Server{Store: f.store}
+	handler := server.wrap(func(tx *board.Tx, q *request, r *http.Request) (int, any, error) {
+		var execution board.Execution
+		if err := decodeFields(q, &execution); err != nil {
+			return 0, nil, board.Err(422, "Invalid execution")
+		}
+		execution.ProjectID = f.project
+		return server.registerExecution(tx, execution, r)
+	})
+	return f.requestWithHandler(handler, "POST", f.base()+"/executions", body, true, want, nil)
+}
+
+func (f *executionProtocolFixture) executionRecords() []board.Execution {
+	f.t.Helper()
+	var executions []board.Execution
+	err := f.store.Do(context.Background(), func(tx *board.Tx) error {
+		rows, err := tx.Query("SELECT project_id,id FROM xloom_executions WHERE namespace=? ORDER BY created_at,rowid", "protocol-test")
+		if err != nil {
+			return err
+		}
+		var identities [][2]string
+		for rows.Next() {
+			var identity [2]string
+			if err := rows.Scan(&identity[0], &identity[1]); err != nil {
+				rows.Close()
+				return err
+			}
+			identities = append(identities, identity)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		for _, identity := range identities {
+			execution, err := tx.Execution(identity[0], identity[1])
+			if err != nil {
+				return err
+			}
+			executions = append(executions, execution)
+		}
+		return nil
+	})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return executions
 }
 
 func (f *executionProtocolFixture) state() board.State {
@@ -131,7 +191,7 @@ func (f *executionProtocolFixture) registerWithFields(kind string, graphRPC *boo
 		key = kind + ":" + f.intent
 	}
 	e := board.Execution{ProjectID: f.project, ID: f.run, Namespace: "protocol-test", Backend: "planner", Kind: kind, Intent: f.intent, Lease: f.lease, Job: raw, RetryKey: key}
-	f.request("POST", f.base()+"/executions", e, true, want, nil)
+	f.registerLegacy(e, want)
 }
 
 func (f *executionProtocolFixture) action(op, key string, payload any) board.StateActionResult {
@@ -184,7 +244,7 @@ func TestLiveDecisionCannotSubmitCompatibilitySteps(t *testing.T) {
 						t.Fatal("rejected final plan changed the project or created a duplicate step")
 					}
 					var entries []board.Execution
-					f.request("GET", "/executions?namespace=protocol-test", nil, false, http.StatusOK, &entries)
+					entries = f.executionRecords()
 					if len(entries) != 1 || entries[0].Status != "result_pending" {
 						t.Fatalf("rejected apply changed execution receipt: %+v", entries)
 					}
@@ -323,7 +383,7 @@ func TestExecutionRegistrationRejectsInvalidProtocolFields(t *testing.T) {
 			live := true
 			f.registerWithFields("reason", &live, 1, map[string]any{tt.field: tt.value}, http.StatusUnprocessableEntity)
 			var executions []board.Execution
-			f.request("GET", "/executions?namespace=protocol-test", nil, false, http.StatusOK, &executions)
+			executions = f.executionRecords()
 			if len(executions) != 0 {
 				t.Fatal("invalid protocol was saved as a resumable execution")
 			}

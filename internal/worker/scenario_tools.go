@@ -15,7 +15,7 @@ import (
 func cvssTool() agent.Tool {
 	definition := agent.Definition{
 		Name:        "cvss31",
-		Description: "Calculate a CVSS 3.1 Base vector with all eight metrics AV/AC/PR/UI/S/C/I/A. Returns the normalized vector, baseScore, severity and computation factors. Use evidence-backed metrics for verified vulnerabilities only; this calculation does not verify a vulnerability or its impact. No network, files or graph changes.",
+		Description: "Calculate a CVSS 3.1 Base vector with all eight metrics AV/AC/PR/UI/S/C/I/A. Returns the normalized vector, baseScore, severity and computation factors. Record the vector, score, severity and each metric's evidence in the Finding or result description. This is pure computation with no network, files or graph changes.",
 		Schema:      json.RawMessage(`{"type":"object","properties":{"vector":{"type":"string","minLength":1}},"required":["vector"],"additionalProperties":false}`),
 	}
 	return agent.Tool{Definition: definition, Execute: func(ctx context.Context, raw json.RawMessage) (string, error) {

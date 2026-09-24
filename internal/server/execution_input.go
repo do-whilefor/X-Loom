@@ -168,7 +168,7 @@ func (s *Server) prepareExecution(t *b.Tx, q *request, r *http.Request) (int, an
 	if err != nil {
 		return 0, nil, err
 	}
-	return s.registerExecution(t, e, r, true)
+	return s.registerExecution(t, e, r)
 }
 
 func preparedDecisionTriggers(state b.State, previous *b.ExecutionSummary, trigger string) []string {

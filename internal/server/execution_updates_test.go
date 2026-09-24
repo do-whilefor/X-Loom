@@ -29,9 +29,9 @@ func prepareUpdateFixture(t *testing.T, input string) (*stepInvalidationFixture,
 	case "legacy":
 		job.State = nil
 		e.Job, _ = json.Marshal(job)
-		f.request("POST", f.base()+"/executions", e, true, http.StatusCreated, nil)
+		f.registerLegacy(e, http.StatusCreated)
 	default:
-		f.request("POST", f.base()+"/executions", e, true, http.StatusCreated, nil)
+		f.registerLegacy(e, http.StatusCreated)
 	}
 	f.request("POST", f.base()+"/executions/"+f.run+"/status", map[string]string{"status": "running"}, true, http.StatusOK, nil)
 	return f, job

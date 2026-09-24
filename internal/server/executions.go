@@ -14,7 +14,6 @@ func (s *Server) registerExecutionRoutes(m *http.ServeMux) {
 	m.HandleFunc("POST /projects/{pid}/executions/prepare", s.wrap(s.prepareExecution))
 	m.HandleFunc("POST /projects/{pid}/executions/{rid}/input/read", s.wrap(s.snapshotRead))
 	m.HandleFunc("POST /projects/{pid}/executions/{rid}/updates", s.wrap(s.executionUpdates))
-	m.HandleFunc("GET /executions", s.wrap(s.executions))
 	m.HandleFunc("GET /executions/pending", s.wrap(s.pendingExecutions))
 	m.HandleFunc("GET /projects/{pid}/executions/check", s.wrap(s.executionCheck))
 	m.HandleFunc("GET /projects/{pid}/executions/{rid}", s.wrap(s.executionDetail))
@@ -22,7 +21,6 @@ func (s *Server) registerExecutionRoutes(m *http.ServeMux) {
 		r.SetPathValue("execution_identity", "true")
 		s.wrap(s.executionDetail)(w, r)
 	})
-	m.HandleFunc("POST /projects/{pid}/executions", s.wrap(s.executions))
 	for _, op := range []string{"status", "resume", "apply", "retry"} {
 		m.HandleFunc("POST /projects/{pid}/executions/{rid}/"+op, func(w http.ResponseWriter, r *http.Request) {
 			r.SetPathValue("execution_op", op)
@@ -37,26 +35,9 @@ func decodeFields(q *request, v any) error {
 	}
 	return json.Unmarshal(raw, v)
 }
-func (s *Server) executions(t *b.Tx, q *request, r *http.Request) (int, any, error) {
-	if r.Method == "GET" {
-		ns := r.URL.Query().Get("namespace")
-		if ns == "" {
-			return 0, nil, b.Err(422, "namespace is required")
-		}
-		list, err := t.Executions(ns)
-		return 200, list, err
-	}
-	var e b.Execution
-	if err := decodeFields(q, &e); err != nil {
-		return 0, nil, b.Err(422, "Invalid execution")
-	}
-	e.ProjectID = r.PathValue("pid")
-	return s.registerExecution(t, e, r, false)
-}
 
-// prepared is supplied only by the internal preparation path. HTTP fields can
-// never authorize a client-provided snapshot or preparation marker.
-func (s *Server) registerExecution(t *b.Tx, e b.Execution, r *http.Request, prepared bool) (int, any, error) {
+// Production registrations receive the job built by server-side preparation.
+func (s *Server) registerExecution(t *b.Tx, e b.Execution, r *http.Request) (int, any, error) {
 	var job struct {
 		RunID                 string          `json:"run_id"`
 		Kind                  string          `json:"kind"`
@@ -65,15 +46,9 @@ func (s *Server) registerExecution(t *b.Tx, e b.Execution, r *http.Request, prep
 		Workspace             string          `json:"workspace"`
 		GraphRPC              json.RawMessage `json:"graph_rpc"`
 		ResultContractVersion json.RawMessage `json:"result_contract_version"`
-		InputSnapshot         json.RawMessage `json:"input_snapshot"`
-		InputView             json.RawMessage `json:"input_view"`
-		PreparationKey        json.RawMessage `json:"preparation_key"`
 	}
 	if json.Unmarshal(e.Job, &job) != nil || e.ID == "" || e.Namespace == "" || e.Backend == "" || e.Lease == "" || e.RetryKey == "" || job.RunID != e.ID || job.Kind != e.Kind || job.Graph.Project.ID != e.ProjectID || job.Workspace == "" {
 		return 0, nil, b.Err(422, "Invalid execution identity")
-	}
-	if (len(job.InputSnapshot) != 0 || len(job.InputView) != 0 || len(job.PreparationKey) != 0) && !prepared {
-		return 0, nil, b.Err(422, "snapshot inputs must be created through execution preparation")
 	}
 	// Absence preserves old jobs. Explicit null or a malformed value must not
 	// silently select the compatibility protocol or poison a durable result.

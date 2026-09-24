@@ -56,7 +56,7 @@ func TestAutomaticRetryRouteDoesNotRestoreHistoricalJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	f := &executionProtocolFixture{t: t, handler: New(store), run: "original", lease: "planner@original"}
+	f := &executionProtocolFixture{t: t, handler: New(store), store: store, run: "original", lease: "planner@original"}
 	var graph board.Graph
 	f.request("POST", "/projects", map[string]any{"title": "Retry metadata", "origin": "Synthetic fixture", "goal": "Check grant", "bootstrap_enabled": false}, false, http.StatusCreated, &graph)
 	f.project = graph.Project.ID

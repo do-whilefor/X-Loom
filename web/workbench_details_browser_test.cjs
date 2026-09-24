@@ -62,21 +62,20 @@ test('workbench collapses long logs and filters cards without losing the canvas 
   });
   await page.route('**/*', async route => {
     const request = route.request(), url = new URL(request.url()), pathname = url.pathname;
-    if (url.origin !== base.origin || (!pathname.startsWith('/projects') && pathname !== '/ui/overview')) return route.continue();
+    if (url.origin !== base.origin || !pathname.startsWith('/projects')) return route.continue();
     if (request.method() !== 'GET') {
       writes.push(request.method() + ' ' + pathname);
       return route.fulfill({status:405,contentType:'application/json',body:JSON.stringify({detail:'Browser regression fixture is read-only'})});
     }
     let body;
     if (pathname === '/projects') body = [state.graph.project];
-    else if (pathname === '/ui/overview') body = {active_workers:1,observed_at:created};
     else if (pathname === projectPath + '/state') {
       if (stateUnavailable) return route.abort('failed');
       body = state;
     }
     else if (pathname === projectPath + '/state/events') body = [];
     else if (pathname === projectPath + '/executions') body = {items:runs,through:runs.length};
-    else if (pathname === projectPath) body = state.graph;
+    else if (pathname === projectPath + '/identity') body = {id:state.graph.project.id,generation:state.graph.project.generation};
     else {
       errors.push('Unexpected API read: ' + pathname);
       return route.fulfill({status:404,contentType:'application/json',body:'{"detail":"Unknown fixture endpoint"}'});

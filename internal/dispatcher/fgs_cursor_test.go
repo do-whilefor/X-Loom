@@ -13,7 +13,7 @@ import (
 )
 
 func TestDecisionPreparationQueriesItsCapturedInputRevision(t *testing.T) {
-	s, runner, _, graph := batchSchedulerFixture(t, 1)
+	s, runner, _, graph, _ := batchSchedulerFixture(t, 1)
 	ctx := context.Background()
 	inserted := false
 	s.Client.HTTP = &http.Client{Transport: executionQueryTransport(func(r *http.Request) (*http.Response, error) {
@@ -51,7 +51,7 @@ func TestDecisionPreparationQueriesItsCapturedInputRevision(t *testing.T) {
 }
 
 func TestNewDecisionDoesNotReadCompletedJobSnapshot(t *testing.T) {
-	template, _, _, _ := batchSchedulerFixture(t, 1)
+	template, _, _, _, _ := batchSchedulerFixture(t, 1)
 	store, err := board.Open(filepath.Join(t.TempDir(), "fgs.db"))
 	if err != nil {
 		t.Fatal(err)

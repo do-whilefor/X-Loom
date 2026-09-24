@@ -204,10 +204,10 @@
   async function loadWorkspace(preferred = selectedId) {
     if (mutating) return; clearTimeout(timer); const request = requests.begin(), options = {signal:request.signal}; let retryGeneration = false;
     try {
-      const [list, overview] = await Promise.all([api.request('/projects', options), api.request('/ui/overview', options)]); if (!requests.current(request.version)) return;
+      const list = await api.request('/projects', options); if (!requests.current(request.version)) return;
       projects = list.slice().sort((a,b) => String(b.created_at || '').localeCompare(String(a.created_at || '')) || b.id.localeCompare(a.id));
       const target = projects.some(project => project.id === preferred) ? preferred : projects[0]?.id || ''; if (target !== selectedId) resetSelection(target); renderProjects();
-      if (!target) { state = null; executions = []; events = []; logs = []; updateGraph(null); renderActivity({reset:true}); setConnection(true); $('last-update').textContent = '刷新 ' + data.formatTime(overview.observed_at); return; }
+      if (!target) { state = null; executions = []; events = []; logs = []; updateGraph(null); renderActivity({reset:true}); setConnection(true); $('last-update').textContent = '刷新 ' + data.formatTime(new Date().toISOString()); return; }
       const [nextState, runs] = await Promise.all([api.request(pathFor(target) + '/state', options), api.projectExecutions(pathFor(target), options)]); if (!requests.current(request.version)) return;
       const generation = nextState.graph.project.generation || 0;
       let cache = eventCache.get(target) || {after:0,events:[],generation};
@@ -219,8 +219,8 @@
         const nextEvents = await api.request(pathFor(target) + '/state/events?after=' + after, options); if (!requests.current(request.version)) return; if (!nextEvents.length) break;
         const next = Math.max(...nextEvents.map(event => event.revision)); if (next <= after) break; batch.push(...nextEvents); after = next; if (nextEvents.length < 1000) break;
       }
-      const latest = await api.request(pathFor(target), options); if (!requests.current(request.version)) return;
-      if ((latest.project.generation || 0) !== generation) { eventCache.delete(target); retryGeneration = true; return; }
+      const latest = await api.request(pathFor(target) + '/identity', options); if (!requests.current(request.version)) return;
+      if ((latest.generation || 0) !== generation) { eventCache.delete(target); retryGeneration = true; return; }
       cache = {after,generation,stateRevision:nextState.revision,events:cache.events.concat(batch)}; eventCache.set(target, cache);
       if (state && (state.graph.project.generation || 0) !== generation) { selectedNode = null; selectedEdge = null; logLimit = 300; }
       state = nextState; executions = runs.filter(run => (run.generation || 0) === generation); events = cache.events.filter(event => event.revision <= state.revision);

@@ -21,7 +21,7 @@ func TestLegacyBootstrapPendingResultResumesUnderItsRegisteredContract(t *testin
 			}
 			f.pending(output)
 			var before []board.Execution
-			f.request("GET", "/executions?namespace=protocol-test", nil, false, http.StatusOK, &before)
+			before = f.executionRecords()
 			var resumed board.Execution
 			f.request("POST", f.base()+"/executions/"+f.run+"/resume", map[string]any{}, true, http.StatusOK, &resumed)
 			if len(before) != 1 || resumed.ID != before[0].ID || resumed.Kind != "bootstrap" || resumed.Lease != before[0].Lease || resumed.Status != "result_pending" || !bytes.Equal(resumed.Job, before[0].Job) || !bytes.Equal(resumed.Result, before[0].Result) {
@@ -102,7 +102,7 @@ func TestHistoricalBootstrapStrategySurvivesLifecycleAndDatabaseReopen(t *testin
 				t.Fatal(err)
 			}
 			defer store.Close()
-			f := &executionProtocolFixture{t: t, handler: New(store), project: "historical"}
+			f := &executionProtocolFixture{t: t, handler: New(store), store: store, project: "historical"}
 			assertStrategy := func() {
 				var graph board.Graph
 				f.request("GET", f.base(), nil, false, http.StatusOK, &graph)

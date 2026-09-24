@@ -38,7 +38,7 @@ func TestDecisionBatchMakesProgressAfterFiniteConcurrentObservations(t *testing.
 		t.Fatalf("no progress after bounded conflicts: %+v", receipt)
 	}
 	var executions []board.Execution
-	f.request("GET", "/executions?namespace=protocol-test", nil, false, http.StatusOK, &executions)
+	executions = f.executionRecords()
 	for _, e := range executions {
 		if e.ID == f.run && e.Status != "succeeded" {
 			t.Fatal("committed planner has no durable success")
@@ -57,7 +57,7 @@ func TestDecisionBatchRefusalDoesNotPublishDraftOrRequireCommit(t *testing.T) {
 		t.Fatal("refusal published a plan, observation or project completion")
 	}
 	var executions []board.Execution
-	f.request("GET", "/executions?namespace=protocol-test", nil, false, http.StatusOK, &executions)
+	executions = f.executionRecords()
 	if len(executions) != 1 || executions[0].Status != "rejected" {
 		t.Fatalf("refusal was not delivered idempotently: %+v", executions)
 	}

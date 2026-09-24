@@ -54,11 +54,12 @@ func TestRestartArchivesCompleteRoundAndReadsEveryByte(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		executions, err := tx.Executions("test")
-		for _, execution := range executions {
-			expected["execution/"+execution.ID], _ = json.Marshal(execution)
+		execution, err := tx.Execution("proj_001", "evidence-one")
+		if err != nil {
+			return err
 		}
-		return err
+		expected["execution/"+execution.ID], _ = json.Marshal(execution)
+		return nil
 	})
 	if len(expected["state/state"]) < 32<<10 {
 		t.Fatal("fixture does not exercise byte continuation")

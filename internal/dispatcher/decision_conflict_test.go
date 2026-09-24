@@ -77,11 +77,11 @@ func (r *conflictDecisionRunner) Run(ctx context.Context, backend config.Worker,
 func TestDecisionConflictSchedulesChangedInputWithoutRetryingOldSnapshot(t *testing.T) {
 	for _, op := range []string{"decision_preview", "decision_commit"} {
 		t.Run(op, func(t *testing.T) {
-			fixture, _, _, _ := automaticRetryFixture(t, 0, "")
+			fixture, _, store, _ := automaticRetryFixture(t, 0, "")
 			runner := &conflictDecisionRunner{client: fixture.Client, conflictOp: op}
 			scheduler := New(fixture.Config, runner)
 			retryTicks(t, scheduler, 1)
-			original := retryExecutions(t, scheduler)[0]
+			original := testExecutions(t, store)[0]
 			var failure worker.Result
 			if err := json.Unmarshal(original.Result, &failure); err != nil {
 				t.Fatal(err)
@@ -92,7 +92,7 @@ func TestDecisionConflictSchedulesChangedInputWithoutRetryingOldSnapshot(t *test
 			// Recovery must use current server input, including across a restart.
 			scheduler = New(scheduler.Config, runner)
 			retryTicks(t, scheduler, 6)
-			runs := retryExecutions(t, scheduler)
+			runs := testExecutions(t, store)
 			if len(runner.seen) != 2 || len(runs) != 2 {
 				t.Fatalf("changed input was lost or scheduled repeatedly: jobs=%d runs=%d", len(runner.seen), len(runs))
 			}
@@ -108,14 +108,14 @@ func TestDecisionConflictSchedulesChangedInputWithoutRetryingOldSnapshot(t *test
 }
 
 func TestDecisionConflictWithoutChangedInputDoesNotRenewRetryAllowance(t *testing.T) {
-	scheduler, runner, _, graph := automaticRetryFixture(t, 99, "state_changed")
+	scheduler, runner, store, graph := automaticRetryFixture(t, 99, "state_changed")
 	retryTicks(t, scheduler, 1)
-	original := retryExecutions(t, scheduler)[0]
+	original := testExecutions(t, store)[0]
 	for range 2 {
 		scheduler = New(scheduler.Config, runner)
 		retryTicks(t, scheduler, 4)
 	}
-	if len(runner.seen) != 1 || len(retryExecutions(t, scheduler)) != 1 {
+	if len(runner.seen) != 1 || len(testExecutions(t, store)) != 1 {
 		t.Fatal("unchanged input repeatedly reauthorized the conflicted decision")
 	}
 	err := scheduler.Client.Do(context.Background(), "POST", projectPath(graph.Project.ID)+"/executions/"+original.ID+"/retry", map[string]bool{"automatic": true}, nil, nil)

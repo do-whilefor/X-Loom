@@ -420,7 +420,7 @@ def render(report):
     if report.get("validation_review_applied"):
         lines += ["", "业务验收采用保留证据的离线复核结果（validation-reviewed.json），原始 validation.json 未被覆盖。",
                   "原始失败项：" + "；".join(report["original_business_validation"].get("failures") or ["无"]),
-                  "复核原因：" + str(report["business_validation"].get("review_reason", "见复核文件")) + "。CONT-amount-24 的前缀原先也匹配了 arithmetic-correction Fact，严格 token 边界修正后重新检查相同归档证据。",
+                  "复核原因：" + str(report["business_validation"].get("review_reason", "见复核文件")) + "。",
                   "复核失败项：" + "；".join(report["business_validation"].get("failures") or ["无"])]
     elif report["business_validation"].get("failures"):
         lines.append("业务验收失败项：" + "；".join(report["business_validation"]["failures"]))

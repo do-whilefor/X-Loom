@@ -166,13 +166,16 @@ func TestLiveContentionProject(t *testing.T) {
 			t.Error(err)
 		}
 		_ = saveLiveJSON(filepath.Join(output, "state.json"), state)
-		for filename, endpoint := range map[string]string{"state-events.json": "/projects/" + pid + "/state/events?after=0", "executions.json": "/executions?namespace=" + namespace} {
-			var value any
-			if err := client.Do(collectCtx, "GET", endpoint, nil, &value, nil); err != nil {
-				t.Error(err)
-			} else if err = saveLiveJSON(filepath.Join(output, filename), value); err != nil {
-				t.Error(err)
-			}
+		var events []board.StateEvent
+		if err := client.Do(collectCtx, "GET", "/projects/"+pid+"/state/events?after=0", nil, &events, nil); err != nil {
+			t.Error(err)
+		} else if err := saveLiveJSON(filepath.Join(output, "state-events.json"), events); err != nil {
+			t.Error(err)
+		}
+		if executions, err := testExecutions(collectCtx, store, namespace); err != nil {
+			t.Error(err)
+		} else if err := saveLiveJSON(filepath.Join(output, "executions.json"), executions); err != nil {
+			t.Error(err)
 		}
 		if err := saveLiveJSON(filepath.Join(output, "runs.json"), runner.snapshot()); err != nil {
 			t.Error(err)

@@ -14,9 +14,8 @@ type Loop struct {
 	Tools    []Tool
 	History  []Message
 	Emit     Emit
-	Save     func([]Message) error
-	// SaveState atomically persists the request view and its checkpoint. When
-	// supplied it replaces Save. Original messages remain in message_end events.
+	// SaveState atomically persists the request view and its checkpoint.
+	// Original messages remain in message_end events.
 	SaveState  func([]Message, *ContextCheckpoint) error
 	Checkpoint *ContextCheckpoint
 	Steering   <-chan string
@@ -81,9 +80,6 @@ func (l *Loop) append(m Message) error {
 func (l *Loop) saveState() error {
 	if l.SaveState != nil {
 		return l.SaveState(l.History, l.Checkpoint)
-	}
-	if l.Save != nil {
-		return l.Save(l.History)
 	}
 	return nil
 }
@@ -155,12 +151,7 @@ func (l *Loop) Run(ctx context.Context, prompt string) (string, error) {
 			if err := l.compact(ctx); err != nil {
 				return last, err
 			}
-			var defs []Definition
-			for _, t := range l.Tools {
-				if !l.Concluding && !l.Repairing {
-					defs = append(defs, t.Definition)
-				}
-			}
+			defs := l.definitions()
 			l.emit(Event{Type: "turn_start"})
 			m, err := l.generate(ctx, l.History, defs, 0)
 			if err != nil {

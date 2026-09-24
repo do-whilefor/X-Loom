@@ -84,7 +84,7 @@ class TimingAnalysisTests(unittest.TestCase):
                               {"type": "tool_end", "at": "2026-09-23T00:00:19.400000Z", "tool_id": "commit-1", "tool_name": "graph_action"}]
                 (path / "events.jsonl").write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
             report = analyze(root)
-            save("validation-reviewed.json", {"passed": True, "failures": [], "review_reason": "marker suffix correction"})
+            save("validation-reviewed.json", {"passed": True, "failures": [], "review_reason": "independent evidence review"})
             reviewed_report = analyze(root)
             path = root / "workspace" / ".xloom" / "runs" / "decide" / "events.jsonl"
             events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
@@ -110,6 +110,9 @@ class TimingAnalysisTests(unittest.TestCase):
         self.assertIn("本次没有触发版本冲突", render(report))
         self.assertTrue(reviewed_report["validation_review_applied"])
         self.assertIn("原始 validation.json 未被覆盖", render(reviewed_report))
+        self.assertIn("independent evidence review", render(reviewed_report))
+        self.assertNotIn("marker suffix", render(reviewed_report))
+        self.assertNotIn("arithmetic-correction", render(reviewed_report))
 
 
 if __name__ == "__main__":

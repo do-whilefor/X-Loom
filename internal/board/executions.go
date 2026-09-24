@@ -64,22 +64,6 @@ func (t *Tx) Execution(project, id string) (Execution, error) {
 	}
 	return e, err
 }
-func (t *Tx) Executions(namespace string) ([]Execution, error) {
-	rows, err := t.Query("SELECT "+executionColumns+" FROM xloom_executions WHERE namespace=? ORDER BY created_at,rowid", namespace)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []Execution{}
-	for rows.Next() {
-		e, err := scanExecution(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
-}
 func (t *Tx) RegisterExecution(e Execution) error {
 	var snapshotJob struct {
 		InputSnapshot *InputSnapshot `json:"input_snapshot"`

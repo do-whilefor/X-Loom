@@ -31,9 +31,9 @@ func (r *staleDecisionRunner) Run(ctx context.Context, backend config.Worker, jo
 	return r.batchProtocolRunner.Run(ctx, backend, job)
 }
 
-func staleDecisionFailure(t *testing.T, scheduler *Scheduler) board.Execution {
+func staleDecisionFailure(t *testing.T, store *board.Store) board.Execution {
 	t.Helper()
-	runs := retryExecutions(t, scheduler)
+	runs := testExecutions(t, store)
 	if len(runs) != 1 {
 		t.Fatalf("stale run was retried before a fresh scheduling pass: %+v", runs)
 	}
@@ -47,12 +47,12 @@ func staleDecisionFailure(t *testing.T, scheduler *Scheduler) board.Execution {
 	return runs[0]
 }
 
-func assertFreshDecisionReplacement(t *testing.T, scheduler *Scheduler, runner *staleDecisionRunner, original board.Execution) {
+func assertFreshDecisionReplacement(t *testing.T, scheduler *Scheduler, runner *staleDecisionRunner, store *board.Store, original board.Execution) {
 	t.Helper()
 	// Once the first no-op commit consumes the new input, further ticks must
 	// neither restart the stale snapshot nor schedule the replacement twice.
 	retryTicks(t, scheduler, 6)
-	runs := retryExecutions(t, scheduler)
+	runs := testExecutions(t, store)
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
 	if len(runner.seen) != 2 || len(runs) != 2 {
@@ -68,7 +68,7 @@ func assertFreshDecisionReplacement(t *testing.T, scheduler *Scheduler, runner *
 }
 
 func TestDecisionHeartbeatCancelsStalledRunWithoutSchedulerTick(t *testing.T) {
-	fixture, _, _, graph := automaticRetryFixture(t, 0, "")
+	fixture, _, store, graph := automaticRetryFixture(t, 0, "")
 	started := make(chan worker.Job, 1)
 	stopped := make(chan error, 1)
 	runner := &staleDecisionRunner{first: func(ctx context.Context, job worker.Job) (worker.Result, error) {
@@ -106,12 +106,12 @@ func TestDecisionHeartbeatCancelsStalledRunWithoutSchedulerTick(t *testing.T) {
 		t.Fatal("changed input did not cancel the stalled Decide within five heartbeat intervals")
 	}
 	scheduler.wg.Wait()
-	original := staleDecisionFailure(t, scheduler)
-	assertFreshDecisionReplacement(t, scheduler, runner, original)
+	original := staleDecisionFailure(t, store)
+	assertFreshDecisionReplacement(t, scheduler, runner, store, original)
 }
 
 func TestDecisionRetryChecksVersionBeforeStartingAnotherRunner(t *testing.T) {
-	fixture, _, _, graph := automaticRetryFixture(t, 0, "")
+	fixture, _, store, graph := automaticRetryFixture(t, 0, "")
 	// Keep the periodic heartbeat out of this test: the same-run recovery
 	// preflight must discover the change itself before restarting the Worker.
 	fixture.Config.Runtime.Interval = 10
@@ -123,18 +123,18 @@ func TestDecisionRetryChecksVersionBeforeStartingAnotherRunner(t *testing.T) {
 	}}
 	scheduler := New(fixture.Config, runner)
 	retryTicks(t, scheduler, 1)
-	original := staleDecisionFailure(t, scheduler)
+	original := staleDecisionFailure(t, store)
 	runner.mu.Lock()
 	calls := len(runner.seen)
 	runner.mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("same-run recovery started %d Workers against stale input", calls)
 	}
-	assertFreshDecisionReplacement(t, scheduler, runner, original)
+	assertFreshDecisionReplacement(t, scheduler, runner, store, original)
 }
 
 func TestDecisionTerminalFailureSurvivesConcurrentStaleCancellation(t *testing.T) {
-	fixture, _, _, graph := automaticRetryFixture(t, 0, "")
+	fixture, _, store, graph := automaticRetryFixture(t, 0, "")
 	fixture.Config.Runtime.Interval = 30
 	runner := &staleDecisionRunner{first: func(ctx context.Context, _ worker.Job) (worker.Result, error) {
 		if err := fixture.Client.Do(ctx, "POST", projectPath(graph.Project.ID)+"/hints", map[string]string{"content": "Input changed before recovery", "creator": "fixture"}, nil, nil); err != nil {
@@ -185,7 +185,7 @@ func TestDecisionTerminalFailureSurvivesConcurrentStaleCancellation(t *testing.T
 	if outcome != "failed" || err == nil || context.Cause(ctx) != lateConflict || len(failures) != 1 {
 		t.Fatalf("settled stale failure changed after late cancellation: outcome=%q err=%v cause=%v writes=%d", outcome, err, context.Cause(ctx), len(failures))
 	}
-	terminal := staleDecisionFailure(t, scheduler)
+	terminal := staleDecisionFailure(t, store)
 	var result worker.Result
 	if err := json.Unmarshal(terminal.Result, &result); err != nil {
 		t.Fatal(err)
@@ -199,7 +199,7 @@ func TestDecisionTerminalFailureSurvivesConcurrentStaleCancellation(t *testing.T
 }
 
 func TestDecisionCommittedReceiptWinsStaleCancellation(t *testing.T) {
-	fixture, _, _, graph := automaticRetryFixture(t, 0, "")
+	fixture, _, store, graph := automaticRetryFixture(t, 0, "")
 	runner := &batchProtocolRunner{directions: 1}
 	scheduler := New(fixture.Config, runner)
 	ctx, cancel := context.WithCancelCause(context.Background())
@@ -220,7 +220,7 @@ func TestDecisionCommittedReceiptWinsStaleCancellation(t *testing.T) {
 	if outcome != "success" || err != nil || !decisionStateChanged(context.Cause(ctx)) {
 		t.Fatalf("late stale-input signal overrode a durable commit: outcome=%q err=%v cause=%v", outcome, err, context.Cause(ctx))
 	}
-	runs := retryExecutions(t, scheduler)
+	runs := testExecutions(t, store)
 	if len(runs) != 1 || runs[0].Status != "succeeded" {
 		t.Fatalf("committed execution was rewritten after cancellation: %+v", runs)
 	}
@@ -234,7 +234,7 @@ func TestDecisionCommittedReceiptWinsStaleCancellation(t *testing.T) {
 }
 
 func TestDecisionHeartbeatCancelsBlockedHealthBeforeRunnerStarts(t *testing.T) {
-	scheduler, runner, _, graph := automaticRetryFixture(t, 0, "")
+	scheduler, runner, store, graph := automaticRetryFixture(t, 0, "")
 	scheduler.Config.Runtime.HealthMode = "startup_and_task"
 	started := make(chan struct{})
 	stopped := make(chan error, 1)
@@ -266,7 +266,7 @@ func TestDecisionHeartbeatCancelsBlockedHealthBeforeRunnerStarts(t *testing.T) {
 		t.Fatal("stale input did not interrupt the readiness probe")
 	}
 	scheduler.wg.Wait()
-	staleDecisionFailure(t, scheduler)
+	staleDecisionFailure(t, store)
 	if len(runner.seen) != 0 {
 		t.Fatal("stale Decide reached Runner after its readiness probe was cancelled")
 	}

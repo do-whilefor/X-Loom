@@ -4,15 +4,15 @@ package board
 // the write transaction. Already running work can retain independent evidence;
 // invalidating its premise does not silently cancel it or rewrite its inputs.
 func (t *Tx) StepReady(project, id string) error {
-	if err := t.StepAvailable(project, id); err != nil {
-		return err
-	}
 	s, err := t.State(project)
 	if err != nil {
 		return err
 	}
 	for _, step := range s.Steps {
 		if step.ID == id {
+			if step.Status == "abandoned" {
+				return Err(409, "Step was abandoned")
+			}
 			return s.ValidateFactSources(step.From, false)
 		}
 	}

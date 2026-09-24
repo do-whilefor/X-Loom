@@ -79,18 +79,13 @@ func TestRetryRechecksCorrectedStepBeforeStartingAnotherProcess(t *testing.T) {
 	}
 	registered := board.Execution{ProjectID: state.Graph.Project.ID, ID: job.RunID, Namespace: "xloom", Backend: "fixture", Kind: job.Kind, Intent: job.Intent.ID, Lease: "fixture@" + job.RunID, Job: raw, RetryKey: "explore:" + job.Intent.ID}
 	lease := Lease{Run: registered.Lease, Kind: registered.Kind, Intent: registered.Intent}
-	if err := scheduler.Client.Do(ctx, "POST", projectPath(registered.ProjectID)+"/executions", registered, &registered, &lease); err != nil {
-		t.Fatal(err)
-	}
+	registered = registerLegacyExecution(t, store, registered)
 	active := &task{Job: job, Worker: config.Worker{Name: "fixture", Type: "mock"}, Lease: lease, Execution: registered}
 	outcome, runErr := scheduler.runRegistered(ctx, active, func() {})
 	if runner.calls != 1 || outcome != "cancelled" || runErr == nil || !strings.Contains(runErr.Error(), "not effective evidence") {
 		t.Fatalf("invalidated retry started another process or lost its cause: calls=%d outcome=%s err=%v", runner.calls, outcome, runErr)
 	}
-	var executions []board.Execution
-	if err := scheduler.Client.Do(ctx, "GET", "/executions?namespace=xloom", nil, &executions, nil); err != nil {
-		t.Fatal(err)
-	}
+	executions := testExecutions(t, store)
 	if len(executions) != 1 || executions[0].Status != "cancelled" {
 		t.Fatalf("retry cancellation was not durable: %+v", executions)
 	}

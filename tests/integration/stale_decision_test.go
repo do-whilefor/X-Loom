@@ -201,8 +201,8 @@ func TestDockerStaleDecisionCancelsModelWithoutStoppingExecute(t *testing.T) {
 	}
 	readRuns := func() []board.Execution {
 		t.Helper()
-		var runs []board.Execution
-		if err := client.Do(ctx, "GET", "/executions?namespace="+c.Container.Namespace, nil, &runs, nil); err != nil {
+		runs, err := testExecutions(ctx, store, c.Container.Namespace)
+		if err != nil {
 			t.Fatal(err)
 		}
 		return runs

@@ -27,8 +27,11 @@ func TestCTFSubmissionRulesReachModelAndPersistAcrossPhases(t *testing.T) {
 			calls := 0
 			provider := scenarioProvider(func(_ context.Context, history []agent.Message, definitions []agent.Definition, _ agent.Emit) (agent.Message, error) {
 				calls++
-				input := history[len(history)-1].Text()
-				for _, rule := range []string{"high confidence", "Never use the submission API to brute force", "API response explicitly confirms acceptance", "${TSEC_SERVER_HOST}/api/submit", "${TSEC_AGENT_TOKEN}"} {
+				var input string
+				for _, message := range history {
+					input += message.Text() + "\n"
+				}
+				for _, rule := range []string{"high confidence", "Never use the submission API to brute force", "API response explicitly confirms acceptance"} {
 					if !strings.Contains(input, rule) {
 						t.Fatalf("model input lost submission rule %q in %s", rule, phase)
 					}
@@ -36,6 +39,18 @@ func TestCTFSubmissionRulesReachModelAndPersistAcrossPhases(t *testing.T) {
 				restricted := phase == "conclude" || (phase == "repair" && calls == 2)
 				if restricted != (len(definitions) == 0) {
 					t.Fatalf("wrong phase capabilities: restricted=%v definitions=%v", restricted, definitions)
+				}
+				if strings.Count(input, ctfPolicy) != 1 || strings.Count(input, "<task_graph>") != 1 || strings.Contains(input, ctfExecution) {
+					t.Fatal("task policy was duplicated or execution instructions leaked into phase history")
+				}
+				submission := false
+				for _, definition := range definitions {
+					if definition.Name == "bash" {
+						submission = strings.Contains(definition.Description, "${TSEC_SERVER_HOST}/api/submit") && strings.Contains(definition.Description, "${TSEC_AGENT_TOKEN}")
+					}
+				}
+				if submission == restricted {
+					t.Fatal("CTF submission recipe must exist only in executable tool definitions")
 				}
 				if phase == "repair" && calls == 1 {
 					return agent.Text("assistant", "A candidate flag is not enough to claim submission success."), nil
@@ -58,9 +73,8 @@ func TestCTFSubmissionRulesReachModelAndPersistAcrossPhases(t *testing.T) {
 			if err := json.Unmarshal(raw, &saved); err != nil {
 				t.Fatal(err)
 			}
-			prompt := map[string]string{"execute": saved.TaskPrompt, "conclude": saved.ConclusionPrompt, "repair": saved.RepairPrompt}[phase]
-			if !strings.Contains(prompt, ctfPolicy) {
-				t.Fatal("durable phase prompt lost the CTF submission policy")
+			if !strings.Contains(saved.TaskPrompt, ctfPolicy) || strings.Contains(saved.ConclusionPrompt+saved.RepairPrompt, ctfPolicy) {
+				t.Fatal("durable phase prompts did not retain exactly one shared CTF policy")
 			}
 		})
 	}

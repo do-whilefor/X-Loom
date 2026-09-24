@@ -15,7 +15,8 @@ func TestProjectExecutionsUseMetadataAndBoundedPublicResult(t *testing.T) {
 		putQueryExecution(t, tx, Execution{ProjectID: "proj_001", ID: "malformed", Kind: "reason", Status: "failed", Job: json.RawMessage("archived"), Result: json.RawMessage("not JSON")}, 8, "")
 		nul, _ := json.Marshal(map[string]string{"text": "before\x00after"})
 		putQueryExecution(t, tx, Execution{ProjectID: "proj_001", ID: "nul", Kind: "reason", Status: "succeeded", Result: nul}, 8, "")
-		views, err := tx.ProjectExecutions("proj_001")
+		page, err := tx.ProjectExecutionPage("proj_001", 0, 0, 100)
+		views := page.Items
 		if err != nil {
 			return err
 		}
@@ -75,9 +76,9 @@ func TestProjectExecutionPagesBoundBytesAndRetainAllHistory(t *testing.T) {
 		if len(seen) != 12 {
 			t.Fatalf("lost execution history: got %d entries", len(seen))
 		}
-		legacy, err := tx.ProjectExecutions("proj_001")
-		if err == nil && len(legacy) != 13 {
-			t.Fatalf("legacy array lost entries: %d", len(legacy))
+		fresh, err := tx.ProjectExecutionPage("proj_001", through, 0, 100)
+		if err == nil && (len(fresh.Items) != 1 || fresh.Items[0].ID != "new-run" || fresh.Through <= through) {
+			t.Fatalf("new executions not visible from a fresh boundary: %+v", fresh)
 		}
 		return err
 	})

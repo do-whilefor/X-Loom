@@ -174,7 +174,7 @@ func (f *batchFaultTransport) RoundTrip(request *http.Request) (*http.Response, 
 	return response, err
 }
 
-func batchSchedulerFixture(t *testing.T, directions int) (*Scheduler, *batchProtocolRunner, *batchFaultTransport, board.Graph) {
+func batchSchedulerFixture(t *testing.T, directions int) (*Scheduler, *batchProtocolRunner, *batchFaultTransport, board.Graph, *board.Store) {
 	t.Helper()
 	store, err := board.Open(filepath.Join(t.TempDir(), "decision-flow.db"))
 	if err != nil {
@@ -201,7 +201,7 @@ func batchSchedulerFixture(t *testing.T, directions int) (*Scheduler, *batchProt
 	if err = scheduler.Client.Do(context.Background(), "POST", "/projects", map[string]any{"title": "Batch fixture", "origin": "Synthetic target fixtures", "goal": "Check every requested fixture", "bootstrap_enabled": true}, &graph, nil); err != nil {
 		t.Fatal(err)
 	}
-	return scheduler, runner, transport, graph
+	return scheduler, runner, transport, graph, store
 }
 
 func finishBatchFixture(t *testing.T, scheduler *Scheduler, project string) board.State {
@@ -225,12 +225,9 @@ func finishBatchFixture(t *testing.T, scheduler *Scheduler, project string) boar
 	return board.State{}
 }
 
-func assertBatchExecutionReceipts(t *testing.T, scheduler *Scheduler, transport *batchFaultTransport, project string) {
+func assertBatchExecutionReceipts(t *testing.T, store *board.Store, transport *batchFaultTransport, project string) {
 	t.Helper()
-	var executions []board.Execution
-	if err := scheduler.Client.Do(context.Background(), "GET", "/executions?namespace=xloom", nil, &executions, nil); err != nil {
-		t.Fatal(err)
-	}
+	executions := testExecutions(t, store)
 	for _, execution := range executions {
 		if execution.ProjectID == project && execution.Status != "succeeded" {
 			t.Fatalf("commit receipt was overwritten or execution retried: %s %s", execution.Kind, execution.Status)
@@ -247,7 +244,7 @@ func TestDecisionBatchDispatcherEndToEndWithDeliveryFaults(t *testing.T) {
 	for _, directions := range []int{1, 3} {
 		for _, mode := range []string{"normal", "runner_error_after_commit", "commit_response_lost"} {
 			t.Run(fmt.Sprintf("%d_directions/%s", directions, mode), func(t *testing.T) {
-				scheduler, runner, transport, graph := batchSchedulerFixture(t, directions)
+				scheduler, runner, transport, graph, store := batchSchedulerFixture(t, directions)
 				runner.lateError = mode == "runner_error_after_commit"
 				transport.loseResponse = mode == "commit_response_lost"
 				state := finishBatchFixture(t, scheduler, graph.Project.ID)
@@ -273,7 +270,7 @@ func TestDecisionBatchDispatcherEndToEndWithDeliveryFaults(t *testing.T) {
 				if explores != directions {
 					t.Fatalf("Execute ran %d times, want %d", explores, directions)
 				}
-				assertBatchExecutionReceipts(t, scheduler, transport, graph.Project.ID)
+				assertBatchExecutionReceipts(t, store, transport, graph.Project.ID)
 				if mode == "commit_response_lost" && transport.lost == 0 {
 					t.Fatal("commit response loss was not exercised")
 				}
@@ -283,7 +280,7 @@ func TestDecisionBatchDispatcherEndToEndWithDeliveryFaults(t *testing.T) {
 }
 
 func TestDecisionBatchReceiptSurvivesCancellationAndDispatcherRestart(t *testing.T) {
-	scheduler, runner, transport, graph := batchSchedulerFixture(t, 1)
+	scheduler, runner, transport, graph, store := batchSchedulerFixture(t, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runner.afterCommit = cancel
@@ -291,7 +288,7 @@ func TestDecisionBatchReceiptSurvivesCancellationAndDispatcherRestart(t *testing
 		t.Fatal(err)
 	}
 	scheduler.wg.Wait()
-	assertBatchExecutionReceipts(t, scheduler, transport, graph.Project.ID)
+	assertBatchExecutionReceipts(t, store, transport, graph.Project.ID)
 	var before board.State
 	if err := scheduler.Client.Do(context.Background(), "GET", projectPath(graph.Project.ID)+"/state", nil, &before, nil); err != nil {
 		t.Fatal(err)
@@ -306,5 +303,5 @@ func TestDecisionBatchReceiptSurvivesCancellationAndDispatcherRestart(t *testing
 	if len(state.Steps) != 2 || len(state.FactRecords) != 3 {
 		t.Fatal("restart replayed the already committed decision")
 	}
-	assertBatchExecutionReceipts(t, restarted, transport, graph.Project.ID)
+	assertBatchExecutionReceipts(t, store, transport, graph.Project.ID)
 }

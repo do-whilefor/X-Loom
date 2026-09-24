@@ -101,9 +101,19 @@ func TestConclusionUsesOnlyPersistedBoundaryEvidence(t *testing.T) {
 	if _, err = prepareFinalEvidence(context.Background(), j, runDir, input, refs); err == nil {
 		t.Fatal("conclusion read a mutable file")
 	}
-	_, recovered, err := conclusionInputWithEvidence(context.Background(), j, runDir, false)
+	recoveredPrompt, recovered, err := conclusionInputWithEvidence(context.Background(), j, runDir, false)
 	if err != nil || len(recovered) != 0 {
 		t.Fatal("recovery minted new boundary evidence")
+	}
+	if !strings.Contains(recoveredPrompt, "No frozen fragments are available for a new final fact") || !strings.Contains(recoveredPrompt, "fact_id from this Step") {
+		t.Fatal("recovered conclusion taught the model to select an unavailable evidence file")
+	}
+	if _, err := prepareFinalEvidence(context.Background(), j, runDir, input, recovered); err == nil {
+		t.Fatal("recovery without a snapshot accepted a new final fact")
+	}
+	input.Text = `{"accepted":true,"outcome":"completed","data":{"fact_id":"published_fact"}}`
+	if _, err := prepareFinalEvidence(context.Background(), j, runDir, input, recovered); err != nil {
+		t.Fatalf("missing snapshot prevented referencing an already published fact: %v", err)
 	}
 }
 

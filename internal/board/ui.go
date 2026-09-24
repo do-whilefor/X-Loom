@@ -1,8 +1,9 @@
 package board
 
 import (
+	"database/sql"
 	"encoding/json"
-	"sort"
+	"errors"
 )
 
 // Keep optional scenario metadata outside Cairn's projects table so both
@@ -71,26 +72,6 @@ type ExecutionViewPage struct {
 	Through    int64           `json:"through"`
 }
 
-// ProjectExecutions preserves the original array response for old clients.
-// New clients follow ProjectExecutionPage cursors for bounded responses.
-func (t *Tx) ProjectExecutions(project string) ([]ExecutionView, error) {
-	out := []ExecutionView{}
-	var after, through int64
-	for {
-		page, err := t.ProjectExecutionPage(project, after, through, 100)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, page.Items...)
-		if page.NextCursor == 0 {
-			break
-		}
-		after, through = page.NextCursor, page.Through
-	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
-	return out, nil
-}
-
 // Through freezes the set of executions to enumerate, not their changing
 // statuses. A fresh refresh starts at zero and sees current runtime metadata.
 func (t *Tx) ProjectExecutionPage(project string, after, through int64, limit int) (ExecutionViewPage, error) {
@@ -142,38 +123,18 @@ func (t *Tx) ProjectExecutionPage(project string, after, through int64, limit in
 	return out, rows.Err()
 }
 
-// ActiveWorkers counts currently held, non-revoked project leases after
-// expiration. It is not a claim about running Docker processes or configured
-// dispatcher limits, neither of which the HTTP server can observe directly.
-type UIOverview struct {
-	ActiveWorkers   int            `json:"active_workers"`
-	ExecutionCounts map[string]int `json:"execution_counts"`
-	ObservedAt      string         `json:"observed_at"`
+// ProjectIdentity is the lightweight round check used after a workspace refresh.
+// It avoids loading graph records only to detect a concurrent restart.
+type ProjectIdentity struct {
+	ID         string `json:"id"`
+	Generation int64  `json:"generation"`
 }
 
-func (t *Tx) UIOverview() (UIOverview, error) {
-	out := UIOverview{ExecutionCounts: map[string]int{}, ObservedAt: t.Now}
-	err := t.QueryRow(`SELECT COUNT(*) FROM (
- SELECT id AS project_id,reason_worker AS worker FROM projects WHERE status='active' AND reason_worker IS NOT NULL
- UNION
- SELECT i.project_id,i.worker FROM intents i JOIN projects p ON p.id=i.project_id
- WHERE p.status='active' AND i.to_fact_id IS NULL AND i.concluded_at IS NULL AND i.worker IS NOT NULL
-) owners WHERE NOT EXISTS(SELECT 1 FROM xloom_revoked_runs r WHERE r.project_id=owners.project_id AND r.worker=owners.worker)`).Scan(&out.ActiveWorkers)
-	if err != nil {
-		return out, err
+func (t *Tx) ProjectIdentity(project string) (ProjectIdentity, error) {
+	var identity ProjectIdentity
+	err := t.QueryRow(`SELECT p.id,COALESCE(r.generation,0) FROM projects p LEFT JOIN xloom_project_rounds r ON r.project_id=p.id WHERE p.id=?`, project).Scan(&identity.ID, &identity.Generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = Err(404, "Project not found")
 	}
-	rows, err := t.Query("SELECT status,COUNT(*) FROM xloom_executions GROUP BY status")
-	if err != nil {
-		return out, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var status string
-		var count int
-		if err := rows.Scan(&status, &count); err != nil {
-			return out, err
-		}
-		out.ExecutionCounts[status] = count
-	}
-	return out, rows.Err()
+	return identity, err
 }

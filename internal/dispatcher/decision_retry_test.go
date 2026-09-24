@@ -65,24 +65,15 @@ func retryTicks(t *testing.T, s *Scheduler, count int) {
 	}
 }
 
-func retryExecutions(t *testing.T, s *Scheduler) []board.Execution {
-	t.Helper()
-	var executions []board.Execution
-	if err := s.Client.Do(context.Background(), "GET", "/executions?namespace=xloom", nil, &executions, nil); err != nil {
-		t.Fatal(err)
-	}
-	return executions
-}
-
 func TestFailedColdStartDecideAutomaticallyContinuesOnce(t *testing.T) {
-	s, runner, _, graph := automaticRetryFixture(t, 1, "recovery_exhausted")
+	s, runner, store, graph := automaticRetryFixture(t, 1, "recovery_exhausted")
 	retryTicks(t, s, 1)
-	original := retryExecutions(t, s)[0]
+	original := testExecutions(t, store)[0]
 	retryTicks(t, s, 1)
 	if len(runner.seen) != 2 || runner.seen[0].RunID == runner.seen[1].RunID || runner.seen[1].PreviousRunID != runner.seen[0].RunID {
 		t.Fatalf("expected a distinct successor: %+v", runner.seen)
 	}
-	runs := retryExecutions(t, s)
+	runs := testExecutions(t, store)
 	if len(runs) != 2 || runs[0].Status != "retried" || runs[1].Status != "succeeded" || string(runs[0].Job) != string(original.Job) || string(runs[0].Result) != string(original.Result) {
 		t.Fatalf("successor changed original identity/result or did not commit: %+v", runs)
 	}
@@ -101,7 +92,7 @@ func TestFailedColdStartDecideAutomaticallyContinuesOnce(t *testing.T) {
 }
 
 func TestAutomaticDecisionRetryBoundSurvivesDispatcherRestart(t *testing.T) {
-	s, runner, _, graph := automaticRetryFixture(t, 99, "budget_exhausted")
+	s, runner, store, graph := automaticRetryFixture(t, 99, "budget_exhausted")
 	retryTicks(t, s, 1)
 	s = New(s.Config, runner) // Recovery before authorization.
 	retryTicks(t, s, 1)
@@ -110,7 +101,7 @@ func TestAutomaticDecisionRetryBoundSurvivesDispatcherRestart(t *testing.T) {
 	if len(runner.seen) != 2 {
 		t.Fatalf("automatic retry allowance was replenished: %d", len(runner.seen))
 	}
-	runs := retryExecutions(t, s)
+	runs := testExecutions(t, store)
 	path := projectPath(graph.Project.ID) + "/executions/" + runs[1].ID + "/retry"
 	err := s.Client.Do(context.Background(), "POST", path, map[string]bool{"automatic": true}, nil, nil)
 	var protocol *ProtocolError
@@ -127,9 +118,9 @@ func TestAutomaticDecisionRetryBoundSurvivesDispatcherRestart(t *testing.T) {
 }
 
 func TestAutomaticDecisionRetryGrantIsDurableAndIdempotent(t *testing.T) {
-	s, runner, _, graph := automaticRetryFixture(t, 1, "transport")
+	s, runner, store, graph := automaticRetryFixture(t, 1, "transport")
 	retryTicks(t, s, 1)
-	original := retryExecutions(t, s)[0]
+	original := testExecutions(t, store)[0]
 	path := projectPath(graph.Project.ID) + "/executions/" + original.ID + "/retry"
 	for range 2 {
 		if err := s.Client.Do(context.Background(), "POST", path, map[string]bool{"automatic": true}, nil, nil); err != nil {
@@ -146,7 +137,7 @@ func TestAutomaticDecisionRetryGrantIsDurableAndIdempotent(t *testing.T) {
 func TestAutomaticDecisionRetryGrantCannotCrossProjectRestart(t *testing.T) {
 	s, runner, store, graph := automaticRetryFixture(t, 99, "transport")
 	retryTicks(t, s, 1)
-	original := retryExecutions(t, s)[0]
+	original := testExecutions(t, store)[0]
 	path := projectPath(graph.Project.ID) + "/executions/" + original.ID + "/retry"
 	if err := s.Client.Do(context.Background(), "POST", path, map[string]bool{"automatic": true}, nil, nil); err != nil {
 		t.Fatal(err)
@@ -167,7 +158,7 @@ func TestAutomaticDecisionRetryGrantCannotCrossProjectRestart(t *testing.T) {
 func TestAutomaticDecisionRetryCannotOverrideAnotherPlanner(t *testing.T) {
 	s, _, store, graph := automaticRetryFixture(t, 99, "transport")
 	retryTicks(t, s, 1)
-	original := retryExecutions(t, s)[0]
+	original := testExecutions(t, store)[0]
 	if err := store.Do(context.Background(), func(tx *board.Tx) error {
 		g, err := tx.Load(graph.Project.ID)
 		if err != nil {
@@ -186,7 +177,7 @@ func TestAutomaticDecisionRetryCannotOverrideAnotherPlanner(t *testing.T) {
 	if err := s.Client.Do(context.Background(), "GET", projectPath(graph.Project.ID), nil, &after, nil); err != nil {
 		t.Fatal(err)
 	}
-	if after.Project.Reason == nil || after.Project.Reason.Worker != "other@planner" || retryExecutions(t, s)[0].Status != "failed" {
+	if after.Project.Reason == nil || after.Project.Reason.Worker != "other@planner" || testExecutions(t, store)[0].Status != "failed" {
 		t.Fatal("rejected grant partially changed state")
 	}
 }
@@ -196,7 +187,7 @@ func TestAutomaticDecisionRetryNeverReplaysRefusalOrCancellation(t *testing.T) {
 		t.Run(status, func(t *testing.T) {
 			s, runner, store, graph := automaticRetryFixture(t, 99, "transport")
 			retryTicks(t, s, 1)
-			original := retryExecutions(t, s)[0]
+			original := testExecutions(t, store)[0]
 			if err := store.Do(context.Background(), func(tx *board.Tx) error {
 				_, err := tx.Exec("UPDATE xloom_executions SET status=? WHERE project_id=? AND id=?", status, graph.Project.ID, original.ID)
 				return err
@@ -227,7 +218,7 @@ func TestAutomaticDecisionRetryExcludesNonRecoverableFailures(t *testing.T) {
 func TestAutomaticDecisionRetryValidatesManagementAndProjectFence(t *testing.T) {
 	s, runner, store, graph := automaticRetryFixture(t, 99, "recovery_exhausted")
 	retryTicks(t, s, 1)
-	original := retryExecutions(t, s)[0]
+	original := testExecutions(t, store)[0]
 	path := projectPath(graph.Project.ID) + "/executions/" + original.ID + "/retry"
 	for _, value := range []any{nil, "true", 1} {
 		err := s.Client.Do(context.Background(), "POST", path, map[string]any{"automatic": value}, nil, nil)
@@ -274,7 +265,7 @@ func TestAutomaticDecisionRetryValidatesManagementAndProjectFence(t *testing.T) 
 func TestDispatcherRecoveryExhaustionReleasesLeaseBeforeSuccessor(t *testing.T) {
 	s, runner, store, graph := automaticRetryFixture(t, 99, "transport")
 	retryTicks(t, s, 1)
-	original := retryExecutions(t, s)[0]
+	original := testExecutions(t, store)[0]
 	// Reconstruct a process interrupted after consuming both resume attempts.
 	if err := store.Do(context.Background(), func(tx *board.Tx) error {
 		if _, err := tx.Exec("UPDATE xloom_executions SET status='running',result=NULL,resumes=2 WHERE project_id=? AND id=?", original.ProjectID, original.ID); err != nil {
@@ -294,7 +285,7 @@ func TestDispatcherRecoveryExhaustionReleasesLeaseBeforeSuccessor(t *testing.T) 
 	}
 	s = New(s.Config, runner)
 	retryTicks(t, s, 1)
-	failed := retryExecutions(t, s)[0]
+	failed := testExecutions(t, store)[0]
 	var result worker.Result
 	if err := json.Unmarshal(failed.Result, &result); err != nil {
 		t.Fatal(err)

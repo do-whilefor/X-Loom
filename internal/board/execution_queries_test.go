@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -251,29 +252,54 @@ func TestExecutionCheckLatestBaselineAndRepeatedUseMetadata(t *testing.T) {
 	})
 }
 
-func TestExecutionCheckAutomaticClassificationMatchesAuthority(t *testing.T) {
+func TestExecutionCheckAndRetryGrantClassifyFailures(t *testing.T) {
 	s := executionQueryStore(t)
 	executionQueryTx(t, s, func(tx *Tx) {
-		cases := []Execution{
-			{Status: "failed", Result: json.RawMessage(`{"status":"failed","failure_kind":"recovery_exhausted"}`)},
-			{Status: "failed", Result: json.RawMessage(`{"status":"failed","failure_kind":"budget_exhausted"}`)},
-			{Status: "failed", Result: json.RawMessage(`{"status":"failed","failure_kind":"request_timeout"}`)},
-			{Status: "failed", Result: json.RawMessage(`{"status":"failed","failure_kind":"transient_infrastructure"}`)},
-			{Status: "failed", Result: json.RawMessage(`{"status":"failed","failure_kind":"transport"}`)},
-			{Status: "failed", Result: json.RawMessage(`{"status":"failed","failure_kind":"rate_limit"}`)},
-			{Status: "failed", Result: json.RawMessage(`{"status":"failed","failure_kind":"unavailable"}`)},
-			{Status: "cancelled", Result: json.RawMessage(`{"status":"failed","failure_kind":"transport"}`)},
-			{Status: "rejected", Result: json.RawMessage(`{"status":"failed","failure_kind":"transport"}`)},
-			{Status: "failed", Result: json.RawMessage(`{"status":"success","failure_kind":"transport"}`)},
-			{Status: "failed", Result: json.RawMessage(`{"status":"failed","failure_kind":"configuration"}`)},
-			{Status: "failed", Result: json.RawMessage(`malformed historical result`)},
+		cases := []struct {
+			kind, status, result string
+			eligible             bool
+		}{
+			{"reason", "failed", `{"status":"failed","failure_kind":"recovery_exhausted"}`, true},
+			{"reason", "failed", `{"status":"failed","failure_kind":"budget_exhausted"}`, true},
+			{"reason", "failed", `{"status":"failed","failure_kind":"request_timeout"}`, true},
+			{"reason", "failed", `{"status":"failed","failure_kind":"transient_infrastructure"}`, true},
+			{"reason", "failed", `{"status":"failed","failure_kind":"transport"}`, true},
+			{"reason", "failed", `{"status":"failed","failure_kind":"rate_limit"}`, true},
+			{"reason", "failed", `{"status":"failed","failure_kind":"unavailable"}`, true},
+			{"reason", "cancelled", `{"status":"failed","failure_kind":"transport"}`, false},
+			{"reason", "rejected", `{"status":"failed","failure_kind":"transport"}`, false},
+			{"reason", "failed", `{"status":"success","failure_kind":"transport"}`, false},
+			{"reason", "failed", `{"status":"failed","failure_kind":"configuration"}`, false},
+			{"reason", "failed", `malformed historical result`, false},
+			{"explore", "failed", `{"status":"failed","failure_kind":"transport"}`, false},
 		}
-		for n, e := range cases {
-			e.ID, e.ProjectID, e.Kind = fmt.Sprintf("case-%d", n), fmt.Sprintf("project-%d", n), "reason"
+		for n, test := range cases {
+			e := Execution{ID: fmt.Sprintf("case-%d", n), ProjectID: fmt.Sprintf("project-%d", n), Kind: test.kind, Status: test.status, Result: json.RawMessage(test.result)}
 			putQueryExecution(t, tx, e, 0, "")
-			check, err := tx.CheckExecutions(ExecutionCheckQuery{ProjectID: e.ProjectID, Namespace: "ns", Kind: "reason", RetryKey: "reason:key"})
-			if err != nil || (check.AutomaticRetryID != "") != AutomaticDecisionRetryEligible(e) {
+			check, err := tx.CheckExecutions(ExecutionCheckQuery{ProjectID: e.ProjectID, Namespace: "ns", Kind: e.Kind, RetryKey: "reason:key"})
+			if err != nil || (check.AutomaticRetryID != "") != test.eligible {
 				t.Fatalf("case %d: classification=%+v err=%v", n, check, err)
+			}
+			if test.eligible && check.AutomaticRetryID != e.ID {
+				t.Fatalf("case %d: retry targets %q instead of %q", n, check.AutomaticRetryID, e.ID)
+			}
+			err = tx.RequestAutomaticDecisionRetry(e)
+			if (err == nil) != test.eligible {
+				t.Fatalf("case %d: grant eligibility=%t err=%v", n, test.eligible, err)
+			}
+			if !test.eligible {
+				var api *APIError
+				if !errors.As(err, &api) || api.Status != 409 {
+					t.Fatalf("case %d: expected an ineligible conflict, got %v", n, err)
+				}
+			}
+			stored, err := tx.Execution(e.ProjectID, e.ID)
+			wantStatus := e.Status
+			if test.eligible {
+				wantStatus = "retry_requested"
+			}
+			if err != nil || stored.Status != wantStatus || string(stored.Result) != test.result {
+				t.Fatalf("case %d: grant changed the wrong state or result: %+v err=%v", n, stored, err)
 			}
 		}
 	})

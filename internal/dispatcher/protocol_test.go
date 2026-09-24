@@ -72,10 +72,7 @@ func TestNewJobsRegisterTheCurrentResultProtocol(t *testing.T) {
 				if job.ResultContractVersion != 2 || job.GraphRPC != (backend != "mock") {
 					t.Fatalf("wrong protocol for %s %s: version=%d graph_rpc=%v", backend, kind, job.ResultContractVersion, job.GraphRPC)
 				}
-				var executions []board.Execution
-				if err = scheduler.Client.Do(ctx, "GET", "/executions?namespace=xloom", nil, &executions, nil); err != nil {
-					t.Fatal(err)
-				}
+				executions := testExecutions(t, store)
 				if len(executions) != 1 {
 					t.Fatalf("registered executions: %d", len(executions))
 				}

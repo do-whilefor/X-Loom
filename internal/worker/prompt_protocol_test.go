@@ -5,51 +5,108 @@ import (
 	"strings"
 	"testing"
 
+	"xloom/internal/board"
 	"xloom/internal/config"
 	"xloom/internal/contract"
 )
 
 // Exercise the examples actually sent to the model against the same contract
-// as the Worker. A version change must not leave the default or repair prompt
-// teaching a response that will be rejected on every turn.
+// as the Worker. Phase deltas retain this contract without copying its examples.
 func TestPromptExamplesMatchRegisteredResultProtocol(t *testing.T) {
 	for _, version := range []int{0, 1, 2} {
 		for _, kind := range []string{"bootstrap", "explore", "reason"} {
-			for _, conclude := range []bool{false, true} {
-				if kind == "reason" && conclude {
-					continue
-				}
-				for _, rpc := range []bool{false, true} {
-					t.Run(fmt.Sprintf("v%d/%s/conclude=%t/rpc=%t", version, kind, conclude, rpc), func(t *testing.T) {
-						j := Job{Kind: kind, ResultContractVersion: version, GraphRPC: rpc, Budget: config.Task{MaxIntents: 3}}
-						body, err := taskTemplate(j, conclude)
+			for _, rpc := range []bool{false, true} {
+				t.Run(fmt.Sprintf("v%d/%s/rpc=%t", version, kind, rpc), func(t *testing.T) {
+					j := Job{Kind: kind, ResultContractVersion: version, GraphRPC: rpc, Budget: config.Task{MaxIntents: 3}}
+					body, err := taskTemplate(j, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					seen := map[string]bool{}
+					for _, line := range strings.Split(body, "\n") {
+						if !strings.Contains(line, `{"accepted"`) {
+							continue
+						}
+						r, err := contract.ParseWithPolicy(line, kind, false, 1, j.Budget.MaxIntents, contract.Policy{Version: version, GraphRPC: rpc})
 						if err != nil {
-							t.Fatal(err)
+							t.Fatalf("model-facing example violates registered protocol: %v\n%s", err, line)
 						}
-						seen := map[string]bool{}
-						for _, line := range strings.Split(body, "\n") {
-							if !strings.Contains(line, `{"accepted"`) {
-								continue
-							}
-							r, err := contract.ParseWithPolicy(line, kind, conclude, 1, j.Budget.MaxIntents, contract.Policy{Version: version, GraphRPC: rpc})
-							if err != nil {
-								t.Fatalf("model-facing example violates registered protocol: %v\n%s", err, line)
-							}
-							seen[r.Outcome] = true
+						seen[r.Outcome] = true
+					}
+					if version >= 1 && kind != "reason" {
+						if !seen["completed"] || !seen["incomplete"] || !seen["continue"] {
+							t.Fatalf("execution prompt lacks the correct terminal and continuation options: %v", seen)
 						}
-						if version >= 1 && kind != "reason" {
-							if !seen["completed"] || !seen["incomplete"] || seen["continue"] == conclude {
-								t.Fatalf("execution prompt lacks the correct terminal and continuation options: %v", seen)
-							}
-						} else if len(seen) != 1 || !seen[""] {
-							t.Fatalf("legacy/planning prompt changed protocol: %v", seen)
-						}
-						if kind == "reason" && (strings.Contains(body, `"intents":[`) == rpc || strings.Contains(body, `"decided":true`) != rpc) {
-							t.Fatalf("planning prompt advertises the wrong submission path: %s", body)
-						}
-					})
-				}
+					} else if len(seen) != 1 || !seen[""] {
+						t.Fatalf("legacy/planning prompt changed protocol: %v", seen)
+					}
+					if kind == "reason" && (strings.Contains(body, `"intents":[`) == rpc || strings.Contains(body, `"decided":true`) != rpc) {
+						t.Fatalf("planning prompt advertises the wrong submission path: %s", body)
+					}
+				})
 			}
+		}
+	}
+}
+
+func TestPhaseInstructionsDoNotCopyTaskInputOrScenario(t *testing.T) {
+	for _, version := range []int{0, 1, 2} {
+		for _, kind := range []string{"bootstrap", "explore"} {
+			for _, scenario := range []string{"pentest", "ctf"} {
+				t.Run(fmt.Sprintf("v%d/%s/%s", version, kind, scenario), func(t *testing.T) {
+					j := Job{Kind: kind, ResultContractVersion: version, Graph: board.Graph{Project: board.Project{Scenario: scenario}}}
+					original, err := Prompt(j, false, t.TempDir())
+					if err != nil {
+						t.Fatal(err)
+					}
+					conclusion, err := Prompt(j, true, t.TempDir())
+					if err != nil {
+						t.Fatal(err)
+					}
+					repair, err := repairInstruction(j, true, 2, &outputFailure{Reason: "invalid_contract", Detail: "fixture"})
+					if err != nil {
+						t.Fatal(err)
+					}
+					combined := original + conclusion + repair
+					if strings.Count(combined, "<task_graph>") != 1 || strings.Count(combined, scenarioPrompt(j)) != 1 {
+						t.Fatal("phase changes duplicated immutable task input or scenario policy")
+					}
+					if !strings.Contains(conclusion, "All tools are disabled") || (version >= 1 && !strings.Contains(conclusion, "do not return continue")) {
+						t.Fatal("conclusion lost its phase restrictions")
+					}
+					if strings.Contains(combined, ctfExecution) || strings.Contains(repair, "<result_contract>") {
+						t.Fatal("phase instructions copied execution guidance or the original contract")
+					}
+					if version == 0 && kind == "bootstrap" {
+						if _, err := contract.ParseWithPolicy(conclusion, kind, true, 1, 3, contract.Policy{}); err != nil {
+							t.Fatalf("legacy bootstrap conclusion changed its result format: %v", err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestBootstrapConclusionKeepsOriginalProofWithoutCompletingProject(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		body, err := taskTemplate(Job{Kind: "bootstrap", ResultContractVersion: version}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		completed := 0
+		for _, line := range strings.Split(body, "\n") {
+			if !strings.Contains(line, `"outcome":"completed"`) {
+				continue
+			}
+			result, err := contract.ParseWithPolicy(line, "bootstrap", true, 0, 3, contract.Policy{Version: version})
+			if err != nil || result.Kind != "fact" || result.Outcome != "completed" {
+				t.Fatalf("v%d original proof cannot conclude as evidence only: result=%+v err=%v", version, result, err)
+			}
+			completed++
+		}
+		if completed == 0 {
+			t.Fatalf("v%d bootstrap has no completion proof example", version)
 		}
 	}
 }

@@ -14,7 +14,6 @@ func (s *Server) registerStateRoutes(m *http.ServeMux) {
 	m.HandleFunc("POST /projects/{pid}/state/read", s.wrap(s.graphRead))
 	m.HandleFunc("POST /projects/{pid}/state/actions", s.wrap(s.stateAction))
 	m.HandleFunc("GET /projects/{pid}/state/events", s.wrap(s.stateEvents))
-	m.HandleFunc("GET /projects/{pid}/state/changes", s.wrap(s.stateChanges))
 	m.HandleFunc("POST /projects/{pid}/state/decisions/preview", s.wrap(s.decisionPreview))
 	m.HandleFunc("POST /projects/{pid}/state/decisions/commit", s.wrap(s.decisionCommit))
 	m.HandleFunc("GET /projects/{pid}/state/decisions/receipt", s.wrap(s.decisionReceipt))
@@ -99,17 +98,4 @@ func (s *Server) stateEvents(t *b.Tx, _ *request, r *http.Request) (int, any, er
 	}
 	events, err := t.StateEvents(r.PathValue("pid"), after)
 	return 200, events, err
-}
-
-func (s *Server) stateChanges(t *b.Tx, _ *request, r *http.Request) (int, any, error) {
-	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
-	if err != nil || after < 0 {
-		return 0, nil, b.Err(422, "after must be a nonnegative revision")
-	}
-	through, err := strconv.ParseInt(r.URL.Query().Get("through"), 10, 64)
-	if err != nil || through < after {
-		return 0, nil, b.Err(422, "through must be at least after")
-	}
-	changes, err := t.StateChanges(r.PathValue("pid"), after, through)
-	return 200, changes, err
 }

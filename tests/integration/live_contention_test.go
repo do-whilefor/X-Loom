@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -428,72 +427,6 @@ func TestLiveContentionMarkerBoundary(t *testing.T) {
 	}
 	if liveContentionMarker("prefix "+marker, marker) {
 		t.Fatal("marker was accepted outside the description prefix")
-	}
-}
-
-// Reaudit saved evidence without rerunning the model or replacing any original
-// observation. The original verdict remains beside the separately named review.
-func TestLiveContentionRetainedAudit(t *testing.T) {
-	directory := os.Getenv("XLOOM_LIVE_REAUDIT")
-	if directory == "" {
-		t.Skip("set XLOOM_LIVE_REAUDIT to audit a retained live run offline")
-	}
-	var state board.State
-	raw, err := os.ReadFile(filepath.Join(directory, "state.json"))
-	if err != nil || json.Unmarshal(raw, &state) != nil {
-		t.Fatal("cannot read retained project state", err)
-	}
-	var original struct {
-		Failures []string `json:"failures"`
-	}
-	raw, err = os.ReadFile(filepath.Join(directory, "validation.json"))
-	if err != nil || json.Unmarshal(raw, &original) != nil {
-		t.Fatal("cannot read original validation result", err)
-	}
-	files := map[string][]byte{}
-	err = filepath.WalkDir(filepath.Join(directory, "workspace"), func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if !entry.Type().IsRegular() {
-			return nil
-		}
-		relative, err := filepath.Rel(directory, path)
-		if err != nil {
-			return err
-		}
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		files["/"+filepath.ToSlash(relative)] = raw
-		return nil
-	})
-	if err != nil {
-		t.Fatal("cannot read retained workspace", err)
-	}
-	failures := validateLiveContention(state, files)
-	passed := state.Graph.Project.Status == "completed" && len(failures) == 0
-	review := map[string]any{
-		"project_completed": state.Graph.Project.Status == "completed", "passed": passed, "failures": failures,
-		"original_failures": original.Failures, "review_reason": "marker suffix correction",
-		"source_commit": os.Getenv("XLOOM_SOURCE_COMMIT"), "reviewed_at": time.Now().UTC(),
-	}
-	raw, err = json.MarshalIndent(review, "", "  ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	reviewPath := filepath.Join(directory, "validation-reviewed.json")
-	if info, err := os.Lstat(reviewPath); err == nil && !info.Mode().IsRegular() {
-		t.Fatal("review destination must be a regular file")
-	} else if err != nil && !os.IsNotExist(err) {
-		t.Fatal(err)
-	}
-	if err = os.WriteFile(reviewPath, append(raw, '\n'), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if !passed {
-		t.Fatalf("retained business acceptance failed: %v", failures)
 	}
 }
 

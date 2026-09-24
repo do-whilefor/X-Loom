@@ -81,9 +81,4 @@ func (c *Client) List(ctx context.Context) ([]board.Summary, error) {
 	err := c.Do(ctx, "GET", "/projects", nil, &p, nil)
 	return p, err
 }
-func (c *Client) Get(ctx context.Context, id string) (board.Graph, error) {
-	var g board.Graph
-	err := c.Do(ctx, "GET", projectPath(id), nil, &g, nil)
-	return g, err
-}
 func projectPath(id string) string { return "/projects/" + url.PathEscape(id) }

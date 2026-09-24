@@ -63,9 +63,7 @@ func TestCompletionPreviewBridgeRetainsReviewWithinFrameBudget(t *testing.T) {
 	job := worker.Job{RunID: "completion-review", Kind: "reason", Graph: state.Graph, State: &state, GraphRPC: true, ResultContractVersion: 2, Workspace: "/workspace", Budget: config.Task{MaxIntents: 3}, Decision: &board.DecisionContext{Version: 2, StateVersion: board.DecisionStateVersion(state)}}
 	raw, _ := json.Marshal(job)
 	execution := board.Execution{ProjectID: graph.Project.ID, ID: job.RunID, Namespace: "xloom", Backend: "retry-fixture", Kind: "reason", Lease: lease.Run, Job: raw, RetryKey: "reason:completion-review"}
-	if err := s.Client.Do(ctx, "POST", base+"/executions", execution, nil, &lease); err != nil {
-		t.Fatal(err)
-	}
+	registerLegacyExecution(t, store, execution)
 	batch := board.DecisionBatch{ExpectedVersion: job.Decision.StateVersion}
 	for _, step := range steps {
 		payload, _ := json.Marshal(map[string]any{"action": "abandon", "id": step.ID, "reason": strings.Repeat("r", 8000)})

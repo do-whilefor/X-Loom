@@ -18,7 +18,44 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"xloom/internal/board"
 )
+
+// Acceptance diagnostics read the test-owned store, not a production endpoint
+// that exports every immutable job and result in the namespace.
+func testExecutions(ctx context.Context, store *board.Store, namespace string) ([]board.Execution, error) {
+	out := []board.Execution{}
+	err := store.Do(ctx, func(tx *board.Tx) error {
+		rows, err := tx.Query("SELECT project_id,id FROM xloom_executions WHERE namespace=? ORDER BY created_at,rowid", namespace)
+		if err != nil {
+			return err
+		}
+		var ids [][2]string
+		for rows.Next() {
+			var id [2]string
+			if err := rows.Scan(&id[0], &id[1]); err != nil {
+				rows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		for _, id := range ids {
+			run, err := tx.Execution(id[0], id[1])
+			if err != nil {
+				return err
+			}
+			out = append(out, run)
+		}
+		return nil
+	})
+	return out, err
+}
 
 // Share the test server's network namespace when acceptance tests themselves
 // run in Docker. Engine inspect normalizes container network targets to their

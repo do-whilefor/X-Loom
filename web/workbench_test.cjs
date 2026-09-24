@@ -72,13 +72,12 @@ function harness(handler, selected = 'A') {
 function standard(url, states, extra = () => undefined) {
   const custom = extra(url); if (custom !== undefined) return custom;
   if (url === '/projects') return Object.values(states).map(state => state.graph.project);
-  if (url === '/ui/overview') return {active_workers:99,observed_at:now};
   const match = url.match(/^\/projects\/([^/?]+)(.*)$/); if (!match) throw new Error(url);
   const state = states[match[1]], suffix = match[2];
   if (suffix === '/state') return state;
   if (suffix.startsWith('/executions')) return {items:[],through:0};
   if (suffix.startsWith('/state/events')) return [];
-  if (!suffix) return {project:state.graph.project};
+  if (suffix === '/identity') return {id:state.graph.project.id,generation:state.graph.project.generation};
   throw new Error('unhandled ' + url);
 }
 
@@ -95,6 +94,16 @@ test('desktop workbench removes mobile navigation and optional topbar controls',
     assert.ok(!html.includes('id="' + id + '"'), id + ' must be absent');
     assert.ok(!app.includes("$('" + id + "')"), id + ' must not retain a script binding');
   }
+});
+
+test('refresh uses a lightweight round identity without unused overview statistics', async () => {
+  const h = harness(url => standard(url, {A:snapshot('A')})); await settle();
+  assert.equal(h.displayed.filter(Boolean).length,1);
+  assert.ok(h.calls.some(call => call.url === '/projects/A/identity'));
+  assert.ok(!h.calls.some(call => call.url === '/ui/overview' || call.url === '/projects/A'));
+  const empty = harness(url => { assert.equal(url,'/projects'); return []; }); await settle();
+  assert.ok(empty.elements.get('last-update').textContent.startsWith('刷新 '));
+  assert.deepEqual(empty.calls.map(call => call.url),['/projects']);
 });
 
 test('long log previews preserve full Unicode text and keep expansion scoped to project and round', async () => {
@@ -138,7 +147,7 @@ test('generation conflict discards mixed state and immediately reloads the curre
   const states = {A:snapshot('A')}; let stateReads = 0;
   const h = harness(url => standard(url,states,value => {
     if (value === '/projects/A/state') return snapshot('A', stateReads++ ? 1 : 0);
-    if (value === '/projects/A') return {project:project('A',1)};
+    if (value === '/projects/A/identity') return {id:'A',generation:1};
   }));
   await settle(); assert.equal(h.displayed.filter(Boolean).length,0); await h.fireTimer(0);
   assert.equal(h.displayed.filter(Boolean).length,1); assert.equal(h.displayed.filter(Boolean)[0].graph.project.generation,1);

@@ -1,9 +1,12 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 
 	"xloom/internal/board"
@@ -18,14 +21,14 @@ func TestDecisionObservationIsIndependentOfImmutableBusinessResult(t *testing.T)
 	f.decision("commit", f.batch(batchAction("step", "next", `{"action":"add","from":["origin"],"description":"A fixture check"}`)), http.StatusOK)
 	before := f.state()
 	var runs []board.Execution
-	f.request("GET", "/executions?namespace=protocol-test", nil, false, http.StatusOK, &runs)
+	runs = f.executionRecords()
 	original := runs[0]
 	f.request("POST", path, body, false, http.StatusForbidden, nil)
 	f.request("POST", path, body, true, http.StatusOK, nil)
 	f.request("POST", path, body, true, http.StatusOK, nil)
 	f.request("POST", path, map[string]any{"metrics": worker.DecisionMetrics{Version: 1, ModelCalls: 99}}, true, http.StatusConflict, nil)
 	f.request("POST", path, map[string]any{"metrics": body["metrics"], "status": "failed"}, true, http.StatusUnprocessableEntity, nil)
-	f.request("GET", "/executions?namespace=protocol-test", nil, false, http.StatusOK, &runs)
+	runs = f.executionRecords()
 	var oldResult, newResult map[string]json.RawMessage
 	if json.Unmarshal(original.Result, &oldResult) != nil || json.Unmarshal(runs[0].Result, &newResult) != nil {
 		t.Fatal("invalid stored result")
@@ -48,13 +51,30 @@ func TestDecisionChangesReturnOnlyBoundedGraphIndex(t *testing.T) {
 	f.register("explore", &live, 2)
 	f.action("fact", "observation", evidenceFixtureFact(f.run))
 	state := f.state()
-	var changes []board.StateEvent
-	f.request("GET", f.base()+"/state/changes?after=0&through=1", nil, false, http.StatusOK, &changes)
-	if len(changes) != 1 || changes[0].Revision != 1 || len(changes[0].Payload) != 0 || len(changes[0].Result) != 0 {
+	var changes []board.StateChange
+	if err := f.store.Do(context.Background(), func(tx *board.Tx) error {
+		var err error
+		changes, err = tx.StateChanges(f.project, 0, 1)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || changes[0].Revision != 1 || strings.Contains(string(raw), `"payload"`) || strings.Contains(string(raw), `"result"`) {
 		t.Fatalf("index leaked event bodies: %+v", changes)
 	}
 	if state.Revision < 2 {
 		t.Fatal("fixture must contain information newer than the query boundary")
 	}
-	f.request("GET", f.base()+"/state/changes?after=2&through=1", nil, false, http.StatusUnprocessableEntity, nil)
+	err = f.store.Do(context.Background(), func(tx *board.Tx) error {
+		_, err := tx.StateChanges(f.project, 2, 1)
+		return err
+	})
+	var apiErr *board.APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid revision interval: %v", err)
+	}
 }

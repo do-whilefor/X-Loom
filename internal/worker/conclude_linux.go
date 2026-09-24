@@ -48,7 +48,13 @@ func conclusionInputWithEvidence(ctx context.Context, j Job, runDir string, coll
 		return "", nil, err
 	}
 	if !collectArtifacts {
-		return prompt + "\nThis session did not save a bounded output snapshot at its original conclusion boundary. No files have been read on recovery. Use only the supplied graph and existing session evidence; report incomplete if they do not establish a confirmed result.\n", nil, ctx.Err()
+		prompt += "\nThis session did not save a bounded output snapshot at its original conclusion boundary. No files have been read on recovery. Use only the original task input and existing session evidence.\n"
+		if j.ResultContractVersion >= 2 {
+			prompt += "No frozen fragments are available for a new final fact. Completed must use a previously published evidence-backed fact_id from this Step; otherwise report incomplete.\n"
+		} else {
+			prompt += "Report incomplete if the existing evidence does not establish a confirmed result.\n"
+		}
+		return prompt, nil, ctx.Err()
 	}
 	snapshot, err := snapshotArtifacts(ctx, runDir)
 	if err != nil {

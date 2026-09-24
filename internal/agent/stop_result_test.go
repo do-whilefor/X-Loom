@@ -61,7 +61,7 @@ func TestStopResultSettlesToolGroupWithoutMoreSideEffectsOrModelCalls(t *testing
 				}), makeTool("write", nil)},
 				FollowUp:   followUp,
 				StopResult: func() (string, bool) { return authoritative, committed },
-				Save: func(history []Message) error {
+				SaveState: func(history []Message, _ *ContextCheckpoint) error {
 					saved = append([]Message{}, history...)
 					return nil
 				},

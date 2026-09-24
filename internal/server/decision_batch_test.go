@@ -67,7 +67,7 @@ func TestDecisionPreviewIsIsolatedAndCommitResolvesReferencesOnce(t *testing.T) 
 		t.Fatal("receipt replay duplicated state")
 	}
 	var executions []board.Execution
-	f.request("GET", "/executions?namespace=protocol-test", nil, false, http.StatusOK, &executions)
+	executions = f.executionRecords()
 	if len(executions) != 1 || executions[0].Status != "succeeded" {
 		t.Fatal("batch commit did not atomically acknowledge execution")
 	}

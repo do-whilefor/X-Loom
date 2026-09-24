@@ -86,7 +86,7 @@ func (f *stepInvalidationFixture) step() board.Step {
 func (f *stepInvalidationFixture) execution() *board.Execution {
 	f.t.Helper()
 	var executions []board.Execution
-	f.request("GET", "/executions?namespace=protocol-test", nil, false, http.StatusOK, &executions)
+	executions = f.executionRecords()
 	for _, execution := range executions {
 		if execution.ID == f.run {
 			return &execution
@@ -113,7 +113,7 @@ func TestStepInvalidationRejectsHTTPRegistrationAfterClaim(t *testing.T) {
 	f.claim(http.StatusOK)
 	job := f.registration() // Immutable input was read while its premise was valid.
 	f.refute()
-	body := f.request("POST", f.base()+"/executions", job, true, http.StatusConflict, nil)
+	body := f.registerLegacy(job, http.StatusConflict)
 	if !strings.Contains(body, "not effective evidence") {
 		t.Fatalf("registration failed for an unrelated reason: %s", body)
 	}
@@ -125,7 +125,7 @@ func TestStepInvalidationRejectsHTTPRegistrationAfterClaim(t *testing.T) {
 func TestStepInvalidationRejectsHTTPStartAfterRegistration(t *testing.T) {
 	f := newStepInvalidationFixture(t)
 	f.claim(http.StatusOK)
-	f.request("POST", f.base()+"/executions", f.registration(), true, http.StatusCreated, nil)
+	f.registerLegacy(f.registration(), http.StatusCreated)
 	f.refute()
 	body := f.request("POST", f.base()+"/executions/"+f.run+"/status", map[string]string{"status": "running"}, true, http.StatusConflict, nil)
 	if !strings.Contains(body, "not effective evidence") {
@@ -139,7 +139,7 @@ func TestStepInvalidationRejectsHTTPStartAfterRegistration(t *testing.T) {
 func TestStepInvalidationKeepsRunningObservationUntilHTTPAbandon(t *testing.T) {
 	f := newStepInvalidationFixture(t)
 	f.claim(http.StatusOK)
-	f.request("POST", f.base()+"/executions", f.registration(), true, http.StatusCreated, nil)
+	f.registerLegacy(f.registration(), http.StatusCreated)
 	f.request("POST", f.base()+"/executions/"+f.run+"/status", map[string]string{"status": "running"}, true, http.StatusOK, nil)
 	f.refute()
 	step := f.step()
@@ -176,10 +176,10 @@ func TestStepInvalidationAllowsExistingHTTPRegistrationReplay(t *testing.T) {
 	f := newStepInvalidationFixture(t)
 	f.claim(http.StatusOK)
 	registration := f.registration()
-	f.request("POST", f.base()+"/executions", registration, true, http.StatusCreated, nil)
+	f.registerLegacy(registration, http.StatusCreated)
 	f.request("POST", f.base()+"/executions/"+f.run+"/status", map[string]string{"status": "running"}, true, http.StatusOK, nil)
 	f.refute()
-	f.request("POST", f.base()+"/executions", registration, true, http.StatusCreated, nil)
+	f.registerLegacy(registration, http.StatusCreated)
 	if stored := f.execution(); stored == nil || stored.Status != "running" || stored.Resumes != 0 {
 		t.Fatalf("registration replay restarted or mutated the existing execution: %+v", stored)
 	}
@@ -188,7 +188,7 @@ func TestStepInvalidationAllowsExistingHTTPRegistrationReplay(t *testing.T) {
 func TestStepInvalidationAllowsPendingHTTPResultRecovery(t *testing.T) {
 	f := newStepInvalidationFixture(t)
 	f.claim(http.StatusOK)
-	f.request("POST", f.base()+"/executions", f.registration(), true, http.StatusCreated, nil)
+	f.registerLegacy(f.registration(), http.StatusCreated)
 	f.request("POST", f.base()+"/executions/"+f.run+"/status", map[string]string{"status": "running"}, true, http.StatusOK, nil)
 	f.pending(`{"accepted":true,"outcome":"completed","data":{"description":"The independently checked endpoint response has a rate-limit header"}}`)
 	before := f.execution()
