@@ -179,7 +179,22 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 		description += " Reuse a published evidence Fact in the final completed.data.fact_id to finish this Step without duplicating observations."
 	}
 	description += " Use a stable idempotency_key (1-128 bytes); reuse it only for the exact same action. A result_omitted receipt still confirms success; use read_graph to retrieve the entity and its paginated support instead of repeating the write. The server validates leases, evidence and project state."
-	schema, _ := json.Marshal(map[string]any{"type": "object", "properties": map[string]any{"op": map[string]any{"type": "string", "enum": allowed}, "idempotency_key": map[string]any{"type": "string", "minLength": 1, "maxLength": 128}, "payload": map[string]any{"type": "object"}}, "required": []string{"op", "idempotency_key", "payload"}, "additionalProperties": false})
+	// Describe collection shapes to the model and reject malformed arguments
+	// before staging a draft. Operation-specific semantics stay with the server.
+	ids := map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
+	payload := map[string]any{"type": "object", "properties": map[string]any{
+		"from": ids, "sources": ids,
+		"evidence": map[string]any{"type": "array", "items": map[string]any{
+			"type": "object", "properties": map[string]any{
+				"path":       map[string]any{"type": "string"},
+				"run_id":     map[string]any{"type": "string"},
+				"excerpt":    map[string]any{"type": "string"},
+				"start_line": map[string]any{"type": "integer"},
+				"end_line":   map[string]any{"type": "integer"},
+			},
+		}},
+	}}
+	schema, _ := json.Marshal(map[string]any{"type": "object", "properties": map[string]any{"op": map[string]any{"type": "string", "enum": allowed}, "idempotency_key": map[string]any{"type": "string", "minLength": 1, "maxLength": 128}, "payload": payload}, "required": []string{"op", "idempotency_key", "payload"}, "additionalProperties": false})
 	action := agent.Tool{Definition: agent.Definition{Name: "graph_action", Description: description, Schema: schema}, Execute: func(ctx context.Context, raw json.RawMessage) (string, error) {
 		if o.decisionConflict != nil && *o.decisionConflict != "" {
 			return "", errors.New(*o.decisionConflict)
