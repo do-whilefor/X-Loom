@@ -10,7 +10,7 @@ test "$TZ" = Asia/Shanghai
 test "$PYTHONUNBUFFERED" = 1
 test -s /etc/ssl/certs/ca-certificates.crt
 dpkg-query -W -f '${Status}\n' ca-certificates | grep -Fx 'install ok installed' >/dev/null
-for tool in bash curl wget rg fd python python3 pip pip3 jq git cat ps ip dig unzip zip sudo; do
+for tool in bash curl wget rg fd python python3 pip pip3 jq git cat ps ip dig unzip zip sudo as objcopy cpp aws tccli aliyun node npm playwright-cli; do
     command -v "$tool" >/dev/null
 done
 su -s /bin/sh kali -c 'test -w /workspace && test "$(sudo -n id -u)" = 0'
@@ -31,12 +31,25 @@ dig -v >/dev/null
 pip --version
 pip3 --version
 python3 -m pip --version
+python3 -m pip check
+/opt/tccli-venv/bin/python -m pip check
+test "$(readlink -f "$(command -v tccli)")" = /opt/tccli-venv/bin/tccli
+node -e 'if (Number(process.versions.node.split(".")[0]) < 20) process.exit(1)'
+test "$PLAYWRIGHT_MCP_BROWSER" = chromium
+test "$PLAYWRIGHT_MCP_HEADLESS" = true
+test "$PLAYWRIGHT_MCP_SANDBOX" = false
+test "$PLAYWRIGHT_MCP_EXECUTABLE_PATH" = /usr/local/bin/xloom-chromium
+test -x "$PLAYWRIGHT_MCP_EXECUTABLE_PATH"
+test "$PLAYWRIGHT_BROWSERS_PATH" = /opt/ms-playwright
+test -d "$PLAYWRIGHT_BROWSERS_PATH"
 
 # 仅连接回环地址，因此构建及 --network none 下的测试均无需外网。
 python - "$smoke_dir" <<'PY'
 import http.server
 import importlib.metadata
+import os
 import pathlib
+import re
 import ssl
 import subprocess
 import sys
@@ -44,10 +57,67 @@ import threading
 import venv
 
 assert sys.prefix == "/opt/xloom-venv", sys.prefix
+assert sys.version_info[:2] == (3, 13), sys.version
 assert ssl.create_default_context().cert_store_stats()["x509_ca"] > 0
-packages = {package.metadata["Name"].lower() for package in importlib.metadata.distributions()}
-assert packages <= {"pip", "setuptools", "wheel"}, packages
-venv_path = pathlib.Path(sys.argv[1]) / "venv"
+smoke_dir = pathlib.Path(sys.argv[1])
+os.environ["XDG_CACHE_HOME"] = str(smoke_dir / ".cache")
+os.environ["PWNLIB_NOTERM"] = "1"
+versions = {package: importlib.metadata.version(package) for package in ("pwntools", "pymongo", "awscli")}
+for package, version in versions.items():
+    assert version, package
+    print(f"{package} {version}")
+tccli_version = subprocess.check_output(
+    ["/opt/tccli-venv/bin/python", "-c", "import importlib.metadata; print(importlib.metadata.version('tccli'))"],
+    text=True, timeout=10,
+).strip()
+assert tccli_version, "tccli has no installed version"
+
+# Resolve Requests' effective CA bundle without preparing or sending a request.
+requests_ca_check = """import requests
+with requests.Session() as session:
+    settings = session.merge_environment_settings('https://example.invalid', {}, None, None, None)
+assert settings['verify'] == '/etc/ssl/certs/ca-certificates.crt', settings['verify']
+"""
+for interpreter in (sys.executable, "/opt/tccli-venv/bin/python"):
+    subprocess.run([interpreter, "-c", requests_ca_check], check=True, timeout=10)
+
+# Exercise native assembly and encoding without a target process or service.
+from pwn import asm, context, cyclic, cyclic_find
+from pwnlib.util.safeeval import const
+assert const("1") == 1
+assert const("[1, 2, 3]") == [1, 2, 3]
+with context.local(arch="amd64", os="linux", log_level="error"):
+    assert asm("xor eax, eax; ret") == b"\x31\xc0\xc3"
+    pattern = cyclic(64)
+    assert cyclic_find(pattern[24:28]) == 24
+
+import pymongo
+from bson import BSON, ObjectId
+document = {"_id": ObjectId("0123456789abcdef01234567"), "count": 3, "tags": ["xloom", "离线"]}
+assert BSON(BSON.encode(document)).decode() == document
+assert pymongo.version == versions["pymongo"], pymongo.version
+
+# Version commands do not require cloud credentials or make service requests.
+for command, version in (
+    (["aws", "--version"], "aws-cli/" + versions["awscli"]),
+    (["tccli", "--version"], tccli_version),
+):
+    output = subprocess.check_output(command, stderr=subprocess.STDOUT, text=True, timeout=15)
+    assert version in output, (command, output)
+    print(output.strip())
+aws_help = subprocess.check_output(
+    ["aws", "help"], stderr=subprocess.STDOUT, text=True, timeout=30,
+    env=dict(os.environ, MANPAGER="cat", PAGER="cat", AWS_EC2_METADATA_DISABLED="true"),
+)
+# groff's terminal output may encode bold/underlining with backspace overstrikes.
+aws_help = re.sub(r".\x08", "", aws_help)
+assert "SYNOPSIS" in aws_help, "AWS CLI help did not render its synopsis"
+aliyun_version = subprocess.check_output(["aliyun", "version"], text=True, timeout=15).strip()
+assert re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", aliyun_version), aliyun_version
+print("aliyun " + aliyun_version)
+subprocess.run(["playwright-cli", "--version"], check=True, timeout=15)
+
+venv_path = smoke_dir / "venv"
 venv.create(venv_path, with_pip=True)
 subprocess.run([str(venv_path / "bin/python"), "-m", "pip", "--version"], check=True)
 
@@ -55,8 +125,13 @@ subprocess.run([str(venv_path / "bin/python"), "-m", "pip", "--version"], check=
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8" if self.path == "/browser" else "text/plain")
         self.end_headers()
-        self.wfile.write(b"xloom-worker-smoke\n")
+        if self.path == "/browser":
+            self.wfile.write(b'<!doctype html><title>X-Loom browser smoke</title><p id="result">pending</p>'
+                            b'<script>document.querySelector("#result").textContent = "chromium-script-ran";</script>')
+        else:
+            self.wfile.write(b"xloom-worker-smoke\n")
 
     def log_message(self, *args):
         pass
@@ -72,19 +147,31 @@ with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
             ["wget", "--no-proxy", "--quiet", "--timeout=5", "--tries=1", "-O", "-", url],
         ):
             assert subprocess.check_output(command, timeout=10) == b"xloom-worker-smoke\n"
+        session = "xloom-smoke-" + str(os.getpid())
+        cli = ["playwright-cli", "-s=" + session]
+        # Use the installed CLI and its Chromium defaults, not a separate Node API.
+        # Its run-code command exits nonzero when either browser assertion fails.
+        try:
+            subprocess.run(cli + ["open", url + "browser"], cwd=smoke_dir, check=True, timeout=45)
+            subprocess.run(cli + ["run-code", """async page => {
+                if ((await page.title()) !== 'X-Loom browser smoke') throw new Error('browser title mismatch');
+                if ((await page.locator('#result').innerText()) !== 'chromium-script-ran') throw new Error('page script did not execute');
+            }"""], cwd=smoke_dir, check=True, timeout=20)
+        finally:
+            subprocess.run(cli + ["close"], cwd=smoke_dir, check=True, timeout=20)
     finally:
         server.shutdown()
         thread.join()
 PY
 
-# 精简镜像不再预装安全工具、浏览器、知识库或项目 Agent 指令。
-for tool in nmap nuclei npm playwright-cli aliyun; do
+# 未列入安装范围的安全工具、知识库和项目 Agent 指令仍不预装。
+for tool in nmap nuclei; do
     if command -v "$tool" >/dev/null 2>&1; then
         printf 'Unexpected preinstalled tool: %s\n' "$tool" >&2
         exit 1
     fi
 done
-for path in /opt/ms-playwright /opt/nuclei-templates /home/kali/knowledges /home/kali/tools /home/kali/pocs /workspace/.agents /workspace/.claude /workspace/AGENTS.md /workspace/CLAUDE.md; do
+for path in /opt/nuclei-templates /home/kali/knowledges /home/kali/tools /home/kali/pocs /workspace/.agents /workspace/.claude /workspace/AGENTS.md /workspace/CLAUDE.md; do
     test ! -e "$path"
 done
 /usr/local/bin/xloom worker --help 2>&1 | grep -F -- '-job' >/dev/null
