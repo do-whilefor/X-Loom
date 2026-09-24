@@ -84,6 +84,10 @@ class TimingAnalysisTests(unittest.TestCase):
                               {"type": "tool_end", "at": "2026-09-23T00:00:19.400000Z", "tool_id": "commit-1", "tool_name": "graph_action"}]
                 (path / "events.jsonl").write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
             report = analyze(root)
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            manifest["http_observation_mode"] = "proxy"
+            save("manifest.json", manifest)
+            self.assertEqual(analyze(root), report)
             save("validation-reviewed.json", {"passed": True, "failures": [], "review_reason": "independent evidence review"})
             reviewed_report = analyze(root)
             path = root / "workspace" / ".xloom" / "runs" / "decide" / "events.jsonl"
@@ -113,6 +117,52 @@ class TimingAnalysisTests(unittest.TestCase):
         self.assertIn("independent evidence review", render(reviewed_report))
         self.assertNotIn("marker suffix", render(reviewed_report))
         self.assertNotIn("arithmetic-correction", render(reviewed_report))
+
+    def test_direct_mode_without_http_observations_keeps_application_usage(self):
+        at = lambda second: f"2026-09-23T00:00:{second:02d}Z"
+        for file_present in (False, True):
+            with self.subTest(empty_file=file_present), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "manifest.json").write_text(json.dumps({
+                    "started": at(0), "completed_observed": at(5), "http_observation_mode": "direct",
+                }), encoding="utf-8")
+                (root / "runs.json").write_text(json.dumps([
+                    {"run_id": "direct-run", "kind": "reason", "started": at(1), "finished": at(4)},
+                ]), encoding="utf-8")
+                if file_present:
+                    (root / "http-observations.json").write_text("[]", encoding="utf-8")
+                path = root / "workspace" / ".xloom" / "runs" / "direct-run"
+                path.mkdir(parents=True)
+                events = [
+                    {"type": "model_call_start", "at": at(1), "request": {"kind": "turn"}},
+                    {"type": "model_call_end", "at": at(3), "request": {
+                        "kind": "turn", "duration_ms": 2000,
+                        "usage": {"input_tokens": 17, "output_tokens": 5},
+                    }},
+                ]
+                (path / "events.jsonl").write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+                report = analyze(root)
+                self.assertEqual(report["http_observation_mode"], "direct")
+                self.assertEqual(report["http_observation_status"], "not_collected")
+                for key in ("http_attempt_count", "http_retries_in_matched_logical_calls", "unmatched_http_attempts",
+                            "http_timing_ms", "http_stage_cumulative_seconds", "proxy_reported_usage",
+                            "proxy_error_class_counts", "thinking_chars", "output_chars", "usage_difference_calls"):
+                    self.assertIsNone(report[key], key)
+                self.assertEqual(report["model_calls"], 1)
+                self.assertEqual(report["usage_calls"], 1)
+                self.assertEqual(report["usage_status"], "reported_only")
+                self.assertEqual(report["reported_usage"]["input_tokens"], 17)
+                self.assertEqual(report["reported_usage"]["output_tokens"], 5)
+                self.assertEqual(report["timing"]["model_active_seconds"], 2)
+                self.assertEqual(report["usage_comparisons"][0]["status"], "not_comparable")
+                self.assertIsNone(report["usage_comparisons"][0]["app_minus_proxy"])
+                rendered = render(report)
+                self.assertIn("HTTP 观测未采集（direct 直连）", rendered)
+                self.assertIn("| 代理各 HTTP 尝试（未采集） | 未知 | 未知 | 未知 | 未知 |", rendered)
+                self.assertIn("| 应用逻辑请求 | 17 | 5 |", rendered)
+                self.assertNotIn("HTTP 尝试 0 次", rendered)
+                self.assertNotIn("到首事件等待 0.000 秒", rendered)
+                self.assertNotIn("0 次存在差异", rendered)
 
 
 if __name__ == "__main__":

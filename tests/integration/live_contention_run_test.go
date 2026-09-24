@@ -81,8 +81,9 @@ func saveLiveJSON(path string, data any) error {
 }
 
 // This test runs the production Server, Scheduler, Docker bridge and Worker.
-// The proxy only observes upstream bytes; every model response is real. Local
-// fixture data is the only task content sent to the configured model service.
+// The optional proxy only observes upstream bytes; every model response is real.
+// Direct mode preserves the configured hostname for provider-specific behavior.
+// Local fixture data is the only task content sent to the model service.
 func TestLiveContentionProject(t *testing.T) {
 	if os.Getenv("XLOOM_LIVE_CONTENTION_TEST") != "1" {
 		t.Skip("opt in with model configuration, XLOOM_DOCKER_TEST_IMAGE and XLOOM_LIVE_OUTPUT")
@@ -98,11 +99,21 @@ func TestLiveContentionProject(t *testing.T) {
 	if err := os.MkdirAll(output, 0700); err != nil {
 		t.Fatal(err)
 	}
-	proxy, observations, err := newLiveModelProxy(base, token)
-	if err != nil {
-		t.Fatal("invalid live proxy configuration")
+	publicUpstream, err := url.Parse(base)
+	if err != nil || publicUpstream == nil || (publicUpstream.Scheme != "http" && publicUpstream.Scheme != "https") || publicUpstream.Host == "" || publicUpstream.User != nil {
+		t.Fatal("invalid live model upstream")
 	}
-	defer proxy.Close()
+	workerBase, workerToken, observationMode := base, token, "direct"
+	observations := &liveProxyRecorder{}
+	if os.Getenv("XLOOM_LIVE_DIRECT_MODEL") != "1" {
+		proxy, recorder, err := newLiveModelProxy(base, token)
+		if err != nil {
+			t.Fatal("invalid live proxy configuration")
+		}
+		defer proxy.Close()
+		workerBase, workerToken, observationMode = proxy.URL, "local-observation-proxy", "proxy"
+		observations = recorder
+	}
 	store, err := board.Open(filepath.Join(output, "project.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -117,7 +128,7 @@ func TestLiveContentionProject(t *testing.T) {
 		Tasks:     config.Tasks{Reason: config.Task{Timeout: 300, MaxIntents: 3}, Explore: config.Task{Timeout: 0, ConcludeTimeout: 60}},
 		Container: config.Container{Image: image, Network: testContainerNetwork(t), Namespace: namespace, CompletedAction: "stop"},
 		Workers: []config.Worker{{Name: "live", Type: "go", TaskTypes: []string{"reason", "explore"}, MaxRunning: 4, Env: map[string]string{
-			"ANTHROPIC_BASE_URL": proxy.URL, "ANTHROPIC_AUTH_TOKEN": "local-observation-proxy", "ANTHROPIC_MODEL": model,
+			"ANTHROPIC_BASE_URL": workerBase, "ANTHROPIC_AUTH_TOKEN": workerToken, "ANTHROPIC_MODEL": model,
 			"XLOOM_REASONING_EFFORT": "max", "XLOOM_REQUEST_TIMEOUT": "180", "XLOOM_MAX_OUTPUT_TOKENS": "384000",
 			"XLOOM_CONTEXT_TOKENS": "920000", "XLOOM_CONTEXT_TARGET_TOKENS": "250000", "XLOOM_CONTEXT_BYTES": "8388608",
 		}}},
@@ -136,9 +147,9 @@ func TestLiveContentionProject(t *testing.T) {
 	}
 	pid := graph.Project.ID
 	container := namespace + "-dispatch-" + pid
-	publicUpstream, _ := url.Parse(base)
 	publicUpstream.User, publicUpstream.RawQuery, publicUpstream.Fragment = nil, "", ""
 	manifest := map[string]any{"project_id": pid, "started": started, "model": model, "upstream": publicUpstream.String(), "reasoning_effort": "max", "request_timeout_seconds": 180, "decision_timeout_seconds": 300, "max_workers": 4, "source_commit": os.Getenv("XLOOM_SOURCE_COMMIT"), "image": image, "namespace": namespace, "healthcheck": "disabled", "cost_status": "unknown_no_verified_account_pricing", "scope": "synthetic local files; real model, scheduler and Docker workers"}
+	manifest["http_observation_mode"] = observationMode
 	if err = saveLiveJSON(filepath.Join(output, "manifest.json"), manifest); err != nil {
 		t.Fatal(err)
 	}

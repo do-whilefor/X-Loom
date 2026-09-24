@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"syscall"
@@ -102,7 +103,13 @@ func (p *Anthropic) payload(messages []agent.Message, tools []agent.Definition, 
 			Effort string `json:"effort"`
 		} `json:"output_config"`
 	}{Model: model, MaxTokens: limit, System: System, Messages: agent.WireHistory(messages), Tools: tools, Stream: true}
+	// The default DeepSeek gateway accepts enabled with output_config.effort.
+	// OpenRouter's Messages schema requires a token budget for enabled; adaptive
+	// uses output_config.effort without a second, independent thinking budget.
 	payload.Thinking.Type = "enabled"
+	if endpoint, err := url.Parse(p.endpoint()); err == nil && strings.EqualFold(endpoint.Hostname(), "openrouter.ai") {
+		payload.Thinking.Type = "adaptive"
+	}
 	payload.OutputConfig.Effort = effort
 	return json.Marshal(payload)
 }
@@ -128,9 +135,6 @@ func (p *Anthropic) generate(ctx context.Context, messages []agent.Message, tool
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	// DeepSeek's Anthropic format uses output_config.effort for reasoning
-	// strength; budget_tokens is ignored. A returned thinking:"" block is
-	// transcript data and is unrelated to these request controls.
 	data, err := p.payload(messages, tools, maxTokens)
 	if err != nil {
 		return agent.Message{}, err

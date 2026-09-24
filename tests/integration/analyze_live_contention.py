@@ -222,6 +222,10 @@ def analyze(output):
     observed = read_json(output / "runs.json", []) or []
     state_events = read_json(output / "state-events.json", []) or []
     proxy = read_json(output / "http-observations.json", []) or []
+    # Older manifests always used the proxy. A direct run does not collect
+    # HTTP attempts; an absent/empty observation file is not a zero count.
+    http_mode = manifest.get("http_observation_mode", "proxy")
+    http_collected = http_mode != "direct" or bool(proxy)
     original_validation = read_json(output / "validation.json", {})
     reviewed_validation = read_json(output / "validation-reviewed.json")
     validation = reviewed_validation if reviewed_validation is not None else original_validation
@@ -322,6 +326,8 @@ def analyze(output):
     read_conflicts = [tool for tool in conflicts if tool["name"] in {"read_graph", "read_snapshot"}]
     terminal_conflicts = [tool for tool in conflicts if tool.get("op") in {"preview", "commit"} or any(op.get("op") in {"decision_preview", "decision_commit"} for op in tool.get("decision_operations", []))]
     report = {"version": 1, "project_id": manifest.get("project_id"), "model": manifest.get("model"),
+              "http_observation_mode": http_mode,
+              "http_observation_status": "collected" if http_collected else "not_collected",
               "source_commit": manifest.get("source_commit"), "reasoning_effort": manifest.get("reasoning_effort"),
               "started": iso(started), "finished": iso(finished), "end_basis": end_basis,
               "project_wall_seconds": finished - started,
@@ -370,6 +376,12 @@ def analyze(output):
                            "incomplete_model_observations": sum(run["incomplete_model_observations"] for run in runs),
                            "incomplete_tool_observations": sum(run["incomplete_tool_observations"] for run in runs)},
               **usage_totals(requests)}
+    if not http_collected:
+        for key in ("http_attempt_count", "proxy_error_class_counts", "http_retries_in_matched_logical_calls",
+                    "unmatched_http_attempts", "http_timing_ms", "http_stage_cumulative_seconds",
+                    "thinking_chars", "output_chars", "proxy_reported_usage", "usage_difference_calls"):
+            report[key] = None
+        report["usage_comparison_basis"] = "direct model access did not collect HTTP observations; application model_call_end usage remains available, but HTTP counts, retries, timing and proxy usage are unknown"
     report["run_kind_totals"] = {kind: {"runs": sum(run["kind"] == kind for run in runs),
                                         "model_calls": sum(call["run_kind"] == kind for call in requests),
                                         "model_duration_ms": sum(call.get("duration_ms", 0) for call in requests if call["run_kind"] == kind),
@@ -380,6 +392,9 @@ def analyze(output):
 
 def render(report):
     timing, coverage, usage = report["timing"], report["coverage"], report["reported_usage"]
+    http_collected = report.get("http_observation_status") != "not_collected"
+    http_counts = (f"HTTP 尝试 {report['http_attempt_count']} 次，已匹配逻辑调用内重试 {report['http_retries_in_matched_logical_calls']} 次"
+                   if http_collected else "HTTP 观测未采集（direct 直连），尝试次数和重试次数未知")
     lines = ["# X-Loom 真实模型并发验收与耗时", "",
              f"模型 `{report['model']}`，reasoning=`{report['reasoning_effort']}`，源码 `{report['source_commit']}`。项目 `{report['project_id']}`。",
              f"业务验收：{'通过' if report['business_validation'].get('passed') else '未通过或尚未提供'}。项目墙钟 **{report['project_wall_seconds']:.3f} 秒**（结束依据：{report['end_basis']}）。",
@@ -387,23 +402,19 @@ def render(report):
     for label, key in (("仅模型请求", "model_only_seconds"), ("仅工具执行", "tool_only_seconds"), ("模型与工具并发", "overlap_seconds"), ("两者均未活动", "neither_seconds")):
         lines.append(f"| {label} | {timing[key]:.3f} | {timing[key] / timing['wall_seconds']:.1%} |")
     lines += ["", f"模型请求累计 {report['cumulative_model_duration_ms'] / 1000:.3f} 秒，工具累计 {report['cumulative_tool_duration_ms'] / 1000:.3f} 秒。累计值包含并发，不能直接除以项目墙钟作为占比。空档包含调度、容器、落盘、图更新及尚未观测的工作，不等同于纯调度开销。",
-              f"逻辑模型请求 {report['model_calls']} 次（summary {report['summary_calls']}，失败 {report['failed_model_calls']}）；HTTP 尝试 {report['http_attempt_count']} 次，已匹配逻辑调用内重试 {report['http_retries_in_matched_logical_calls']} 次；工具 {report['tool_calls']} 次。",
+              f"逻辑模型请求 {report['model_calls']} 次（summary {report['summary_calls']}，失败 {report['failed_model_calls']}）；{http_counts}；工具 {report['tool_calls']} 次。",
               "", "| 请求耗时统计 | p50 秒 | p95 秒 | 最大秒 |", "| --- | ---: | ---: | ---: |"]
     for label, data in (("模型逻辑请求", report["model_duration_ms"]), ("工具", report["tool_duration_ms"])):
         lines.append(f"| {label} | {data.get('p50', 0) / 1000:.3f} | {data.get('p95', 0) / 1000:.3f} | {data.get('max', 0) / 1000:.3f} |")
     lines += ["", "百分位采用 nearest rank。", "", "## 各 run", "", "| run | 种类 / 状态 | 输入 revision | 墙钟秒 | 模型次数 / 累计秒 | 工具次数 / 累计秒 |", "| --- | --- | ---: | ---: | ---: | ---: |"]
     for run in report["runs"]:
         lines.append(f"| `{run['run_id']}` | {run['kind']} / {run['status']} | {run['input_revision']} | {(run['wall_seconds'] or 0):.3f} | {run['model_calls']} / {run['model_duration_ms'].get('sum', 0) / 1000:.3f} | {len(run['tools'])} / {run['tool_duration_ms'].get('sum', 0) / 1000:.3f} |")
-    lines += ["", "完整输入版本、每次调用和最长请求见 timing-report.json。", "", "## 模型侧观测", "", "| HTTP / SSE 指标 | 有数据次数 | p50 秒 | p95 秒 | 最大秒 |", "| --- | ---: | ---: | ---: | ---: |"]
-    labels = {"headers_ms": "到响应头", "first_event_ms": "到首 SSE 事件", "first_content_ms": "到首内容块（TTFT 近似）", "first_output_ms": "到首文本/工具输出块", "thinking_span_ms": "thinking 首末块跨度", "output_span_ms": "输出首末块跨度"}
-    for key, label in labels.items():
-        data = report["http_timing_ms"][key]
-        lines.append(f"| {label} | {data['count']} | {data.get('p50', 0) / 1000:.3f} | {data.get('p95', 0) / 1000:.3f} | {data.get('max', 0) / 1000:.3f} |")
-    lines += ["", "这些时间由透明代理读取真实响应字节时记录；首内容块可为空，所以 TTFT 是近似值。thinking 跨度包含流传输与服务端间隔，不是纯 GPU 思考时间；请求前等待也无法分离网络、排队和内部计算。thinking_chars 是字符数，不是 token。报告不保留思考正文。",
-              f"全部 HTTP 尝试累计：到首事件等待 {report['http_stage_cumulative_seconds']['to_first_event']:.3f} 秒；thinking 首末块跨度 {report['http_stage_cumulative_seconds']['thinking_span']:.3f} 秒；输出首末块跨度 {report['http_stage_cumulative_seconds']['output_span']:.3f} 秒。它们累计了并发请求，不等于项目墙钟；首事件到首内容、块间空隙和流尾部不在这三个数中，不能强行相加当作无遗漏分解。",
-              f"观测 thinking 字符 {report['thinking_chars']}，输出字符 {report['output_chars']}。",
-              f"代理错误分类：{json.dumps(report['proxy_error_class_counts'], ensure_ascii=False)}。stream_close_after_app_success 表示 HTTP 200 且应用逻辑请求成功，代理仅见读流/取消标记；保留原始标记，不把完成后关流计为模型失败。HTTP 失败、伴随应用失败的代理错误和未确认错误分别列出。",
-              "", "## 版本冲突与覆盖", "",
+    lines += ["", "完整输入版本、每次调用和最长请求见 timing-report.json。", "", "## 模型侧观测", ""]
+    if http_collected:
+        lines += render_http_observations(report)
+    else:
+        lines.append("direct 模式下模型请求未经过观测代理，未采集 HTTP / SSE 计时、thinking / 输出字符数和代理 usage；这些指标为未知，不代表零请求、零耗时或零 token。逻辑调用和应用 usage 仍按 model_call_end 等应用事件统计。")
+    lines += ["", "## 版本冲突与覆盖", "",
               f"Execute 峰值并发 {coverage['peak_concurrent_execute_runs']}；Decide 运行期间其他 run 的业务更新 {len(report['external_business_updates_during_decisions'])} 条。",
               f"state_changed {coverage['state_changed_count']} 次；读图冲突 {coverage['read_state_changed_count']} 次；preview/commit 冲突 {coverage['preview_commit_conflicts']} 次；这些冲突后旧 run 新模型请求 {coverage['model_calls_after_preview_commit_conflict']} 次。",
               f"预算耗尽 run：{len(coverage['budget_exhausted_runs'])}；未闭合模型/工具观测：{coverage['incomplete_model_observations']} / {coverage['incomplete_tool_observations']}（不完整区间未计入活动并集）。"]
@@ -425,13 +436,30 @@ def render(report):
     elif report["business_validation"].get("failures"):
         lines.append("业务验收失败项：" + "；".join(report["business_validation"]["failures"]))
     proxy_usage = report["proxy_reported_usage"]
+    proxy_usage_row = (f"| 代理各 HTTP 尝试 | {proxy_usage['input_tokens']} | {proxy_usage['output_tokens']} | {proxy_usage['cache_read_input_tokens']} | {proxy_usage['cache_creation_input_tokens']} |"
+                       if http_collected else "| 代理各 HTTP 尝试（未采集） | 未知 | 未知 | 未知 | 未知 |")
+    comparison = (f"逐逻辑请求与最后匹配 HTTP 尝试相比，{report['usage_difference_calls']} 次存在差异，{report['usage_uncomparable_calls']} 次无法比较。两套总量分别列示，不能相加。"
+                  if http_collected else "代理 usage 未采集，不能比较应用与代理用量；应用数据不受此影响。")
     lines += ["", "## 用量与费用", "", "| 观测来源 | 输入 token | 输出 token | 缓存读取 token | 缓存写入 token |", "| --- | ---: | ---: | ---: | ---: |",
               f"| 应用逻辑请求 | {usage['input_tokens']} | {usage['output_tokens']} | {usage['cache_read_input_tokens']} | {usage['cache_creation_input_tokens']} |",
-              f"| 代理各 HTTP 尝试 | {proxy_usage['input_tokens']} | {proxy_usage['output_tokens']} | {proxy_usage['cache_read_input_tokens']} | {proxy_usage['cache_creation_input_tokens']} |", "",
-              f"应用覆盖状态 `{report['usage_status']}`，有 usage 的逻辑请求 {report['usage_calls']} 次。逐逻辑请求与最后匹配 HTTP 尝试相比，{report['usage_difference_calls']} 次存在差异，{report['usage_uncomparable_calls']} 次无法比较。两套总量分别列示，不能相加。",
+              proxy_usage_row, "",
+              f"应用覆盖状态 `{report['usage_status']}`，有 usage 的逻辑请求 {report['usage_calls']} 次。{comparison}",
               "应用只累计 model_call_end 的 usage；message_end、摘要记录不重复累计。当前应用合并流式 usage 时仅用正数覆盖，代理也接受显式零值；若供应商流包含归零，两边可能不同。仅凭这些观测不能确定供应商计费语义或哪边应作为账单。未返回的 usage、内部失败尝试账单无法据此确认；没有已核实的账号价格和账单，实际金额为未知。", "",
               "业务验收明细：`validation.json`；逐次计时：`timing-report.json`；原始证据：`runs.json`、`http-observations.json`、`state-events.json` 和 `workspace/.xloom/runs/`。", ""]
     return "\n".join(lines)
+
+
+def render_http_observations(report):
+    lines = ["| HTTP / SSE 指标 | 有数据次数 | p50 秒 | p95 秒 | 最大秒 |", "| --- | ---: | ---: | ---: | ---: |"]
+    labels = {"headers_ms": "到响应头", "first_event_ms": "到首 SSE 事件", "first_content_ms": "到首内容块（TTFT 近似）", "first_output_ms": "到首文本/工具输出块", "thinking_span_ms": "thinking 首末块跨度", "output_span_ms": "输出首末块跨度"}
+    for key, label in labels.items():
+        data = report["http_timing_ms"][key]
+        lines.append(f"| {label} | {data['count']} | {data.get('p50', 0) / 1000:.3f} | {data.get('p95', 0) / 1000:.3f} | {data.get('max', 0) / 1000:.3f} |")
+    lines += ["", "这些时间由透明代理读取真实响应字节时记录；首内容块可为空，所以 TTFT 是近似值。thinking 跨度包含流传输与服务端间隔，不是纯 GPU 思考时间；请求前等待也无法分离网络、排队和内部计算。thinking_chars 是字符数，不是 token。报告不保留思考正文。",
+              f"全部 HTTP 尝试累计：到首事件等待 {report['http_stage_cumulative_seconds']['to_first_event']:.3f} 秒；thinking 首末块跨度 {report['http_stage_cumulative_seconds']['thinking_span']:.3f} 秒；输出首末块跨度 {report['http_stage_cumulative_seconds']['output_span']:.3f} 秒。它们累计了并发请求，不等于项目墙钟；首事件到首内容、块间空隙和流尾部不在这三个数中，不能强行相加当作无遗漏分解。",
+              f"观测 thinking 字符 {report['thinking_chars']}，输出字符 {report['output_chars']}。",
+              f"代理错误分类：{json.dumps(report['proxy_error_class_counts'], ensure_ascii=False)}。stream_close_after_app_success 表示 HTTP 200 且应用逻辑请求成功，代理仅见读流/取消标记；保留原始标记，不把完成后关流计为模型失败。HTTP 失败、伴随应用失败的代理错误和未确认错误分别列出。"]
+    return lines
 
 
 def main():
