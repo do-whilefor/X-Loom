@@ -419,7 +419,7 @@ def render(report):
               f"state_changed {coverage['state_changed_count']} 次；读图冲突 {coverage['read_state_changed_count']} 次；preview/commit 冲突 {coverage['preview_commit_conflicts']} 次；这些冲突后旧 run 新模型请求 {coverage['model_calls_after_preview_commit_conflict']} 次。",
               f"预算耗尽 run：{len(coverage['budget_exhausted_runs'])}；未闭合模型/工具观测：{coverage['incomplete_model_observations']} / {coverage['incomplete_tool_observations']}（不完整区间未计入活动并集）。"]
     if not coverage["state_changed_observed"]:
-        lines.append("本次没有触发版本冲突，不能声称真实模型已经覆盖冲突退出路径；并发业务更新是否覆盖见上述记录。")
+        lines.append("本次工具响应未观测到 state_changed，不能声称真实模型已覆盖 preview/commit 的冲突退出路径。此统计不包含调度器主动取消过期决策；该行为需另查运行记录。")
     if not coverage["at_least_two_execute_overlap"] or not coverage["decision_saw_external_fact_updates"]:
         lines.append("本次并发覆盖不足：未同时满足至少两个 Execute 重叠及 Decide 期间其他 run 的事实更新。")
     if not coverage["all_run_evidence_present"]:
