@@ -9,8 +9,11 @@ test "$(readlink -f /home/kali/workspace)" = /workspace
 test "$TZ" = Asia/Shanghai
 test "$PYTHONUNBUFFERED" = 1
 test -s /etc/ssl/certs/ca-certificates.crt
-dpkg-query -W -f '${Status}\n' ca-certificates | grep -Fx 'install ok installed' >/dev/null
-for tool in bash curl wget rg fd python python3 pip pip3 jq git cat ps ip dig unzip zip sudo as objcopy cpp aws tccli aliyun node npm playwright-cli; do
+for package in ca-certificates kali-linux-headless bsdextrautils iputils-ping sshpass ncat rlwrap yq krb5-user adb nodejs npm jq ripgrep fd-find; do
+    dpkg-query -W -f '${Status}\n' "$package" | grep -Fx 'install ok installed' >/dev/null
+done
+for tool in bash curl wget rg fd python python3 pip pip3 jq git cat ps ip dig unzip zip sudo as objcopy cpp aws tccli aliyun node npm playwright-cli \
+    column hexdump ping sshpass ncat rlwrap yq kinit klist adb nmap sqlmap; do
     command -v "$tool" >/dev/null
 done
 su -s /bin/sh kali -c 'test -w /workspace && test "$(sudo -n id -u)" = 0'
@@ -27,6 +30,7 @@ fd --hidden --no-ignore --type f '^probe\.txt$' "$smoke_dir" | grep -Fx "$file" 
 test "$(cat "/home/kali/workspace/${smoke_dir##*/}/probe.txt")" = xloom-worker-smoke
 bash -c 'test "$BASH_VERSION"'
 ip -j link show lo | jq -e 'any(.[]; .ifname == "lo")' >/dev/null
+ping -n -c 1 -W 2 127.0.0.1 >/dev/null
 dig -v >/dev/null
 pip --version
 pip3 --version
@@ -62,6 +66,32 @@ assert ssl.create_default_context().cert_store_stats()["x509_ca"] > 0
 smoke_dir = pathlib.Path(sys.argv[1])
 os.environ["XDG_CACHE_HOME"] = str(smoke_dir / ".cache")
 os.environ["PWNLIB_NOTERM"] = "1"
+
+# Exercise the added text tools and YAML bridge with local fixture bytes.
+columns = subprocess.check_output(
+    ["column", "-t", "-s", ","], input="name,value\nxloom,42\n", text=True, timeout=10,
+).splitlines()
+assert [line.split() for line in columns] == [["name", "value"], ["xloom", "42"]], columns
+assert columns[0].index("value") == columns[1].index("42"), columns
+assert subprocess.check_output(
+    ["hexdump", "-v", "-e", '1/1 "%02x"'], input=b"\x00AB\xff", timeout=10,
+) == b"004142ff"
+assert subprocess.check_output(
+    ["yq", "-r", ".service.name"], input="service:\n  name: xloom-worker\n", text=True, timeout=10,
+).strip() == "xloom-worker"
+
+# Local version paths only: no scans, SSH login, Kerberos tickets or ADB daemon.
+for command, label in (
+    (["nmap", "--version"], "nmap"),
+    (["sshpass", "-V"], "sshpass"),
+    (["ncat", "--version"], "ncat"),
+    (["rlwrap", "--version"], "rlwrap"),
+    (["klist", "-V"], "kerberos"),
+    (["adb", "version"], "android debug bridge"),
+):
+    output = subprocess.check_output(command, stderr=subprocess.STDOUT, text=True, timeout=15)
+    assert label in output.lower(), (command, output)
+
 versions = {package: importlib.metadata.version(package) for package in ("pwntools", "pymongo", "awscli")}
 for package, version in versions.items():
     assert version, package
@@ -164,14 +194,8 @@ with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
         thread.join()
 PY
 
-# 未列入安装范围的安全工具、知识库和项目 Agent 指令仍不预装。
-for tool in nmap nuclei; do
-    if command -v "$tool" >/dev/null 2>&1; then
-        printf 'Unexpected preinstalled tool: %s\n' "$tool" >&2
-        exit 1
-    fi
-done
-for path in /opt/nuclei-templates /home/kali/knowledges /home/kali/tools /home/kali/pocs /workspace/.agents /workspace/.claude /workspace/AGENTS.md /workspace/CLAUDE.md; do
+# 不恢复原竞赛环境的额外知识库或项目 Agent 指令。
+for path in /home/kali/knowledges /home/kali/tools /home/kali/pocs /workspace/.agents /workspace/.claude /workspace/AGENTS.md /workspace/CLAUDE.md; do
     test ! -e "$path"
 done
 /usr/local/bin/xloom worker --help 2>&1 | grep -F -- '-job' >/dev/null

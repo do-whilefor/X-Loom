@@ -2,6 +2,7 @@
 ARG XLOOM_IMAGE=xloom:dev
 FROM --platform=linux/amd64 ${XLOOM_IMAGE} AS application
 
+# kali-linux-headless 是 APT 元包：在官方 Kali 基础镜像中安装其工具集。
 FROM --platform=linux/amd64 kalilinux/kali-rolling@sha256:30399bd65187e06525008dd13eecc2b3439d26a82b2c6b0ba32dee72bd843117 AS runtime
 
 ARG KALI_MIRROR=
@@ -18,8 +19,11 @@ ENV TZ=Asia/Shanghai \
 # 随后安装 Kali 的 ca-certificates 接管证书更新；不关闭 TLS 或 APT 签名校验。
 COPY --from=application /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
+# 软件包安装期间不启动 Apache、SSH、数据库等服务；运行时按需手动启动。
 # 可选镜像源只替换 URI，保留套件、组件和签名校验配置。
-RUN if [ -n "$KALI_MIRROR" ]; then \
+RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+    && chmod 0755 /usr/sbin/policy-rc.d \
+    && if [ -n "$KALI_MIRROR" ]; then \
         case "$KALI_MIRROR" in http://?*|https://?*) ;; *) echo 'KALI_MIRROR must start with http:// or https://' >&2; exit 1 ;; esac; \
         awk -v mirror="$KALI_MIRROR" '$1 == "URIs:" {$0 = "URIs: " mirror} {print}' \
             /etc/apt/sources.list.d/kali.sources > /tmp/kali.sources \
@@ -30,8 +34,10 @@ RUN if [ -n "$KALI_MIRROR" ]; then \
     && DEBIAN_FRONTEND=noninteractive apt-get \
         -o Acquire::https::CaInfo=/etc/ssl/certs/ca-certificates.crt \
         -o Acquire::Retries=2 install -y --no-install-recommends \
+        kali-linux-headless \
+        bsdextrautils nodejs npm jq iputils-ping sshpass ncat rlwrap yq krb5-user adb \
         bash ca-certificates curl wget ripgrep fd-find \
-        python3.13 python3.13-venv jq git coreutils procps \
+        python3.13 python3.13-venv git coreutils procps \
         iproute2 dnsutils unzip zip xz-utils sudo tzdata groff-base \
         binutils cpp build-essential python3.13-dev libssl-dev libffi-dev \
         libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
@@ -41,16 +47,6 @@ RUN if [ -n "$KALI_MIRROR" ]; then \
         libfontconfig1 libfreetype6 fonts-liberation fonts-wqy-zenhei fonts-noto-color-emoji \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
-
-# 官方 Node 运行时自带 npm，避免发行版 npm 的整套开发依赖。
-ARG NODE_VERSION=24.21.0
-ARG NODE_SHA256=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6
-RUN curl --fail --show-error --location --retry 3 \
-        "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
-        --output /tmp/node.tar.xz \
-    && printf '%s  %s\n' "$NODE_SHA256" /tmp/node.tar.xz | sha256sum --check - \
-    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
-    && rm /tmp/node.tar.xz
 
 # pwntools 4.15 尚未完整支持 Python 3.14；任务环境使用 3.13。
 RUN python3.13 -m venv /opt/xloom-venv \
@@ -104,7 +100,12 @@ RUN if ! id kali >/dev/null 2>&1; then useradd -m -s /bin/bash kali; fi \
     && git config --system --add safe.directory /workspace
 
 COPY container/environment.md container/check-worker.sh /usr/local/share/xloom/
-RUN chmod 0755 /usr/local/share/xloom/check-worker.sh
+# Kali 为 Nmap 设置的 CAP_NET_ADMIN 超出 Docker 默认权限，连 --version 也会无法执行。
+# 去掉文件 capabilities，让默认 root 进程沿用容器已有权限。
+RUN chmod 0755 /usr/local/share/xloom/check-worker.sh \
+    && if [ -f /usr/lib/nmap/nmap ] && [ -n "$(getcap /usr/lib/nmap/nmap)" ]; then \
+        setcap -r /usr/lib/nmap/nmap; \
+    fi
 COPY --from=application /usr/local/bin/xloom /usr/local/bin/xloom
 
 USER root

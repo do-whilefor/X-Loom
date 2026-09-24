@@ -1,7 +1,13 @@
-# Kali Worker 镜像
+# Kali Headless Worker 镜像
 
-安装基础运行工具、pwntools、pymongo、AWS CLI v1、腾讯云 tccli、阿里云 aliyun，
-以及全局 Playwright CLI 和 Chromium。不安装整套 Kali 安全工具或知识库/PoC。
+以官方 `kalilinux/kali-rolling` 为基础，安装 `kali-linux-headless` 元包及其必需工具依赖，
+再安装 pwntools、pymongo、AWS CLI v1、腾讯云 tccli、阿里云 aliyun，以及全局 Playwright CLI 和 Chromium。
+`kali-linux-headless` 是 APT 元包，不是 Docker 的 `FROM` 镜像名。
+
+明确补齐 bsdextrautils、nodejs/npm、jq、iputils-ping、sshpass、ncat、rlwrap、yq、krb5-user、adb、
+ripgrep（`rg`）和 fd-find（`fd`）。其中 yq 使用 Kali 的 jq 风格 Python 实现，例如 `yq -r '.name' file.yaml`。
+APT 使用 `--no-install-recommends`；安装期间禁止自动启动软件包服务，实际任务需要时再启动。
+
 `python`/`python3` 和 `pip`/`pip3` 使用 `/opt/xloom-venv`；tccli 使用独立虚拟环境，
 其命令同样已加入 PATH。任务可按需继续安装 Python 依赖。
 两个虚拟环境均使用 Python 3.13，避免 pwntools 4.15.0 在 Python 3.14 下的字节码兼容问题。
@@ -29,21 +35,18 @@ docker compose --profile images build worker-image
 
 | 构建参数 | 默认值 |
 | --- | --- |
-| `NODE_VERSION` | `24.21.0` |
 | `PWNTOOLS_VERSION` | `4.15.0` |
 | `PYMONGO_VERSION` | `4.18.1` |
 | `AWSCLI_VERSION` | `1.46.1`（Python 包，CLI v1） |
 | `TCCLI_VERSION` | `3.1.173.1` |
 | `ALIYUN_CLI_VERSION` | `3.5.1` |
 
-Node.js 从官方发布站下载；升级 `NODE_VERSION` 时，需同步对应 Linux x64 包的 `NODE_SHA256`。
-
 Aliyun 从官方 GitHub Release 下载；升级 `ALIYUN_CLI_VERSION` 时，必须同步
 `ALIYUN_CLI_SHA256`，使用对应版本、Linux amd64 发布包的校验值。
 默认值来源于 [v3.5.1 的 SHASUMS256.txt](https://github.com/aliyun/aliyun-cli/releases/download/v3.5.1/SHASUMS256.txt)。
 可通过 `--build-arg <参数名>=<版本>` 覆盖这些默认值，修改后重新构建并运行自检。
 
-Node.js 24.21.0 和 npm 来自官方 Linux x64 发布包，构建时校验 SHA256，提供 `node`、`npm`、`npx`。
+Node.js 和 npm 统一由 Kali APT 提供，提供 `node`、`npm`、`npx`；自检要求 Node.js 至少为 20。
 Playwright 按 `@playwright/cli@latest` 全局安装，构建时执行 `playwright-cli install`
 预装匹配的 Chromium。Docker 缓存可能复用先前解析的版本；需要重新获取 `latest` 时，
 使用 `docker build --no-cache -f container/Dockerfile -t xloom-worker:dev .`，并重新运行下方自检。
@@ -71,7 +74,8 @@ APT 索引下载失败会使构建失败，避免把使用旧索引的警告误�
 
 ### 离线验证与使用
 
-`check-worker.sh` 已随镜像分发到 `/usr/local/share/xloom/`。自检实际执行 pwntools 汇编和常量求值、
+`check-worker.sh` 已随镜像分发到 `/usr/local/share/xloom/`。自检检查 headless 元包和新增工具，
+实际执行回环 ping、文本与 YAML 处理、pwntools 汇编和常量求值、
 BSON 编解码、云 CLI 版本命令、由 groff-base 渲染的 AWS CLI 帮助，以及 Playwright CLI 打开回环地址页面并验证 JavaScript 运行结果；
 无需外网或云凭据。
 

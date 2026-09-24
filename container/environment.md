@@ -1,6 +1,6 @@
 # X-Loom Worker 环境
 
-- 基于官方 Kali rolling 镜像（`linux/amd64`），使用 Go `xloom worker` 执行 Agent Loop。
+- 基于官方 Kali rolling 镜像（`linux/amd64`），安装 `kali-linux-headless` 元包及其必需工具依赖，使用 Go `xloom worker` 执行 Agent Loop。
 - `/workspace` 是同一项目共享的工作目录；`/home/kali/workspace` 指向同一目录，且已初始化为 git 仓库。
 - `/workspace/.xloom/runs/<run-id>` 保存单次执行的任务、会话和工具输出。
 - 默认用户为 root，以兼容 Dispatcher 写入的私有任务文件。保留 `kali` 用户和免密码 sudo，便于手动使用。
@@ -10,6 +10,12 @@
 ## 基础工具
 
 bash、curl、wget、ripgrep (`rg`)、fd (`fdfind`)、Python 3.13、pip、venv、jq、git、coreutils、procps (`ps`)、iproute2 (`ip`)、dnsutils (`dig`)、zip/unzip、sudo，以及 CA 证书和时区数据。另含 binutils、cpp、C/C++ 构建工具和 Python 3.13 开发依赖，支持 pwntools 的本机汇编及 Python 包源码安装。
+
+另外显式安装 bsdextrautils（`column`、`hexdump`）、Node.js/npm、iputils-ping（`ping`）、sshpass、ncat、rlwrap、yq、krb5-user（`kinit`、`klist`）、adb。`yq` 是 Kali 提供的 jq 风格 Python 实现，可用 `yq -r '.name' file.yaml` 读取字段。
+
+headless 工具集包含 nmap、sqlmap 等命令及其随包数据；APT 不额外安装 Recommends。软件包安装期间不会自动启动服务。容器入口仍为 X-Loom，不运行 systemd；任务需要时可直接启动相应服务进程。
+
+Nmap 去除了 Kali 软件包附带的文件 capabilities，避免 `CAP_NET_ADMIN` 超出 Docker 默认权限导致启动失败；默认 root 进程沿用容器已有权限。
 
 ## Python 与云 CLI
 
@@ -29,7 +35,7 @@ bash、curl、wget、ripgrep (`rg`)、fd (`fdfind`)、Python 3.13、pip、venv�
 
 ## 浏览器
 
-从官方 Linux x64 发布包安装 Node.js 24.21.0 和 npm，构建时校验 SHA256，提供 `node`、`npm`、`npx`。全局安装 `@playwright/cli@latest`，命令为 `playwright-cli`；构建时通过 `playwright-cli install` 下载 Chromium，并安装浏览器运行库及字体。
+Node.js 和 npm 由 Kali APT 安装，提供 `node`、`npm`、`npx`；自检要求 Node.js 至少为 20。全局安装 `@playwright/cli@latest`，命令为 `playwright-cli`；构建时通过 `playwright-cli install` 下载 Chromium，并安装浏览器运行库及字体。
 
 浏览器文件位于 `/opt/ms-playwright`；`/usr/local/bin/xloom-chromium` 指向该版本的 Chromium。环境变量默认选择 Chromium、无头模式和 `sandbox=false`，适配镜像默认的 root 用户。CLI 通过 `PLAYWRIGHT_MCP_EXECUTABLE_PATH` 使用固定入口，可在任意工作目录运行，无需再次安装浏览器。
 
@@ -37,6 +43,6 @@ bash、curl、wget、ripgrep (`rg`)、fd (`fdfind`)、Python 3.13、pip、venv�
 
 ## 安装范围
 
-预装上述工具及 X-Loom 二进制；不安装整套 Kali 安全工具、nmap、nuclei、知识库或 PoC，也不复制原竞赛环境的 `AGENTS.md`、`CLAUDE.md` 和技能目录。Playwright 初始化在临时目录完成，不向项目注入 skills 或配置。
+预装 Kali headless 工具集、上述补充工具及 X-Loom 二进制；不额外复制原竞赛环境的知识库、PoC、`AGENTS.md`、`CLAUDE.md` 和技能目录。Playwright 初始化在临时目录完成，不向项目注入 skills 或配置。
 
 此文档只是镜像环境说明，不自动注入模型提示词。
