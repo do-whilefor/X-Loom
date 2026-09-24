@@ -2,7 +2,6 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
   <title>X-Loom · 任务工作台</title>
@@ -41,8 +40,6 @@
     <symbol id="i-terminal" viewBox="0 0 24 24"><path d="m4 6 6 6-6 6m9 0h7"/></symbol>
     <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H5v18h14V8Zm0 0v5h5M8 12h8M8 16h6"/></symbol>
     <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
-    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10h.01"/></symbol>
-    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
     <symbol id="i-node" viewBox="0 0 24 24"><path d="m12 3 9 5v8l-9 5-9-5V8ZM3 8l9 5 9-5m-9 5v8"/></symbol>
     <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
   </defs></svg>
@@ -54,12 +51,10 @@
     <div class="sidebar-label"><span class="project-list-heading">我的项目<span id="project-count">0</span></span><span class="running-total" aria-live="polite"><i class="status-dot active" aria-hidden="true"></i><span id="running-project-count">0</span>运行中</span></div>
     <nav class="project-list" id="project-list" aria-label="项目列表"></nav>
   </aside>
-  <button class="sidebar-scrim" id="sidebar-scrim" aria-label="关闭项目导航" hidden></button>
 
   <div class="workbench">
     <header class="topbar">
-      <div class="breadcrumbs"><button class="icon-button mobile-menu" id="mobile-menu" aria-label="打开项目导航"><svg class="icon"><use href="#i-menu"/></svg></button><span>工作空间</span><svg class="icon"><use href="#i-chevron"/></svg><strong id="breadcrumb-title">工作台</strong></div>
-      <div class="topbar-actions"><span class="connection-badge" id="connection-state" role="status">连接中</span><button class="icon-button" id="refresh-project" aria-label="刷新项目"><svg class="icon"><use href="#i-restart"/></svg></button><button class="icon-button" id="about-button" aria-label="关于工作台"><svg class="icon"><use href="#i-info"/></svg></button></div>
+      <div class="breadcrumbs"><span>工作空间</span><svg class="icon"><use href="#i-chevron"/></svg><strong id="breadcrumb-title">工作台</strong></div>
     </header>
     <p class="workspace-error" id="workspace-error" role="alert" hidden></p><div class="workspace">
       <main class="main-pane">
@@ -110,7 +105,6 @@
     </form>
   </dialog>
   <dialog id="confirm-dialog" class="small-dialog" aria-labelledby="confirm-title"><form id="confirm-form"><header class="dialog-heading"><h2 id="confirm-title"></h2><button type="button" class="icon-button" data-close="confirm-dialog" aria-label="关闭操作确认"><svg class="icon"><use href="#i-close"/></svg></button></header><p id="confirm-message"></p><p class="form-error" id="confirm-error" role="alert"></p><footer class="dialog-footer"><button class="button secondary" type="button" data-close="confirm-dialog">取消</button><button class="button primary" type="submit" id="confirm-action">确认</button></footer></form></dialog>
-  <dialog id="about-dialog" class="small-dialog" aria-labelledby="about-title"><header class="dialog-heading"><h2 id="about-title">X-Loom 工作台</h2><button class="icon-button" data-close="about-dialog" aria-label="关闭工作台说明"><svg class="icon"><use href="#i-close"/></svg></button></header><p>项目、任务图、黑板日志与执行结果来自 X-Loom 服务。点击节点追溯证据，点击连线查看关系。</p><p>系统面板展示已有执行与黑板事件；LLM 请求日志和组件运行日志暂未接入。暂停保留当前轮，重启会归档旧轮并开始新的探索。</p><button class="button primary" data-close="about-dialog">知道了</button></dialog>
   <div class="toast" id="toast" role="status" hidden></div>
 </body>
 </html>

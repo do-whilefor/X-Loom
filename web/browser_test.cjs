@@ -271,18 +271,18 @@ test('workbench persists project operations through the real HTTP service', {
       }
     });
 
-    await t.test('desktop and mobile layouts remain within the viewport', async () => {
+    await t.test('desktop layouts retain all three columns without optional topbar controls', async () => {
       await fs.mkdir(screenshots, {recursive: true});
-      await noOverflow();
-      await page.screenshot({path: path.join(screenshots, 'desktop.png'), fullPage: true, animations: 'disabled'});
-      await page.setViewportSize({width: 390, height: 844});
-      await page.locator('#mobile-menu').waitFor({state: 'visible'});
-      await noOverflow();
-      await page.screenshot({path: path.join(screenshots, 'mobile.png'), fullPage: true, animations: 'disabled'});
-      await page.locator('#mobile-menu').click();
-      await page.locator('#new-project').waitFor({state: 'visible'});
-      await page.locator('#sidebar-scrim').click({position: {x: 360, y: 20}});
+      assert.equal(await page.locator('#mobile-menu, #sidebar-scrim, #connection-state, #refresh-project, #about-button, #about-dialog').count(), 0);
+      for (const width of [1920, 1440, 1280, 1024]) {
+        await page.setViewportSize({width, height: 960});
+        await noOverflow();
+        assert.equal(await page.locator('#sidebar').isVisible(), true);
+        assert.equal(await page.locator('.main-pane').isVisible(), true);
+        assert.equal(await page.locator('.activity-pane').isVisible(), true);
+      }
       await page.setViewportSize({width: 1440, height: 960});
+      await page.screenshot({path: path.join(screenshots, 'desktop.png'), fullPage: true, animations: 'disabled'});
     });
 
     await t.test('more than ten projects and unclassified legacy metadata remain real and searchable', async () => {
@@ -295,7 +295,6 @@ test('workbench persists project operations through the real HTTP service', {
         if (index === 9) legacy = graph.project;
       }
       assert.equal(legacy.scenario, undefined, 'the server must not invent a scenario for omitted metadata');
-      await page.locator('#refresh-project').click();
       await waitCounts(13, 12);
       assert.equal(await page.locator('#project-list .project-row').count(), 13);
       await select(legacy);

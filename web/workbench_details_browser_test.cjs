@@ -54,6 +54,7 @@ test('workbench collapses long logs and filters cards without losing the canvas 
   const screenshots = path.resolve(__dirname,'../tmp/web-workbench-details');
   await fs.mkdir(screenshots,{recursive:true});
   const {state,runs} = fixture(), errors = [], writes = [], assetErrors = [];
+  let stateUnavailable = false;
   const projectPath = '/projects/' + state.graph.project.id;
   page.on('pageerror', error => errors.push(error.message));
   page.on('response', response => {
@@ -69,7 +70,10 @@ test('workbench collapses long logs and filters cards without losing the canvas 
     let body;
     if (pathname === '/projects') body = [state.graph.project];
     else if (pathname === '/ui/overview') body = {active_workers:1,observed_at:created};
-    else if (pathname === projectPath + '/state') body = state;
+    else if (pathname === projectPath + '/state') {
+      if (stateUnavailable) return route.abort('failed');
+      body = state;
+    }
     else if (pathname === projectPath + '/state/events') body = [];
     else if (pathname === projectPath + '/executions') body = {items:runs,through:runs.length};
     else if (pathname === projectPath) body = state.graph;
@@ -97,41 +101,59 @@ test('workbench collapses long logs and filters cards without losing the canvas 
 
   try {
     await page.goto(new URL('/?project=' + state.graph.project.id,base).href,{waitUntil:'networkidle'});
-    await page.waitForFunction(() => document.querySelector('#connection-state')?.dataset.status === 'connected');
+    await page.waitForFunction(() => document.querySelector('#toggle-running')?.disabled === false);
     await page.waitForFunction(() => document.querySelectorAll('#graph-host .graph-node').length === 8);
     await waitPaint();
 
-    await t.test('desktop separators align, obsolete copy is removed, and mobile has no overflow', async () => {
+    await t.test('desktop columns and aligned separators persist at narrower window widths', async () => {
       assert.equal(await page.locator('#project-goal').count(),0);
       assert.equal(await page.locator('.canvas-help').count(),0);
+      assert.equal(await page.locator('#mobile-menu, #sidebar-scrim, #connection-state, #refresh-project, #about-button, #about-dialog').count(),0);
       assert.ok(!(await page.locator('.main-pane').innerText()).includes('自由延展'));
-      for (const width of [1920,1440,1024,900]) {
+      for (const width of [1920,1440,1280,1024,800]) {
         await page.setViewportSize({width,height:960}); await waitLayout();
         const rectangles = await page.evaluate(() => ({
           graphTop:document.querySelector('.graph-stage').getBoundingClientRect().top,
           tabsBottom:document.querySelector('.activity-tabs').getBoundingClientRect().bottom,
+          sidebar:document.querySelector('.sidebar').getBoundingClientRect().toJSON(),
+          main:document.querySelector('.main-pane').getBoundingClientRect().toJSON(),
+          activity:document.querySelector('.activity-pane').getBoundingClientRect().toJSON(),
+          documentWidth:document.documentElement.scrollWidth,
+          bodyWidth:document.body.getBoundingClientRect().width,
         }));
         assert.ok(Math.abs(rectangles.graphTop - rectangles.tabsBottom) <= 1,
           `separators differ at ${width}px: ${JSON.stringify(rectangles)}`);
-        await page.screenshot({path:path.join(screenshots,`workbench-${width}.png`),fullPage:true});
-      }
-      for (const width of [390,650]) {
-        await page.setViewportSize({width,height:844}); await waitLayout();
-        const sizes = await page.evaluate(() => ({
-          width:innerWidth,document:document.documentElement.scrollWidth,body:document.body.scrollWidth,scrollX,
-          workbenchLeft:document.querySelector('.workbench').getBoundingClientRect().left,
-          mainLeft:document.querySelector('.main-pane').getBoundingClientRect().left,
-          sidebarRight:document.querySelector('.sidebar').getBoundingClientRect().right,
-        }));
-        assert.ok(sizes.document <= sizes.width + 1 && sizes.body <= sizes.width + 1,`horizontal overflow: ${JSON.stringify(sizes)}`);
-        assert.equal(sizes.scrollX,0,'mobile layout must not retain horizontal scroll from the desktop viewport');
-        assert.equal(sizes.workbenchLeft,0,'mobile workbench must begin at the viewport left edge');
-        assert.equal(sizes.mainLeft,0,'mobile main pane must begin at the viewport left edge');
-        assert.ok(sizes.sidebarRight <= 1,'closed sidebar must finish outside the mobile viewport');
-        await fs.writeFile(path.join(screenshots,`layout-${width}.json`),JSON.stringify(sizes,null,2));
+        assert.equal(await page.locator('#sidebar').isVisible(),true,'project navigation remains visible');
+        assert.ok(rectangles.sidebar.left >= 0 && rectangles.sidebar.width > 0,'sidebar stays in the desktop layout');
+        assert.ok(Math.abs(rectangles.main.left - rectangles.sidebar.right) <= 1,'main pane follows the sidebar');
+        assert.ok(Math.abs(rectangles.activity.left - rectangles.main.right) <= 1,'logs remain beside the canvas');
+        assert.ok(Math.abs(rectangles.activity.top - rectangles.main.top) <= 1,'logs never stack below the canvas');
+        if (width >= 1024) assert.ok(rectangles.documentWidth <= width + 1,`desktop overflow at ${width}px`);
+        else assert.ok(rectangles.bodyWidth >= 1024,'narrow windows retain the desktop minimum width');
+        await fs.writeFile(path.join(screenshots,`layout-${width}.json`),JSON.stringify(rectangles,null,2));
         await page.screenshot({path:path.join(screenshots,`workbench-${width}.png`),fullPage:true});
       }
       await page.setViewportSize({width:1440,height:960}); await waitPaint();
+    });
+
+    await t.test('automatic polling reports network errors and restores actions after recovery', async () => {
+      const original = await view();
+      stateUnavailable = true;
+      try {
+        await page.locator('#workspace-error').waitFor({state:'visible'});
+        assert.ok((await page.locator('#workspace-error').innerText()).trim());
+        assert.equal(await page.locator('#toggle-running').isDisabled(),true);
+        assert.equal(await page.locator('#add-hint').isDisabled(),true);
+        // The error banner resizes the canvas and recenters its camera; graph coordinates stay intact.
+        assert.deepEqual((await view()).positions,original.positions,'network failures preserve the last rendered graph');
+      } finally {
+        stateUnavailable = false;
+      }
+      await page.locator('#workspace-error').waitFor({state:'hidden'});
+      await waitLayout();
+      assert.equal(await page.locator('#toggle-running').isDisabled(),false);
+      assert.equal(await page.locator('#add-hint').isDisabled(),false);
+      assert.deepEqual(await view(),original,'polling recovery preserves the canvas');
     });
 
     await t.test('long blackboard logs start collapsed, preserve expanded text through polling and tab switches', async () => {

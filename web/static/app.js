@@ -30,9 +30,8 @@
     clearTimeout(toastTimer); $('toast').textContent = message; $('toast').hidden = false; toastTimer = setTimeout(() => { $('toast').hidden = true; }, 4500);
   }
   function closeMenus() { document.querySelectorAll('.project-menu[open]').forEach(menu => { menu.open = false; }); }
-  function hideSidebar() { $('sidebar').classList.remove('open'); $('sidebar-scrim').hidden = true; $('mobile-menu').setAttribute('aria-expanded', 'false'); }
   function setConnection(ok, message = '') {
-    connected = ok; $('connection-state').textContent = ok ? '已连接' : '连接中断'; $('connection-state').dataset.status = ok ? 'connected' : 'error';
+    connected = ok;
     $('workspace-error').hidden = !message; $('workspace-error').textContent = message; renderHeader(); renderProjects();
   }
   function renderProjects() {
@@ -77,7 +76,7 @@
     $('project-end').textContent = ended ? '结束 ' + (timing.endedAt ? data.formatTime(timing.endedAt) : '未记录时间') : '';
     const action = project?.status === 'stopped' ? 'resume' : ended ? 'restart' : 'pause', toggle = $('toggle-running');
     toggle.dataset.action = action; toggle.replaceChildren(icon({pause:'pause',resume:'play',restart:'restart'}[action]), document.createTextNode({pause:'暂停',resume:'继续',restart:'重启'}[action])); toggle.disabled = !project || mutating || !connected;
-    $('add-hint').disabled = !project || ended || mutating || !connected; $('new-project').disabled = $('empty-create').disabled = mutating; $('refresh-project').disabled = mutating;
+    $('add-hint').disabled = !project || ended || mutating || !connected; $('new-project').disabled = $('empty-create').disabled = mutating;
     $('node-count').textContent = graph.getVisibleNodeCount() + ' 个节点'; $('task-progress').textContent = progress.completed + ' / ' + progress.total + ' 个任务已完成'; $('progress-fill').style.width = progress.total ? (progress.completed / progress.total * 100) + '%' : '0%';
     const statusFilter = graph.getStatusFilter(), filterLabel = {done:'已完成',running:'运行中',pending:'待执行'}[statusFilter];
     document.querySelectorAll('[data-status-filter]').forEach(button => { button.setAttribute('aria-pressed', String(button.dataset.statusFilter === statusFilter)); button.disabled = !state; });
@@ -201,7 +200,7 @@
     selectedId = id; state = null; executions = []; events = []; logs = []; selectedNode = null; selectedEdge = null; logLimit = 300; activitySignature = '';
     updateGraph(null); renderHeader(); renderActivity({reset:true}); try { if (id) localStorage.setItem('xloom.selected-project', id); else localStorage.removeItem('xloom.selected-project'); } catch {}
   }
-  async function selectProject(id) { if (mutating) return; if (id !== selectedId || !state) resetSelection(id); closeMenus(); hideSidebar(); renderProjects(); await loadWorkspace(id); }
+  async function selectProject(id) { if (mutating) return; if (id !== selectedId || !state) resetSelection(id); closeMenus(); renderProjects(); await loadWorkspace(id); }
   async function loadWorkspace(preferred = selectedId) {
     if (mutating) return; clearTimeout(timer); const request = requests.begin(), options = {signal:request.signal}; let retryGeneration = false;
     try {
@@ -264,7 +263,7 @@
     try {
       const payload = data.validateProject({title:$('create-name').value,origin:$('create-origin').value,goal:$('create-goal').value,scenario:new FormData($('create-form')).get('scenario')});
       createDraft = true; $('submit-create').disabled = true; $('create-error').textContent = ''; startMutation(); started = true;
-      const created = await api.request('/projects', {method:'POST',body:payload}); createDraft = false; $('create-dialog').close(); $('create-form').reset(); $('project-search').value = ''; tab = 'board'; resetSelection(created.project.id); hideSidebar(); toast('项目已创建');
+      const created = await api.request('/projects', {method:'POST',body:payload}); createDraft = false; $('create-dialog').close(); $('create-form').reset(); $('project-search').value = ''; tab = 'board'; resetSelection(created.project.id); toast('项目已创建');
     } catch (error) { $('create-error').textContent = mutationError(error); } finally { $('submit-create').disabled = false; if (started) await finishMutation(); }
   });
   $('confirm-form').addEventListener('submit', async event => {
@@ -289,9 +288,9 @@
     catch (error) { $('hint-error').textContent = mutationError(error); } finally { await finishMutation(); }
   });
   $('hint-input').addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); $('hint-form').requestSubmit(); } });
-  $('new-project').addEventListener('click', openCreate); $('empty-create').addEventListener('click', openCreate); $('add-hint').addEventListener('click', openHint); $('about-button').addEventListener('click', () => $('about-dialog').showModal());
+  $('new-project').addEventListener('click', openCreate); $('empty-create').addEventListener('click', openCreate); $('add-hint').addEventListener('click', openHint);
   document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => { if (!mutating) $(button.dataset.close).close(); })); document.querySelectorAll('dialog').forEach(dialog => dialog.addEventListener('cancel', event => { if (mutating) event.preventDefault(); }));
-  $('project-search').addEventListener('input', renderProjects); $('refresh-project').addEventListener('click', () => loadWorkspace(selectedId));
+  $('project-search').addEventListener('input', renderProjects);
   $('toggle-running').addEventListener('click', () => { const project = current(); if (!project) return; const action = $('toggle-running').dataset.action; if (action === 'restart') confirmOperation(project.id, action); else changeStatus(project.id, action); });
   document.querySelectorAll('[data-tab]').forEach(button => {
     button.addEventListener('click', () => { tab = button.dataset.tab; renderActivity({reset:true}); }); button.addEventListener('keydown', event => {
@@ -305,12 +304,11 @@
     graph.setStatusFilter(graph.getStatusFilter() === button.dataset.statusFilter ? 'all' : button.dataset.statusFilter); renderHeader();
   }));
   $('graph-host').addEventListener('graphzoom', event => { $('zoom-label').textContent = Math.round(event.detail.zoom * 100) + '%'; });
-  $('mobile-menu').addEventListener('click', () => { const open = $('sidebar').classList.toggle('open'); $('sidebar-scrim').hidden = !open; $('mobile-menu').setAttribute('aria-expanded', String(open)); }); $('sidebar-scrim').addEventListener('click', hideSidebar);
   document.addEventListener('pointerdown', event => { if (!event.target.closest('.project-menu')) closeMenus(); }); window.addEventListener('resize', closeMenus);
   document.addEventListener('keydown', event => {
     if (event.target.closest('input,textarea,select,[contenteditable="true"]') || document.querySelector('dialog[open]') || event.ctrlKey || event.metaKey || event.altKey || event.repeat) return;
-    if (event.key === 'Escape') { graph.selectNode(null); closeMenus(); hideSidebar(); } else if (event.key.toLowerCase() === 'n') { event.preventDefault(); openCreate(); }
-    else if (event.key === '/') { event.preventDefault(); if (innerWidth <= 880) { $('sidebar').classList.add('open'); $('sidebar-scrim').hidden = false; $('mobile-menu').setAttribute('aria-expanded', 'true'); } $('project-search').focus(); }
+    if (event.key === 'Escape') { graph.selectNode(null); closeMenus(); } else if (event.key.toLowerCase() === 'n') { event.preventDefault(); openCreate(); }
+    else if (event.key === '/') { event.preventDefault(); $('project-search').focus(); }
   });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) loadWorkspace(selectedId); });
   window.addEventListener('pagehide', event => { clearTimeout(timer); clearTimeout(toastTimer); requests.cancel(); if (!event.persisted) graph.destroy(); }); window.addEventListener('pageshow', event => { if (event.persisted) loadWorkspace(selectedId); });

@@ -40,7 +40,7 @@ class Element {
 function harness(handler, selected = 'A') {
   const elements = new Map([...html.matchAll(/id="([^"]+)"/g)].map(match => [match[1], new Element()]));
   const tabs = ['board','system','result'].map(name => { const element = elements.get('tab-' + name); element.dataset.tab = name; return element; });
-  const dialogs = ['create','hint','confirm','about'].map(name => elements.get(name + '-dialog'));
+  const dialogs = ['create','hint','confirm'].map(name => elements.get(name + '-dialog'));
   const timers = new Map(), calls = [], projections = [], displayed = []; let timerID = 0, graph;
   const document = {
     hidden:false, getElementById:id => elements.get(id), createElement:tag => new Element(tag), createElementNS:(_,tag) => new Element(tag), createTextNode:text => new Element('#text'),
@@ -88,6 +88,13 @@ test('workbench and graph icons resolve to embedded symbols', () => {
   const explicit = [...(app + graphSource).matchAll(/(?:this\.)?icon\('([^']+)'\)/g)].map(match => match[1]);
   const markup = [...html.matchAll(/<use href="#i-([^"]+)"/g)].map(match => match[1]);
   for (const icon of [...explicit,...markup,'shield','code','flag','graph','pause','play','restart','stop','trash','node','file','check']) assert.ok(symbols.has(icon), 'missing icon ' + icon);
+});
+
+test('desktop workbench removes mobile navigation and optional topbar controls', () => {
+  for (const id of ['mobile-menu','sidebar-scrim','connection-state','refresh-project','about-button','about-dialog']) {
+    assert.ok(!html.includes('id="' + id + '"'), id + ' must be absent');
+    assert.ok(!app.includes("$('" + id + "')"), id + ' must not retain a script binding');
+  }
 });
 
 test('long log previews preserve full Unicode text and keep expansion scoped to project and round', async () => {
@@ -182,8 +189,13 @@ test('network failure preserves the last valid graph and recovers on the next po
   const states = {A:snapshot('A')}; let unavailable = false;
   const h = harness(url => { if (unavailable && url === '/projects/A/state') throw new Error('offline'); return standard(url,states); });
   await settle(); const old = h.displayed.filter(Boolean).at(-1); unavailable = true; await h.fireTimer(2500);
-  assert.equal(h.displayed.filter(Boolean).at(-1),old); assert.match(h.elements.get('workspace-error').textContent,/offline/); assert.equal(h.elements.get('connection-state').dataset.status,'error');
-  unavailable = false; await h.fireTimer(2500); assert.equal(h.elements.get('connection-state').dataset.status,'connected');
+  assert.equal(h.displayed.filter(Boolean).at(-1),old); assert.match(h.elements.get('workspace-error').textContent,/offline/); assert.equal(h.elements.get('workspace-error').hidden,false);
+  assert.equal(h.elements.get('toggle-running').disabled,true); assert.equal(h.elements.get('add-hint').disabled,true);
+  const actions = () => h.elements.get('project-list').children[0].children[1].children[1].children;
+  assert.ok(actions().every(button => button.disabled),'project mutations must be unavailable while disconnected');
+  unavailable = false; await h.fireTimer(2500); assert.equal(h.elements.get('workspace-error').hidden,true); assert.equal(h.elements.get('workspace-error').textContent,'');
+  assert.equal(h.elements.get('toggle-running').disabled,false); assert.equal(h.elements.get('add-hint').disabled,false);
+  assert.ok(actions().every(button => !button.disabled),'polling must restore project actions after recovery');
 });
 
 test('refreshing the selected node never switches the user away from the result panel', async () => {
