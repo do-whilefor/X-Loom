@@ -66,23 +66,26 @@
         <header class="project-heading">
           <div class="heading-top"><div class="project-type" id="project-type"></div><span class="round-label" id="round-label">第 1 次推理</span></div>
           <div class="title-row"><h1 id="project-title">工作台</h1><span class="status-badge" id="project-status"></span></div>
-          <p id="project-goal" class="project-goal"></p>
           <div class="project-meta"><span><svg class="icon"><use href="#i-clock"/></svg><time id="project-start"></time></span><span id="project-end"></span><div class="header-controls"><div class="graph-summary" aria-label="任务概览"><div class="graph-heading"><span class="count-pill" id="node-count"></span></div><div class="graph-progress"><span id="task-progress"></span><div class="progress-track"><i id="progress-fill"></i></div></div></div><button class="button compact secondary" id="toggle-running"></button><button class="button compact secondary" id="add-hint"><svg class="icon"><use href="#i-message"/></svg>补充</button></div></div>
         </header>
         <section class="graph-stage" id="graph-stage" aria-label="从起点发散并汇聚到终点的任务图">
           <div class="canvas-caption"><span class="status-dot"></span><span id="canvas-caption">探索正在展开</span></div>
           <div id="graph-host" class="graph-host"></div>
           <div class="graph-empty" id="graph-empty" hidden><img src="/static/mark.svg" alt=""><h2>每一次探索，从一个目标开始。</h2><p>创建一个项目，把复杂的问题一步步展开。</p><button class="button primary" id="empty-create">创建项目</button></div>
-          <div class="canvas-bottom"><div class="zoom-controls"><button class="icon-button" id="zoom-out" aria-label="缩小任务图"><svg class="icon"><use href="#i-minus"/></svg></button><span id="zoom-label">100%</span><button class="icon-button" id="zoom-in" aria-label="放大任务图"><svg class="icon"><use href="#i-plus"/></svg></button><i></i><button class="icon-button" id="fit-graph" aria-label="适应画布"><svg class="icon"><use href="#i-fit"/></svg></button><button class="icon-button" id="arrange-graph" aria-label="重新随机分布" title="重新随机分布"><svg class="icon"><use href="#i-restart"/></svg></button></div><span class="canvas-help">自由延展 · 边缘自动平移 · 滚轮缩放</span></div>
+          <div class="canvas-bottom"><div class="zoom-controls"><button class="icon-button" id="zoom-out" aria-label="缩小任务图"><svg class="icon"><use href="#i-minus"/></svg></button><span id="zoom-label">100%</span><button class="icon-button" id="zoom-in" aria-label="放大任务图"><svg class="icon"><use href="#i-plus"/></svg></button><i></i><button class="icon-button" id="fit-graph" aria-label="适应画布"><svg class="icon"><use href="#i-fit"/></svg></button><button class="icon-button" id="arrange-graph" aria-label="重新随机分布" title="重新随机分布"><svg class="icon"><use href="#i-restart"/></svg></button></div></div>
         </section>
-        <div class="graph-legend"><span><i class="legend-dot done"></i>已完成</span><span><i class="legend-dot running"></i>运行中</span><span><i class="legend-dot pending"></i>待执行</span><span class="legend-guide">点击节点追溯来源 · 点击连线查看过程</span></div>
+        <div class="graph-legend" role="group" aria-label="按状态筛选卡片"><button type="button" data-status-filter="done" aria-pressed="false" aria-controls="graph-host"><i class="legend-dot done" aria-hidden="true"></i>已完成</button><button type="button" data-status-filter="running" aria-pressed="false" aria-controls="graph-host"><i class="legend-dot running" aria-hidden="true"></i>运行中</button><button type="button" data-status-filter="pending" aria-pressed="false" aria-controls="graph-host"><i class="legend-dot pending" aria-hidden="true"></i>待执行</button><span class="legend-guide">点击节点追溯来源 · 点击连线查看过程</span></div>
       </main>
       <aside class="activity-pane" aria-label="运行观察">
+        <div class="activity-top">
         <header class="activity-heading"><h2>运行观察</h2><span id="activity-live">等待连接</span></header>
         <div class="activity-tabs" role="tablist" aria-label="运行信息"><button id="tab-board" data-tab="board" role="tab" aria-controls="activity-content" aria-selected="true">黑板日志</button><button id="tab-system" data-tab="system" role="tab" aria-controls="activity-content" aria-selected="false" tabindex="-1">系统日志<span class="tab-alert" id="system-alert"></span></button><button id="tab-result" data-tab="result" role="tab" aria-controls="activity-content" aria-selected="false" tabindex="-1">最终结果</button></div>
+        </div>
+        <div class="activity-body">
         <div class="activity-tools" id="activity-tools"></div>
         <div class="node-inspector" id="node-inspector" hidden></div>
         <section class="activity-content" id="activity-content" role="tabpanel" aria-labelledby="tab-board" tabindex="0"></section>
+        </div>
         <footer class="activity-footer"><span id="last-update">等待刷新</span><span id="activity-count"></span></footer>
       </aside>
     </div>

@@ -25,11 +25,11 @@
       this.cards = new Map(); this.edgeElements = new Map(); this.listeners = [];
       this.selected = null; this.selectedEdge = null; this.scale = 1; this.tx = 0; this.ty = 0;
       this.project = null; this.projectId = null; this.generation = null; this.nodes = []; this.edges = []; this.diagnostics = [];
-      this.drag = null; this.filter = 'all'; this.direction = 'upstream'; this.destroyed = false;
+      this.drag = null; this.filter = 'all'; this.statusFilter = 'all'; this.direction = 'upstream'; this.destroyed = false;
       this.panFrame = null; this.panTime = null; this.fitFrame = null; this.drawFrame = null; this.clickTimer = null;
       this.viewport = this.el('div', 'graph-viewport'); this.viewport.tabIndex = 0;
       this.viewport.setAttribute('role', 'group'); this.viewport.setAttribute('aria-label', '任务图。点击节点追踪上游，方向键移动节点，加减号缩放，0 适应画布，Escape 清除选择。');
-      this.world = this.el('div', 'graph-world'); this.nodeHost = this.el('div', 'graph-nodes'); this.svg = this.svgEl('svg', {class: 'graph-edges'});
+      this.world = this.el('div', 'graph-world'); this.nodeHost = this.el('div', 'graph-nodes'); this.svg = this.svgEl('svg', {class: 'graph-edges', tabindex: -1});
       this.defs = this.svgEl('defs');
       for (const [name, color] of Object.entries(COLORS)) {
         const marker = this.svgEl('marker', {id: this.instanceId + '-arrow-' + name, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 5, markerHeight: 5, orient: 'auto-start-reverse'});
@@ -82,7 +82,7 @@
       const mapped = mapState(state), key = this.cacheKey(mapped), changed = key !== this.cacheKey();
       const previousNode = this.project?.nodeIndex.get(this.selected), previousEdge = this.project?.edgeIndex.get(this.selectedEdge);
       this.saveView();
-      if (changed) { this.cancelDrag(); this.cancelPendingFit(); }
+      if (changed) { this.cancelDrag(); this.cancelPendingFit(); this.statusFilter = 'all'; }
       // New generations invalidate previous-round coordinates and camera.
       for (const [savedKey, saved] of this.projectLayouts) if (saved.projectId === mapped.projectId && saved.generation !== mapped.generation) this.projectLayouts.delete(savedKey);
       let saved = this.projectLayouts.get(key);
@@ -101,7 +101,7 @@
       if (changed || !mapped.edgeIndex.has(this.selectedEdge)) this.selectedEdge = null;
       if (!mapped.edgeIndex.has(this.hoveredEdgeKey)) this.hoveredEdgeKey = null;
       if (!mapped.edgeIndex.has(this.focusedEdgeKey)) this.focusedEdgeKey = null;
-      this.empty.hidden = this.nodes.length > 0; this.warning.hidden = !this.diagnostics.length;
+      this.clearHiddenSelection(false); this.warning.hidden = !this.diagnostics.length;
       this.warning.textContent = this.diagnostics.length ? this.diagnostics.length + ' 条图数据引用需要检查' : '';
       this.renderCards(saved.endKey); this.scheduleDraw();
       if (changed && saved.camera) {
@@ -161,10 +161,13 @@
     drawEdges() {
       if (this.destroyed || !this.project) return;
       this.syncGeometry(); this.updateBounds();
+      this.empty.hidden = this.getVisibleNodeCount() > 0;
+      this.empty.textContent = this.statusFilter === 'all' ? '暂无图节点' : '暂无' + ({done: '已完成', running: '运行中', pending: '待执行'})[this.statusFilter] + '节点';
       const selection = collectSelection(this.project, this.selected, this.selectedEdge, this.direction);
       for (const [key, card] of this.cards) {
         const node = this.project.nodeIndex.get(key), related = selection.nodeIds.has(key);
         const matches = this.filter === 'all' || node.type === this.filter || (this.filter === 'start' && key === 'fact:origin');
+        card.hidden = !this.isNodeVisible(node);
         card.classList.toggle('selected', this.selected === key); card.classList.toggle('lineage', selection.active && related); card.classList.toggle('dim', (selection.active && !related) || !matches);
         card.setAttribute('aria-pressed', String(this.selected === key));
       }
@@ -183,6 +186,8 @@
           hit.dataset.edgeKey = edge.id; label.dataset.edgeKey = edge.id;
           entry = {group, path, port, hit, title, label}; this.edgeElements.set(edge.id, entry);
         }
+        const visible = this.isEdgeVisible(edge);
+        entry.group.style.display = visible ? '' : 'none'; entry.label.style.display = visible ? '' : 'none';
         const selected = this.selectedEdge === edge.id, related = selection.edgeKeys.has(edge.id), dim = selection.active && !related;
         const color = selected ? 'selected' : detail.status;
         const classes = detail.status + (selected ? ' selected' : '') + (related ? ' lineage' : '') + (dim ? ' dim' : '');
@@ -202,7 +207,7 @@
     selectNode(selection) {
       if (this.destroyed) return;
       const key = resolveNodeKey(this.nodes, selection);
-      if (selection != null && !key) return;
+      if (selection != null && (!key || !this.isNodeVisible(this.project?.nodeIndex.get(key)))) return;
       const hadEdge = this.selectedEdge !== null; this.selected = key; this.selectedEdge = null; this.scheduleDraw();
       if (hadEdge) this.onSelectEdge(null);
       const node = this.project?.nodeIndex.get(key); this.onSelect(clone(node));
@@ -211,13 +216,29 @@
     selectEdge(edge) {
       if (this.destroyed) return;
       const key = edge == null ? null : edgeKey(edge);
-      if (key && !this.project?.edgeIndex.has(key)) return;
+      if (key && !this.isEdgeVisible(this.project?.edgeIndex.get(key))) return;
       const hadNode = this.selected !== null; this.selected = null; this.selectedEdge = key; this.scheduleDraw();
       if (hadNode) this.onSelect(null); this.onSelectEdge(clone(this.project?.edgeIndex.get(key)));
     }
     clearSelection() { this.selected = null; this.selectedEdge = null; this.scheduleDraw(); this.onSelect(null); this.onSelectEdge(null); }
     setTraceDirection(direction) { this.direction = direction === 'downstream' ? 'downstream' : 'upstream'; this.scheduleDraw(); }
     setFilter(type) { this.filter = ['goal', 'step', 'fact', 'finding', 'start'].includes(type) ? type : 'all'; this.scheduleDraw(); }
+    isNodeVisible(node) { return !!node && (this.statusFilter === 'all' || nodePresentation(node, null).status === this.statusFilter); }
+    isEdgeVisible(edge) { return !!edge && this.isNodeVisible(this.project?.nodeIndex.get(edge.source)) && this.isNodeVisible(this.project?.nodeIndex.get(edge.target)); }
+    clearHiddenSelection(notify = true) {
+      if (this.drag?.id && !this.isNodeVisible(this.project?.nodeIndex.get(this.drag.id))) this.cancelDrag();
+      if (this.selected && !this.isNodeVisible(this.project?.nodeIndex.get(this.selected))) { this.selected = null; if (notify) this.onSelect(null); this.live.textContent = '已清除选择'; }
+      if (this.selectedEdge && !this.isEdgeVisible(this.project?.edgeIndex.get(this.selectedEdge))) { this.selectedEdge = null; if (notify) this.onSelectEdge(null); }
+      if (!this.isEdgeVisible(this.project?.edgeIndex.get(this.hoveredEdgeKey))) this.hoveredEdgeKey = null;
+      if (!this.isEdgeVisible(this.project?.edgeIndex.get(this.focusedEdgeKey))) this.focusedEdgeKey = null;
+    }
+    setStatusFilter(status) {
+      if (this.destroyed) return;
+      const next = ['done', 'running', 'pending'].includes(status) ? status : 'all';
+      if (next === this.statusFilter) return;
+      this.statusFilter = next; this.cancelPendingFit(); this.clearHiddenSelection(); this.scheduleDraw();
+    }
+    getStatusFilter() { return this.statusFilter; }
     arrange() {
       if (this.destroyed || !this.project) return;
       this.cancelDrag(); this.cancelPendingFit(); const saved = this.projectLayouts.get(this.cacheKey()); saved.seed++;
@@ -231,8 +252,10 @@
     fit() {
       if (this.destroyed) return;
       this.cancelDrag(); this.cancelPendingFit(); const size = this.size();
-      if (!this.nodes.length || !size.width || !size.height) { this.pendingFit = !!this.nodes.length; return; }
-      const camera = fitTransform(this.updateBounds(), size.width, size.height); if (!camera) return;
+      const visible = this.nodes.filter(node => this.isNodeVisible(node));
+      if (!visible.length || !size.width || !size.height) { this.pendingFit = !!visible.length; return; }
+      const bounds = worldBounds(new Map(visible.map(node => [node.key, this.positions.get(node.key)])), {width: NODE_WIDTH, height: NODE_HEIGHT, baseWidth: 0, baseHeight: 0, padding: 96});
+      const camera = fitTransform(bounds, size.width, size.height); if (!camera) return;
       this.pendingFit = false; this.viewportSize = size; Object.assign(this, camera); this.transform();
     }
     zoom(factor, x = this.viewport.clientWidth / 2, y = this.viewport.clientHeight / 2) {
@@ -255,7 +278,7 @@
       else if (this.drag) { this.drag.ox = this.tx; this.drag.oy = this.ty; this.drag.x = this.drag.lastX; this.drag.y = this.drag.lastY; }
     }
     focusNode(selection) {
-      const key = resolveNodeKey(this.nodes, selection), point = this.positions.get(key); if (this.destroyed || !point) return;
+      const key = resolveNodeKey(this.nodes, selection), point = this.positions.get(key); if (this.destroyed || !point || !this.isNodeVisible(this.project?.nodeIndex.get(key))) return;
       this.cancelPendingFit(); this.tx = this.viewport.clientWidth / 2 - (point.x + NODE_WIDTH / 2) * this.scale;
       this.ty = this.viewport.clientHeight / 2 - (point.y + NODE_HEIGHT / 2) * this.scale; this.transform();
     }
@@ -315,7 +338,7 @@
       else if (event.key === '0') { event.preventDefault(); this.fit(); }
     }
     getNodes() { return clone(this.nodes); }
-    getVisibleNodeCount() { return this.nodes.length; }
+    getVisibleNodeCount() { return this.nodes.filter(node => this.isNodeVisible(node)).length; }
     forgetProject(projectId) {
       for (const [key, value] of this.projectLayouts) if (value.projectId === projectId) this.projectLayouts.delete(key);
       if (this.projectId === projectId) this.setState(null);

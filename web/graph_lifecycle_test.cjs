@@ -113,3 +113,59 @@ test('the first real nodes arriving after an empty snapshot receive initial fit'
   graph.setState(state()); assert.notEqual(graph.fitFrame, null); h.flush();
   assert.ok(graph.scale < 1); graph.destroy();
 });
+
+test('status filtering hides cards and disconnected edges without changing graph data, positions or camera', () => {
+  const h = harness(), graph = h.graph, value = state();
+  value.steps.push({id: 'queued', status: 'pending'}, {id: 'failed', status: 'failed'}, {id: 'paused', status: 'paused'}, {id: 'review', status: 'completed', invalid_sources: ['origin']});
+  value.goals.push({id: 'unsupported', status: 'achieved', sources: ['old'], support_valid: false});
+  graph.setState(value); h.flush(); graph.zoomBy(.8);
+  const cards = [...graph.cards], positions = [...graph.positions].map(([key, point]) => [key, {...point}]), camera = [graph.scale, graph.tx, graph.ty];
+  const visibleKeys = () => [...graph.cards].filter(([, card]) => !card.hidden).map(([key]) => key).sort();
+  graph.setStatusFilter('done'); h.flush();
+  assert.equal(graph.getStatusFilter(), 'done'); assert.equal(graph.getVisibleNodeCount(), 2); assert.equal(graph.getNodes().length, 8);
+  assert.deepEqual(visibleKeys(), ['fact:old', 'fact:origin']);
+  for (const edge of graph.edges) {
+    const expected = edge.kind === 'refutes' ? '' : 'none', entry = graph.edgeElements.get(edge.id);
+    assert.equal(entry.group.style.display, expected); assert.equal(entry.label.style.display, expected);
+  }
+  graph.setStatusFilter('running'); h.flush(); assert.deepEqual(visibleKeys(), ['step:work']);
+  graph.setFilter('fact'); h.flush(); assert.deepEqual(visibleKeys(), ['step:work']); assert.ok(graph.cards.get('step:work').classList.contains('dim'));
+  graph.setStatusFilter('pending'); h.flush(); assert.deepEqual(visibleKeys(), ['step:queued']);
+  graph.setStatusFilter('all'); h.flush(); assert.equal(graph.getVisibleNodeCount(), 8);
+  assert.ok([...graph.edgeElements.values()].every(entry => entry.group.style.display === '' && entry.label.style.display === ''));
+  for (const [key, card] of cards) assert.equal(graph.cards.get(key), card);
+  assert.deepEqual([...graph.positions], positions); assert.deepEqual([graph.scale, graph.tx, graph.ty], camera); graph.destroy();
+});
+
+test('filtering clears hidden selections and drag captures, and live status changes honor the active filter', () => {
+  const nodes = [], edges = [], h = harness({onSelect: node => nodes.push(node), onSelectEdge: edge => edges.push(edge)}), graph = h.graph, value = state();
+  graph.setState(value); h.flush(); graph.selectNode('step:work');
+  graph.pointerDown({button: 0, target: graph.cards.get('step:work'), pointerId: 4, clientX: 200, clientY: 200});
+  graph.pointerMove({pointerId: 4, clientX: 799, clientY: 300}); graph.setStatusFilter('done'); h.flush();
+  assert.equal(graph.selected, null); assert.equal(nodes.at(-1), null); assert.equal(graph.drag, null); assert.equal(graph.panFrame, null); assert.ok(!graph.viewport.hasPointerCapture(4));
+  graph.selectNode('step:work'); assert.equal(graph.selected, null);
+  graph.selectEdge(graph.edges.find(edge => edge.kind === 'step_input')); assert.equal(graph.selectedEdge, null);
+  graph.selectEdge(graph.edges.find(edge => edge.kind === 'refutes')); assert.ok(graph.selectedEdge);
+  graph.setStatusFilter('running'); h.flush(); assert.equal(graph.selectedEdge, null); assert.equal(edges.at(-1), null);
+  graph.selectNode('step:work');
+  graph.pointerDown({button: 0, target: graph.cards.get('step:work'), pointerId: 5, clientX: 200, clientY: 200});
+  value.steps[0].status = 'completed'; graph.setState(value); h.flush();
+  assert.equal(graph.getStatusFilter(), 'running'); assert.equal(graph.selected, null); assert.equal(nodes.at(-1), null);
+  assert.equal(graph.drag, null); assert.ok(!graph.viewport.hasPointerCapture(5)); assert.equal(graph.getVisibleNodeCount(), 0);
+  assert.equal(graph.empty.hidden, false); assert.equal(graph.empty.textContent, '暂无运行中节点');
+  value.steps[0].status = 'running'; graph.setState(value); h.flush();
+  assert.equal(graph.getVisibleNodeCount(), 1); assert.equal(graph.empty.hidden, true); graph.destroy();
+});
+
+test('filtered fit uses visible nodes and empty filters preserve the camera; project and round changes reset filters', () => {
+  const h = harness(), graph = h.graph; graph.setState(state()); h.flush();
+  graph.positions.set('step:work', {x: 10, y: 20}); graph.positions.set('fact:origin', {x: 60000, y: 70000});
+  graph.setStatusFilter('running'); h.flush(); graph.fit(); const filteredScale = graph.scale;
+  graph.setStatusFilter('all'); graph.fit(); assert.ok(filteredScale > graph.scale * 10);
+  graph.setStatusFilter('pending'); h.flush(); const camera = [graph.scale, graph.tx, graph.ty]; graph.fit();
+  assert.deepEqual([graph.scale, graph.tx, graph.ty], camera); assert.equal(graph.pendingFit, false);
+  graph.setState(state()); h.flush(); assert.equal(graph.getStatusFilter(), 'pending');
+  graph.setState(state('A', 2)); h.flush(); assert.equal(graph.getStatusFilter(), 'all');
+  graph.setStatusFilter('done'); graph.setState(state('B')); h.flush(); assert.equal(graph.getStatusFilter(), 'all');
+  graph.setStatusFilter('running'); graph.setState(null); h.flush(); assert.equal(graph.getStatusFilter(), 'all'); graph.destroy();
+});

@@ -2,7 +2,8 @@
   'use strict';
   const data = window.XLoomData, api = new window.XLoomAPI.Client(), requests = new window.XLoomAPI.RequestScope();
   const $ = id => document.getElementById(id), NS = 'http://www.w3.org/2000/svg';
-  const eventCache = new Map(), drafts = new Map();
+  const eventCache = new Map(), drafts = new Map(), expandedLogs = new Set();
+  let logBodyId = 0;
   let projects = [], state = null, executions = [], events = [], logs = [], selectedId = '';
   let selectedNode = null, selectedEdge = null, tab = 'board', systemFilter = 'all', logLimit = 300;
   let timer, toastTimer, management = null, hintProjectId = '', mutating = false, connected = false;
@@ -68,8 +69,6 @@
     const project = current(), ended = project && ['completed','terminated'].includes(project.status);
     $('breadcrumb-title').textContent = project?.title || '我的项目'; $('project-title').textContent = project?.title || (connected ? '准备好开始探索了吗？' : '正在加载项目');
     $('project-type').replaceChildren(); if (project) $('project-type').append(icon(scenarioIcon(project)), document.createTextNode(data.scenarioName(project.scenario)));
-    const goal = state?.graph?.facts?.find(fact => fact.id === 'goal');
-    $('project-goal').textContent = goal?.description || project?.goal || (project ? '目标数据正在读取' : '选择项目类型，写下起点与目标，交给 X-Loom 逐步探索。'); $('project-goal').title = $('project-goal').textContent;
     $('project-status').textContent = project ? data.statusName(project.status) : ''; $('project-status').className = 'status-badge ' + cssStatus(project?.status || ''); $('project-status').hidden = !project;
     $('round-label').textContent = project ? '第 ' + ((project.generation || 0) + 1) + ' 轮探索' : '新的探索';
     const timing = data.projectTiming(state, executions), progress = data.taskProgress(state);
@@ -80,7 +79,9 @@
     toggle.dataset.action = action; toggle.replaceChildren(icon({pause:'pause',resume:'play',restart:'restart'}[action]), document.createTextNode({pause:'暂停',resume:'继续',restart:'重启'}[action])); toggle.disabled = !project || mutating || !connected;
     $('add-hint').disabled = !project || ended || mutating || !connected; $('new-project').disabled = $('empty-create').disabled = mutating; $('refresh-project').disabled = mutating;
     $('node-count').textContent = graph.getVisibleNodeCount() + ' 个节点'; $('task-progress').textContent = progress.completed + ' / ' + progress.total + ' 个任务已完成'; $('progress-fill').style.width = progress.total ? (progress.completed / progress.total * 100) + '%' : '0%';
-    $('canvas-caption').textContent = !project ? '从一个清晰的目标开始' : !state ? '正在读取任务图' : graph.getVisibleNodeCount() === 0 ? '当前轮尚未产生节点' : ({active:'探索正在展开',stopped:'探索已暂停，已有线索完整保留',completed:'项目已完成，查看结论与证据',terminated:'探索已终止，已有记录仍可查看'})[project.status] || data.statusName(project.status);
+    const statusFilter = graph.getStatusFilter(), filterLabel = {done:'已完成',running:'运行中',pending:'待执行'}[statusFilter];
+    document.querySelectorAll('[data-status-filter]').forEach(button => { button.setAttribute('aria-pressed', String(button.dataset.statusFilter === statusFilter)); button.disabled = !state; });
+    $('canvas-caption').textContent = !project ? '从一个清晰的目标开始' : !state ? '正在读取任务图' : filterLabel ? '正在显示：' + filterLabel + ' · 再次点击恢复全部' : graph.getVisibleNodeCount() === 0 ? '当前轮尚未产生节点' : ({active:'探索正在展开',stopped:'探索已暂停，已有线索完整保留',completed:'项目已完成，查看结论与证据',terminated:'探索已终止，已有记录仍可查看'})[project.status] || data.statusName(project.status);
     $('graph-empty').hidden = !!project; $('activity-live').textContent = project ? data.statusName(project.status) : '等待项目';
     for (const id of ['zoom-in','zoom-out','fit-graph','arrange-graph']) $(id).disabled = !state || !graph.getVisibleNodeCount();
     if (hintProjectId) {
@@ -90,7 +91,7 @@
   }
   function emptyPanel(title, body, name = 'file') { const panel = el('div', 'empty-panel'); panel.append(icon(name), el('h3', '', title), el('p', '', body)); return panel; }
   function revealNode(ref) {
-    const node = graph.getNodes().find(item => nodeKey(item) === nodeKey(ref)); if (!node) return; tab = 'board'; graph.selectNode(ref); graph.focusNode(node.key); renderActivity();
+    const node = graph.getNodes().find(item => nodeKey(item) === nodeKey(ref)); if (!node) return; tab = 'board'; graph.setStatusFilter('all'); renderHeader(); graph.selectNode(ref); graph.focusNode(node.key); renderActivity();
   }
   function evidenceButtons(references) {
     const box = el('div', 'evidence-links'), keys = new Set(graph.getNodes().map(nodeKey));
@@ -124,10 +125,23 @@
       if (node.raw?.invalid_sources?.length) host.append(el('p', 'evidence-warning', '无效证据：' + node.raw.invalid_sources.join('、')));
     }
   }
+  function logContent(source, id, parts) {
+    const content = el('div', 'log-content'), full = el('div', 'log-full'); full.append(...parts);
+    const text = parts.map(part => part.textContent).filter(Boolean).join('\n'), lines = text.split('\n');
+    const previewText = Array.from(lines.slice(0, 4).join('\n')).slice(0, 140).join('');
+    if (previewText === text) { content.append(full); return content; }
+    const key = JSON.stringify([selectedId, state?.graph?.project?.generation || 0, source, id]);
+    const preview = el('p', 'log-preview', previewText.trimEnd() + '…'), toggle = el('button', 'log-toggle');
+    full.id = 'log-body-' + (++logBodyId); toggle.type = 'button'; toggle.setAttribute('aria-controls', full.id);
+    const update = () => { const expanded = expandedLogs.has(key); full.hidden = !expanded; preview.hidden = expanded; toggle.setAttribute('aria-expanded', String(expanded)); toggle.textContent = expanded ? '收起' : '展开全文'; };
+    toggle.addEventListener('click', () => { if (expandedLogs.has(key)) expandedLogs.delete(key); else expandedLogs.add(key); update(); });
+    update(); content.append(preview, full, toggle); return content;
+  }
   function renderLog(log) {
     const article = el('article', 'timeline-entry ' + log.level + (log.kind === 'model' ? ' conclusion' : '')); article.dataset.logId = log.id;
-    const meta = el('div', 'entry-meta'); meta.append(el('span', 'entry-tag', log.kind === 'model' ? '关键结论' : data.phaseName(log.phase)), timestamp(log.time)); article.append(meta, el('h3', '', log.title), el('p', '', log.body || ''));
-    if (log.scope) article.append(el('p', '', '范围：' + log.scope)); if (log.worker) article.append(el('small', 'log-worker', log.worker)); if (log.code) article.append(el('pre', 'log-code', log.code));
+    const meta = el('div', 'entry-meta'); meta.append(el('span', 'entry-tag', log.kind === 'model' ? '关键结论' : data.phaseName(log.phase)), timestamp(log.time)); article.append(meta, el('h3', '', log.title));
+    const parts = [el('p', '', log.body || '')]; if (log.scope) parts.push(el('p', '', '范围：' + log.scope)); if (log.code) parts.push(el('pre', 'log-code', log.code));
+    article.append(logContent('board', log.id, parts)); if (log.worker) article.append(el('small', 'log-worker', log.worker));
     if (log.truncated && !(log.body || '').includes('输出已截断')) article.append(el('p', 'evidence-warning', '输出已截断，内容不完整。'));
     if (log.evidence?.length) article.append(evidenceButtons(log.evidence)); if (log.artifacts?.length) article.append(artifacts(log.artifacts)); if (log.node) article.append(evidenceButtons([log.node])); return article;
   }
@@ -148,7 +162,7 @@
     $('activity-content').append(el('p', 'source-notice', system.unavailable.join('、') + '：暂未接入。'));
     const entries = system.logs.filter(log => systemFilter === 'http' ? log.component === 'LLM' && log.level === 'error' : systemFilter !== 'errors' || log.level === 'error'); $('activity-count').textContent = entries.length + ' 条记录';
     for (const log of entries.slice(-logLimit).reverse()) {
-      const article = el('article', 'system-entry ' + log.level), meta = el('div', 'system-meta'); meta.append(icon('terminal'), el('span', '', log.component), timestamp(log.time)); article.append(meta, el('h3', '', log.title || ''), el('p', '', log.body || ''));
+      const article = el('article', 'system-entry ' + log.level), meta = el('div', 'system-meta'); article.dataset.logId = log.id; meta.append(icon('terminal'), el('span', '', log.component), timestamp(log.time)); article.append(meta, el('h3', '', log.title || ''), logContent('system', log.id, [el('p', '', log.body || '')]));
       if (log.truncated) article.append(el('p', 'evidence-warning', '输出已截断，内容不完整。')); if (log.node) article.append(evidenceButtons([log.node])); $('activity-content').append(article);
     }
     if (entries.length > logLimit) { const more = el('button', 'button secondary more-logs', '显示更早记录（' + (entries.length - logLimit) + '）'); more.addEventListener('click', () => { logLimit += 300; renderActivity(); }); $('activity-content').append(more); }
@@ -287,6 +301,9 @@
     });
   });
   $('zoom-out').addEventListener('click', () => graph.zoomBy(1 / 1.15)); $('zoom-in').addEventListener('click', () => graph.zoomBy(1.15)); $('fit-graph').addEventListener('click', () => graph.fit()); $('arrange-graph').addEventListener('click', () => { graph.arrange(); toast('已重新随机分布节点'); });
+  document.querySelectorAll('[data-status-filter]').forEach(button => button.addEventListener('click', () => {
+    graph.setStatusFilter(graph.getStatusFilter() === button.dataset.statusFilter ? 'all' : button.dataset.statusFilter); renderHeader();
+  }));
   $('graph-host').addEventListener('graphzoom', event => { $('zoom-label').textContent = Math.round(event.detail.zoom * 100) + '%'; });
   $('mobile-menu').addEventListener('click', () => { const open = $('sidebar').classList.toggle('open'); $('sidebar-scrim').hidden = !open; $('mobile-menu').setAttribute('aria-expanded', String(open)); }); $('sidebar-scrim').addEventListener('click', hideSidebar);
   document.addEventListener('pointerdown', event => { if (!event.target.closest('.project-menu')) closeMenus(); }); window.addEventListener('resize', closeMenus);

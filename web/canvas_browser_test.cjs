@@ -52,6 +52,40 @@ test('embedded canvas handles live graph changes and unrestricted pointer moveme
   assert.match(update.text,/变更标题/);
   assert.match(JSON.stringify(update.details),/更新后的关系说明/);
   assert.equal(await page.locator('#canvas-probe .graph-edge-hit').count(),183);
+  const filtered = await page.evaluate(async () => {
+    probe.setStatusFilter('done');
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    return {positions:[...probe.positions],camera:[probe.scale,probe.tx,probe.ty],count:probe.getVisibleNodeCount()};
+  });
+  assert.deepEqual(new Map(filtered.positions),new Map(initial.positions)); assert.deepEqual(filtered.camera,initial.camera);
+  assert.equal(filtered.count,121); assert.equal(await page.locator('#canvas-probe .graph-node:visible').count(),121);
+  assert.equal(await page.locator('#canvas-probe .graph-edge-hit:visible').count(),123);
+  await page.locator('#canvas-probe .graph-viewport').focus(); await page.keyboard.press('Tab');
+  assert.ok(await page.evaluate(()=>document.activeElement.dataset.edgeKey),'visible edge hit targets remain keyboard reachable');
+  await page.evaluate(()=>probe.setStatusFilter('pending'));
+  await page.waitForFunction(()=>document.querySelector('#canvas-probe [data-node-key="fact:f0"]').hidden);
+  assert.equal(await page.locator('#canvas-probe .graph-node:visible').count(),1);
+  assert.equal(await page.locator('#canvas-probe .graph-edge-hit:visible').count(),0);
+  await page.locator('#canvas-probe .graph-viewport').focus(); await page.keyboard.press('0');
+  const pendingFit = await page.evaluate(() => {
+    const bounds = XLoomCanvas.worldBounds(new Map([['goal:goal',probe.positions.get('goal:goal')]]), {width:XLoomLayout.NODE_WIDTH,height:XLoomLayout.NODE_HEIGHT,baseWidth:0,baseHeight:0,padding:96});
+    const expected = XLoomCanvas.fitTransform(bounds,1440,960);
+    return {camera:[probe.scale,probe.tx,probe.ty],expected:[expected.scale,expected.tx,expected.ty]};
+  });
+  assert.deepEqual(pendingFit.camera,pendingFit.expected,'keyboard fit excludes all hidden cards');
+  await page.keyboard.press('Tab');
+  assert.equal(await page.evaluate(()=>document.activeElement.dataset.nodeKey),'goal:goal','keyboard navigation skips hidden nodes and edge hit targets');
+  await page.evaluate(()=>probe.setStatusFilter('running'));
+  await page.waitForFunction(()=>!document.querySelector('#canvas-probe .graph-data-empty').hidden);
+  assert.equal(await page.locator('#canvas-probe .graph-node:visible').count(),0);
+  await page.evaluate(()=>{probeState.steps.find(step=>step.id==='s0').status='running'; probe.setState(probeState);});
+  await page.waitForFunction(()=>!document.querySelector('#canvas-probe [data-node-key="step:s0"]').hidden);
+  assert.equal(await page.locator('#canvas-probe .graph-node:visible').count(),1);
+  assert.equal(await page.locator('#canvas-probe .graph-edge-hit:visible').count(),0);
+  await page.evaluate(()=>{probeState.steps.find(step=>step.id==='s0').status='completed'; probe.setState(probeState); probe.setStatusFilter('all');});
+  await page.waitForFunction(()=>!document.querySelector('#canvas-probe [data-node-key="fact:f0"]').hidden);
+  assert.equal(await page.locator('#canvas-probe .graph-node:visible').count(),122);
+  assert.equal(await page.locator('#canvas-probe .graph-edge-hit:visible').count(),183);
   await page.evaluate(async () => {
     probe.positions.set('fact:f0',{x:-15000,y:-9000});
     probe.setState(probeState); probe.fit();

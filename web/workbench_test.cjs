@@ -51,10 +51,12 @@ function harness(handler, selected = 'A') {
     async request(url, options = {}) { calls.push({url,options}); return handler(url,options); }
   }
   class FakeGraph {
-    constructor(_,options) { this.state = null; this.options = options; this.selected = null; graph = this; }
+    constructor(_,options) { this.state = null; this.options = options; this.selected = null; this.statusFilter = 'all'; graph = this; }
     setState(value) { this.state = value; displayed.push(value); if (this.selected) { const current = this.getNodes().find(node => node.key === this.selected); this.options.onSelect(current || null); } }
     getNodes() { return mapState(this.state).nodes; }
     getVisibleNodeCount() { return this.getNodes().length; }
+    getStatusFilter() { return this.statusFilter; }
+    setStatusFilter(status) { this.statusFilter = status; }
     selectNode(ref) { const node = ref && this.getNodes().find(node => node.key === (ref.type + ':' + ref.id)); this.selected = node?.key; this.options.onSelect(node || null); }
     getEdgeDetails() { return null; }
     destroy() {}
@@ -86,6 +88,35 @@ test('workbench and graph icons resolve to embedded symbols', () => {
   const explicit = [...(app + graphSource).matchAll(/(?:this\.)?icon\('([^']+)'\)/g)].map(match => match[1]);
   const markup = [...html.matchAll(/<use href="#i-([^"]+)"/g)].map(match => match[1]);
   for (const icon of [...explicit,...markup,'shield','code','flag','graph','pause','play','restart','stop','trash','node','file','check']) assert.ok(symbols.has(icon), 'missing icon ' + icon);
+});
+
+test('long log previews preserve full Unicode text and keep expansion scoped to project and round', async () => {
+  const body = '开始🙂'.repeat(80) + '\n结尾 <script>literal text</script>';
+  const makeState = (id, generation = 0) => ({...snapshot(id, generation),fact_records:[{id:'long',description:body,status:'valid'},{id:'short',description:'简短日志',status:'valid'}]});
+  const states = {A:makeState('A'),B:makeState('B')};
+  const h = harness(url => standard(url, states)); await settle();
+  const contents = id => h.elements.get('activity-content').children.find(node => node.dataset.logId === 'state:fact:' + id).children.find(node => node.className === 'log-content');
+  const parts = () => { const [preview, full, toggle] = contents('long').children; return {preview,full,toggle}; };
+  let log = parts(); assert.equal(log.toggle.attributes['aria-expanded'],'false'); assert.equal(log.full.hidden,true);
+  assert.equal(log.preview.textContent,Array.from(body).slice(0,140).join('') + '…');
+  assert.equal(log.full.textContent,body); assert.equal(log.full.children[0].children.length,0,'log text never becomes HTML');
+  assert.equal(contents('short').children.length,1,'short logs remain directly readable');
+  await log.toggle.click(); assert.equal(log.full.hidden,false); assert.equal(log.preview.hidden,true);
+  states.A.revision++; await h.fireTimer(2500); assert.equal(parts().toggle.attributes['aria-expanded'],'true');
+  await h.elements.get('tab-system').click(); await h.elements.get('tab-board').click(); assert.equal(parts().full.hidden,false);
+  await h.select('B'); assert.equal(parts().full.hidden,true,'same log ID in another project starts collapsed');
+  await h.select('A'); assert.equal(parts().full.hidden,false,'returning to the same round retains expansion');
+  states.A = makeState('A',1); await h.fireTimer(2500); assert.equal(parts().full.hidden,true,'a new round has its own expansion state');
+  log = parts(); await log.toggle.click(); await log.toggle.click(); assert.equal(log.toggle.attributes['aria-expanded'],'false');
+});
+
+test('short multiline logs still collapse after the fourth line', async () => {
+  const states = {A:{...snapshot('A'),graph:{...snapshot('A').graph,hints:[{id:'lines',content:'一\n二\n三\n四\n五',created_at:now}]}}};
+  const h = harness(url => standard(url,states)); await settle();
+  const article = h.elements.get('activity-content').children.find(node => node.dataset.logId === 'hint:lines');
+  const [preview,full,toggle] = article.children.find(node => node.className === 'log-content').children;
+  assert.equal(preview.textContent,'一\n二\n三\n四…'); assert.equal(full.hidden,true);
+  await toggle.click(); assert.equal(full.textContent,'一\n二\n三\n四\n五'); assert.equal(full.hidden,false);
 });
 
 test('late A state cannot replace a completed B selection even if transport ignores abort', async () => {
