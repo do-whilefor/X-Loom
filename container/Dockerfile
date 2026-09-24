@@ -7,6 +7,7 @@ FROM --platform=linux/amd64 kalilinux/kali-rolling@sha256:30399bd65187e06525008d
 
 ARG KALI_MIRROR=
 ENV TZ=Asia/Shanghai \
+    XLOOM_WORKER_ENVIRONMENT=kali-headless \
     PYTHONUNBUFFERED=1 \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
     PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \

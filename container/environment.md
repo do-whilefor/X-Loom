@@ -45,4 +45,6 @@ Node.js 和 npm 由 Kali APT 安装，提供 `node`、`npm`、`npx`；自检要�
 
 预装 Kali headless 工具集、上述补充工具及 X-Loom 二进制；不额外复制原竞赛环境的知识库、PoC、`AGENTS.md`、`CLAUDE.md` 和技能目录。Playwright 初始化在临时目录完成，不向项目注入 skills 或配置。
 
-此文档只是镜像环境说明，不自动注入模型提示词。
+镜像通过 `XLOOM_WORKER_ENVIRONMENT=kali-headless` 标识环境。Worker 在初始任务提示词中注入简短的 Kali/headless 说明和实际工作目录；执行阶段另提示可尝试 nuclei、ffuf 等命令，并以实际输出确认可用性。未设置或不识别该标记时，不声明 Kali 或预装工具集。收尾和修复阶段沿用原始说明，不重复注入。
+
+此文档全文不自动注入模型提示词。

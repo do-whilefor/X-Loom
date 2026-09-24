@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"text/template"
 	"xloom/internal/board"
 	"xloom/internal/config"
@@ -66,7 +67,21 @@ func Prompt(j Job, conclude bool, runDir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return context + body + scenarioPrompt(j) + intentContext(j) + "\nCurrent run_id: " + j.RunID, nil
+	return environmentPrompt(j) + context + body + scenarioPrompt(j) + intentContext(j) + "\nCurrent run_id: " + j.RunID, nil
+}
+
+func environmentPrompt(j Job) string {
+	text := "Environment:\n"
+	// The shipped Kali image declares its capabilities. Other Worker
+	// deployments must not inherit claims about that image's installed tools.
+	if os.Getenv("XLOOM_WORKER_ENVIRONMENT") == "kali-headless" {
+		text += "- This Worker runs in a Kali Linux container with kali-linux-headless installed.\n"
+	}
+	text += "- The shared project workspace is " + strconv.Quote(j.Workspace) + "; it can store scripts, command logs and large scan results.\n"
+	if j.Kind != "reason" {
+		text += "- bash commands start in this workspace. Try command-line tools such as nuclei and ffuf as needed; confirm availability from actual command output.\n"
+	}
+	return text + "\n"
 }
 
 func taskTemplate(j Job, conclude bool) (string, error) {

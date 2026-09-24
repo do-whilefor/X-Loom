@@ -26,6 +26,9 @@ func checkSharedPhaseInput(t *testing.T, history []agent.Message, policy string)
 	if strings.Count(input, "<task_graph>") != 1 || strings.Count(input, policy) != 1 {
 		t.Fatal("request lost or duplicated its original task graph or scenario policy")
 	}
+	if strings.Count(input, "Environment:") != 1 {
+		t.Fatal("request lost or duplicated its initial environment")
+	}
 	if strings.Contains(input, ctfExecution) {
 		t.Fatal("execution-only recipe leaked into pinned phase history")
 	}
