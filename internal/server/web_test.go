@@ -21,7 +21,7 @@ func TestWorkspaceServesItsBundledAssets(t *testing.T) {
 				t.Fatalf("workspace content type = %q", response.Header().Get("Content-Type"))
 			}
 			body := response.Body.String()
-			if !strings.Contains(body, "X-Loom · 工作台") || !strings.Contains(body, `id="graph-host"`) {
+			if !strings.Contains(body, "X-Loom · 任务工作台") || !strings.Contains(body, `id="graph-host"`) {
 				t.Fatal("X-Loom workspace is missing")
 			}
 			if strings.Contains(body, "legacy.html") || strings.Contains(body, "经典管理界面") {
@@ -50,6 +50,8 @@ func TestClassicInterfaceIsUnavailable(t *testing.T) {
 		"/static/vendor/cola.min.js", "/static/vendor/cytoscape-cola.js",
 		"/static/vendor/klay.js", "/static/vendor/cytoscape-klay.js",
 		"/static/vendor/elk.bundled.js", "/static/vendor/cytoscape-elk.js",
+		"/static/vendor/cytoscape.min.js", "/static/vendor/dagre.min.js",
+		"/static/vendor/cytoscape-dagre.js", "/static/xloom.svg",
 	} {
 		t.Run(path, func(t *testing.T) {
 			for _, method := range []string{http.MethodGet, http.MethodHead} {
