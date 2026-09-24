@@ -105,7 +105,7 @@ test('workbench collapses long logs and filters cards without losing the canvas 
     await page.waitForFunction(() => document.querySelectorAll('#graph-host .graph-node').length === 8);
     await waitPaint();
 
-    await t.test('desktop columns and aligned separators persist at narrower window widths', async () => {
+    await t.test('compact desktop navigation and aligned separators persist at narrower window widths', async () => {
       assert.equal(await page.locator('#project-goal').count(),0);
       assert.equal(await page.locator('.canvas-help').count(),0);
       assert.equal(await page.locator('#mobile-menu, #sidebar-scrim, #connection-state, #refresh-project, #about-button, #about-dialog').count(),0);
@@ -113,6 +113,10 @@ test('workbench collapses long logs and filters cards without losing the canvas 
       for (const width of [1920,1440,1280,1024,800]) {
         await page.setViewportSize({width,height:960}); await waitLayout();
         const rectangles = await page.evaluate(() => ({
+          topbar:document.querySelector('.topbar').getBoundingClientRect().toJSON(),
+          breadcrumbs:document.querySelector('.breadcrumbs').getBoundingClientRect().toJSON(),
+          projectHeading:document.querySelector('.project-heading').getBoundingClientRect().toJSON(),
+          activityHeading:document.querySelector('.activity-heading').getBoundingClientRect().toJSON(),
           graphTop:document.querySelector('.graph-stage').getBoundingClientRect().top,
           tabsBottom:document.querySelector('.activity-tabs').getBoundingClientRect().bottom,
           sidebar:document.querySelector('.sidebar').getBoundingClientRect().toJSON(),
@@ -121,6 +125,13 @@ test('workbench collapses long logs and filters cards without losing the canvas 
           documentWidth:document.documentElement.scrollWidth,
           bodyWidth:document.body.getBoundingClientRect().width,
         }));
+        assert.ok(rectangles.topbar.height <= 40,`navigation leaves excessive top whitespace at ${width}px`);
+        assert.ok(rectangles.breadcrumbs.height > 0 && rectangles.breadcrumbs.top >= rectangles.topbar.top + 1
+          && rectangles.breadcrumbs.bottom <= rectangles.topbar.bottom - 1,'breadcrumb text fits inside the compact navigation');
+        assert.ok(Math.abs(rectangles.projectHeading.top - rectangles.topbar.bottom) <= 1,
+          'project heading follows navigation without an empty gap');
+        assert.ok(Math.abs(rectangles.activityHeading.top - rectangles.topbar.bottom) <= 1,
+          'activity heading follows navigation without an empty gap');
         assert.ok(Math.abs(rectangles.graphTop - rectangles.tabsBottom) <= 1,
           `separators differ at ${width}px: ${JSON.stringify(rectangles)}`);
         assert.equal(await page.locator('#sidebar').isVisible(),true,'project navigation remains visible');
