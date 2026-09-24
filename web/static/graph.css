@@ -1,0 +1,41 @@
+/* Card appearance stays in style.css; connectors sit beneath opaque cards. */
+.graph-edges{z-index:1;pointer-events:none}
+.graph-nodes{position:absolute;inset:0;z-index:2;pointer-events:none}
+.graph-node{pointer-events:auto;opacity:1}
+.graph-node.lineage{border-color:#8fa17a}
+.graph-node.selected{border-color:#bc6043;box-shadow:0 0 0 3px #bc60431c,0 4px 12px #34342f08}
+.graph-node.dim{opacity:1;box-shadow:none;border-color:#dcd9ce}
+.graph-node.dim .node-title,.graph-node.dim .node-kind,.graph-node.dim .node-status,.graph-node.dim .node-subtitle{color:#939085}
+.graph-node.start.dim{border-color:#292a25}
+.graph-node.start.dim .node-title{color:#e8e6dc}
+.graph-edge{fill:none;stroke:#b0aea5;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke;pointer-events:none}
+.graph-edge.done{stroke:#8fa17a;stroke-dasharray:none}
+.graph-edge.running{stroke:#d97757;stroke-width:1.7;stroke-dasharray:8 5;animation:edge-process-flow .85s linear 6}
+.graph-edge.pending{stroke:#b0aea5;stroke-dasharray:4 5}
+.graph-edge.paused{stroke:#b38548;stroke-dasharray:7 4 1 4}
+.graph-edge.cancelled{stroke:#a39c91;stroke-dasharray:2 5}
+.graph-edge.lineage{stroke-width:1.8}
+.graph-edge.selected{stroke:#bc6043;stroke-width:2.3}
+.graph-edge.dim{opacity:.2}
+.graph-edge-hit{fill:none;stroke:transparent;stroke-width:12;vector-effect:non-scaling-stroke;pointer-events:stroke;cursor:pointer;outline:none}
+.graph-edge-hit:focus-visible{stroke:#bc60432b;stroke-width:12}
+.graph-edge-label{visibility:hidden;opacity:0;pointer-events:none;font-family:var(--font);font-size:16px;font-weight:500;fill:#716e64;stroke:#f2f1eb;stroke-width:5;paint-order:stroke;stroke-linejoin:round;cursor:pointer;user-select:none}
+.graph-edge-label.is-revealed,.graph-edge-label.selected{visibility:visible;opacity:1;pointer-events:all}
+.graph-edge-label.running,.graph-edge-label.selected{fill:#b76145}
+.graph-edge-label.paused{fill:#92743f}
+.graph-edge-label:hover{fill:#a54f36}
+.graph-source-port{pointer-events:none}
+@keyframes edge-process-flow{to{stroke-dashoffset:-26}}
+@media(prefers-reduced-motion:reduce){.graph-edge.running{animation:none}}
+.graph-data-empty{position:absolute;inset:0;display:grid;place-items:center;color:#716e64;pointer-events:none;font-size:14px}
+.graph-data-warning{position:absolute;left:50%;top:10px;transform:translateX(-50%);max-width:90%;padding:5px 9px;border:1px solid #e8dcc7;border-radius:5px;background:#faf4e8;color:#92743f;font-size:11px;pointer-events:none;z-index:3}
+.graph-data-empty[hidden],.graph-data-warning[hidden]{display:none}
+.graph-screen-reader{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+.graph-node.invalid{border-color:#b18748;background:#faf4e8}
+.graph-node.invalid .node-status{color:#92743f}
+.graph-node .node-status{max-width:88px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.graph-node .node-status>span{overflow:hidden;text-overflow:ellipsis}
+.graph-edge.invalid{stroke:#b18748;stroke-dasharray:3 5}
+.graph-edge-label.invalid{fill:#92743f}
+.graph-edge.invalid.selected{stroke:#bc6043}
+.graph-node.invalid.selected{border-color:#bc6043}

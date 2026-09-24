@@ -16,7 +16,7 @@
     valid:'有效', input:'项目输入', superseded:'已被替代', refuted:'已反驳', narrowed:'范围已收窄',
     candidate:'待验证', verified:'已验证', failed:'执行失败', rejected:'结果被拒绝', cancelled:'已取消',
     prepared:'等待执行', retryable:'等待恢复', result_pending:'结果待写回', succeeded:'执行完成',
-    retry_requested:'等待重试'
+    retry_requested:'等待重试', needs_review:'需要复核'
   });
   const PHASES = {bootstrap:'Bootstrap', reason:'Decide', explore:'Execute', intent:'Execute'};
   const PHASE_NAMES = Object.freeze({bootstrap:'启动引导',reason:'决策',decide:'决策',explore:'执行',intent:'执行',execute:'执行',system:'系统',model:'模型结论'});
@@ -46,9 +46,7 @@
       payload[key] = value;
     }
     if (!SCENARIOS.some(scenario => scenario.id === input.scenario)) throw new Error('请选择一个项目场景。');
-    if (input.bootstrap_enabled !== undefined && typeof input.bootstrap_enabled !== 'boolean') throw new Error('启动引导必须为布尔值。');
     payload.scenario = input.scenario;
-    payload.bootstrap_enabled = input.bootstrap_enabled === undefined ? true : input.bootstrap_enabled;
     return payload;
   }
 
@@ -279,7 +277,7 @@
     if (string(project.id)) add({...base('project:' + project.id,project.created_at,'state'),title:'项目已创建',body:string(project.title)});
     if (Number.isInteger(project.generation) && project.generation > 0 && timestamp(project.restarted_at) !== null) {
       add({...base('project:' + string(project.id) + ':restart:' + project.generation,project.restarted_at,'state'),
-        title:'项目已重启',body:'已清空本轮任务图、发现、执行记录和日志，保留原始输入、目标和补充提示，等待重新执行。'});
+        title:'项目已重启',body:'旧轮已归档，新一轮从原始输入和目标开始，保留项目名称、创建时间和补充提示。'});
     }
     if (terminationTime(project) !== null) {
       const generation = Number.isInteger(project.generation) ? project.generation : 0;
@@ -398,5 +396,53 @@
         .filter(Boolean).join(' ').toLocaleLowerCase().includes(query)));
   }
 
-  return {SCENARIOS,validateProject,scenarioName,statusName,phaseName,nodeTypeName,formatTime,projectTiming,taskProgress,buildLogs,filterLogs};
+  function buildSystemLogs(state, events = [], executions = []) {
+    // Public execution records identify a phase, not the cause of an upstream
+    // transport failure. Never infer an LLM provider or HTTP status from text.
+    const logs = buildLogs(state, events, executions).filter(log =>
+      (log.source === 'execution' && log.kind !== 'model') ||
+      (log.source === 'event' && (log.runId || log.title.startsWith('状态更新'))) ||
+      log.id.startsWith('project:')
+    ).map(log => ({...log, component:log.source === 'execution' ? log.phase : '黑板'}));
+    return {logs, unavailable:['LLM 请求日志','组件运行日志']};
+  }
+
+  function buildResult(state, executions = []) {
+    state = object(state);
+    const graph = object(state.graph), project = object(graph.project);
+    const facts = new Map(array(state.fact_records).map(fact => [fact.id,fact]));
+    const findings = array(state.findings).map(finding => {
+      const supportValid = sourceSupport(finding, facts);
+      return {id:string(finding.id),claim:visibleFinalText(finding.claim),status:string(finding.status),
+        statusLabel:findingLabel(finding,supportValid),supportValid,sources:refs(finding.sources)};
+    });
+    const executionLogs = buildLogs(state, [], executions).filter(log => log.source === 'execution');
+    const conclusions = executionLogs.filter(log => log.kind === 'model');
+    const truncated = executionLogs.some(log => log.truncated);
+    const rootGoal = array(state.goals).find(goal => goal?.id === 'goal');
+    const restarted = timestamp(project.restarted_at);
+    const completions = array(graph.intents).filter(intent => intent?.to === 'goal' &&
+      string(intent.description).trim() && timestamp(intent.concluded_at) !== null &&
+      (restarted === null || timestamp(intent.concluded_at) >= restarted))
+      .sort((a,b) => timestamp(a.concluded_at) - timestamp(b.concluded_at));
+    const completion = completions.at(-1);
+    let status = 'pending', summary = '', notice = '项目尚未完成；执行结果和发现不代表最终结论。';
+    if (project.status === 'terminated') {
+      status = 'terminated'; notice = '本轮已终止，已有证据保留，目标未被标记为完成。';
+    } else if (project.status === 'completed') {
+      // Completion is a persisted business decision. A task count, a model's
+      // final response, or fact:goal (the input) cannot substitute for it.
+      const valid = rootGoal?.status === 'achieved' && sourceSupport(rootGoal,facts) && completion;
+      if (valid) {
+        status = 'completed'; summary = visibleFinalText(completion.description);
+        notice = '项目已完成，根目标具有有效证据。';
+      } else {
+        status = 'unverified'; notice = '项目记录为已完成，但完成说明或根目标有效证据不完整，请核对黑板记录。';
+      }
+    }
+    if (truncated) notice += ' 部分执行输出已截断，执行结果并不完整。';
+    return {status,summary,notice,findings,conclusions,truncated};
+  }
+
+  return {SCENARIOS,validateProject,scenarioName,statusName,phaseName,nodeTypeName,formatTime,projectTiming,taskProgress,buildLogs,filterLogs,buildSystemLogs,buildResult};
 }));

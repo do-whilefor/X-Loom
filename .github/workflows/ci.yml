@@ -25,3 +25,13 @@ jobs:
 
       - name: Test, vet and compile
         run: docker build --target build --progress=plain .
+
+      - name: Set up Node for workbench tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check workbench scripts and regressions
+        run: |
+          for script in web/static/*.js; do node --check "$script"; done
+          node --test web/*_test.cjs
