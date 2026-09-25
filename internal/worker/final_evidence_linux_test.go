@@ -135,17 +135,33 @@ func TestWorkerVersionTwoFinalizesAndReplaysFrozenEvidence(t *testing.T) {
 	j.ResultContractVersion = 2
 	runDir := t.TempDir()
 	source := filepath.Join(j.Workspace, "response.txt")
-	if err := os.WriteFile(source, []byte("HTTP/1.1 401 Unauthorized\n"), 0600); err != nil {
+	const original = "HTTP/1.1 401 Unauthorized\n"
+	if err := os.WriteFile(source, []byte(original), 0600); err != nil {
 		t.Fatal(err)
 	}
 	turns := 0
-	provider := scenarioProvider(func(context.Context, []agent.Message, []agent.Definition, agent.Emit) (agent.Message, error) {
+	provider := scenarioProvider(func(_ context.Context, history []agent.Message, _ []agent.Definition, _ agent.Emit) (agent.Message, error) {
 		turns++
+		if turns > 1 {
+			t.Fatal("a verified terminal fact requested a publication or confirmation turn")
+		}
+		prompt := phaseHistoryText(history)
+		if !strings.Contains(prompt, "As soon as the assigned checks and required artifacts are verified") ||
+			!strings.Contains(prompt, "still share important intermediate discoveries while work remains") {
+			t.Fatal("direct completion lost its verification or intermediate sharing boundary")
+		}
 		return agent.Text("assistant", finalEvidenceOutput(source)), nil
 	})
 	first, err := Run(context.Background(), j, Options{RunDir: runDir, Provider: provider})
-	if err != nil || first.Status != "success" {
+	if err != nil || first.Status != "success" || first.Conclude || turns != 1 {
 		t.Fatalf("final result: %+v %v", first, err)
+	}
+	refs := finalEvidenceRefs(t, j, first)
+	if len(refs) != 1 || refs[0].RunID != j.RunID || refs[0].Path == source || refs[0].Excerpt != original {
+		t.Fatalf("direct completion did not freeze evidence: %+v", refs)
+	}
+	if saved := outcomeSession(t, runDir); saved.Result == nil || saved.Result.Text != first.Text || saved.RepairCount != 0 || saved.ContinuationCount != 0 {
+		t.Fatal("direct completion did not persist its frozen result without extra work")
 	}
 	if err = os.WriteFile(source, []byte("changed after result"), 0600); err != nil {
 		t.Fatal(err)
@@ -153,5 +169,8 @@ func TestWorkerVersionTwoFinalizesAndReplaysFrozenEvidence(t *testing.T) {
 	again, err := Run(context.Background(), j, Options{RunDir: runDir, Provider: provider})
 	if err != nil || first.Text != again.Text || turns != 1 {
 		t.Fatalf("replay re-executed or changed evidence: turns=%d err=%v", turns, err)
+	}
+	if raw, err := os.ReadFile(refs[0].Path); err != nil || string(raw) != original {
+		t.Fatalf("direct completion lost its original frozen evidence: %q %v", raw, err)
 	}
 }

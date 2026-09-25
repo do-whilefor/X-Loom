@@ -66,7 +66,8 @@ func TestExploreKeepsRootCoverageAndAssignedDeliverableBoundary(t *testing.T) {
 		}
 		for _, required := range []string{origin, job.Intent.Description,
 			"Project-wide deliverables in the original request do not expand this Step",
-			"only when the current intent explicitly assigns them"} {
+			"only when the current intent explicitly assigns them",
+			"Render multiple formats of one deliverable from one structured source"} {
 			if !strings.Contains(prompt, required) {
 				t.Fatalf("v%d lost root coverage or the Step's output boundary: %q", version, required)
 			}
@@ -81,7 +82,11 @@ func TestPlannerKeepsSingleWriterAndEvidenceReview(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, required := range []string{"Give each shared deliverable one writer", "after the relevant exploration Steps finish",
-			"unless the user requests it earlier", "evidence review and targeted corrections", "producing Step's completion"} {
+			"unless the user requests it earlier", "Preserve the user's root conditions and required coverage",
+			"Combine independent evidence review, report generation and artifact validation when they fit one Step",
+			"Reuse existing reports with targeted corrections",
+			"Add a separate report review only if the user requests it or a specific concern about content, evidence support or required coverage remains unresolved",
+			"wait for its producing Step's completion"} {
 			if !strings.Contains(prompt, required) {
 				t.Fatalf("rpc=%t lost deliverable ordering or verification: %q", rpc, required)
 			}
