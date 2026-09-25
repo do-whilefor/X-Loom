@@ -88,6 +88,14 @@ func TestLiveContentionProject(t *testing.T) {
 	if os.Getenv("XLOOM_LIVE_CONTENTION_TEST") != "1" {
 		t.Skip("opt in with model configuration, XLOOM_DOCKER_TEST_IMAGE and XLOOM_LIVE_OUTPUT")
 	}
+	origin, goal := liveContentionTask()
+	runObservedProject(t, "Live concurrent transaction audit", origin, goal, "business_acceptance", validateLiveContention)
+}
+
+// Reuse the production lifecycle and evidence collection for independently
+// validated workloads. Workload validators must not trust project completion.
+func runObservedProject(t *testing.T, title, origin, goal, validationScope string, validate func(board.State, map[string][]byte) []string) {
+	t.Helper()
 	image, output := os.Getenv("XLOOM_DOCKER_TEST_IMAGE"), os.Getenv("XLOOM_LIVE_OUTPUT")
 	base, token, model := os.Getenv("ANTHROPIC_BASE_URL"), os.Getenv("ANTHROPIC_AUTH_TOKEN"), os.Getenv("ANTHROPIC_DEFAULT_FABLE_MODEL")
 	if selected := os.Getenv("ANTHROPIC_MODEL"); selected != "" {
@@ -119,7 +127,8 @@ func TestLiveContentionProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	api := httptest.NewServer(server.New(store))
+	apiMetrics := &auditAPIRecorder{}
+	api := httptest.NewServer(apiMetrics.wrap(server.New(store)))
 	defer api.Close()
 	namespace := fmt.Sprintf("xloom-live-contention-%d", time.Now().UnixNano())
 	c := config.Config{
@@ -139,10 +148,9 @@ func TestLiveContentionProject(t *testing.T) {
 	runner := &liveObservedRunner{Client: docker.New(c.Container)}
 	defer runner.Close()
 	client := &dispatcher.Client{Base: api.URL}
-	origin, goal := liveContentionTask()
 	var graph board.Graph
 	started := time.Now().UTC()
-	if err = client.Do(context.Background(), "POST", "/projects", map[string]any{"title": "Live concurrent transaction audit", "origin": origin, "goal": goal, "bootstrap_enabled": false}, &graph, nil); err != nil {
+	if err = client.Do(context.Background(), "POST", "/projects", map[string]any{"title": title, "origin": origin, "goal": goal, "bootstrap_enabled": false}, &graph, nil); err != nil {
 		t.Fatal(err)
 	}
 	pid := graph.Project.ID
@@ -150,6 +158,7 @@ func TestLiveContentionProject(t *testing.T) {
 	publicUpstream.User, publicUpstream.RawQuery, publicUpstream.Fragment = nil, "", ""
 	manifest := map[string]any{"project_id": pid, "started": started, "model": model, "upstream": publicUpstream.String(), "reasoning_effort": "max", "request_timeout_seconds": 180, "decision_timeout_seconds": 300, "max_workers": 4, "source_commit": os.Getenv("XLOOM_SOURCE_COMMIT"), "image": image, "namespace": namespace, "healthcheck": "disabled", "cost_status": "unknown_no_verified_account_pricing", "scope": "synthetic local files; real model, scheduler and Docker workers"}
 	manifest["http_observation_mode"] = observationMode
+	manifest["workload_title"], manifest["validation_scope"] = title, validationScope
 	if err = saveLiveJSON(filepath.Join(output, "manifest.json"), manifest); err != nil {
 		t.Fatal(err)
 	}
@@ -194,16 +203,19 @@ func TestLiveContentionProject(t *testing.T) {
 		if err := saveLiveJSON(filepath.Join(output, "http-observations.json"), observations.Snapshot()); err != nil {
 			t.Error(err)
 		}
+		if err := saveLiveJSON(filepath.Join(output, "api-observations.json"), apiMetrics.snapshot()); err != nil {
+			t.Error(err)
+		}
 		files, archiveErr := collectLiveWorkspace(collectCtx, container, output)
 		if archiveErr != nil {
 			t.Error(archiveErr)
 		}
-		failures := validateLiveContention(state, files)
-		if err := saveLiveJSON(filepath.Join(output, "validation.json"), map[string]any{"project_completed": completed, "failures": failures, "passed": completed && len(failures) == 0}); err != nil {
+		failures := validate(state, files)
+		if err := saveLiveJSON(filepath.Join(output, "validation.json"), map[string]any{"validation_scope": validationScope, "project_completed": completed, "failures": failures, "passed": completed && len(failures) == 0}); err != nil {
 			t.Error(err)
 		}
 		if len(failures) > 0 {
-			t.Errorf("business acceptance: %v", failures)
+			t.Errorf("%s: %v", validationScope, failures)
 		}
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cleanupCancel()

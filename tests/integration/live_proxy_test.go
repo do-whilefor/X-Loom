@@ -5,6 +5,8 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,6 +15,8 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -31,36 +35,67 @@ type liveHTTPUsage struct {
 	} `json:"cache_creation"`
 }
 
+// These are serialized UTF-8 JSON byte counts, not token counts or billing
+// estimates. Component values include their JSON quoting/brackets; message
+// block counts include the complete encoded block (including signatures).
+// Components overlap: blocks are within messages, which are within body.
+type liveHTTPRequestBytes struct {
+	Body                 int                      `json:"body"`
+	System               int                      `json:"system"`
+	Tools                int                      `json:"tools"`
+	Messages             int                      `json:"messages"`
+	ThinkingBlocks       int                      `json:"thinking_blocks"`
+	ToolResultBlocks     int                      `json:"tool_result_blocks"`
+	TextBlocks           int                      `json:"text_blocks"`
+	ToolUseBlocks        int                      `json:"tool_use_blocks"`
+	OtherBlocks          int                      `json:"other_blocks"`
+	RepeatedMessageBytes int                      `json:"repeated_message_bytes"`
+	RepeatedMessageCount int                      `json:"repeated_message_count"`
+	MessageCount         int                      `json:"message_count"`
+	SystemSHA256         string                   `json:"system_sha256,omitempty"`
+	ToolsSHA256          string                   `json:"tools_sha256,omitempty"`
+	MessageFingerprints  []liveMessageFingerprint `json:"message_fingerprints,omitempty"`
+}
+
+type liveMessageFingerprint struct {
+	SHA256   string `json:"sha256"`
+	Bytes    int    `json:"bytes"`
+	Repeated bool   `json:"repeated,omitempty"`
+}
+
 // Only timings, counts and explicitly selected protocol metadata are retained.
 // Request/response bodies, URLs, headers and thinking text never enter a record.
 type liveHTTPObservation struct {
-	RequestID           int           `json:"request_id"`
-	RunID               string        `json:"run_id"`
-	Model               string        `json:"model"`
-	MaxTokens           int           `json:"max_tokens"`
-	ToolCount           int           `json:"tool_count"`
-	StartedAt           time.Time     `json:"started_at"`
-	FinishedAt          time.Time     `json:"finished_at"`
-	HTTPStatus          int           `json:"http_status"`
-	HeadersMS           *float64      `json:"headers_ms"`
-	FirstEventMS        *float64      `json:"first_event_ms"`
-	FirstThinkingMS     *float64      `json:"first_thinking_ms"`
-	LastThinkingMS      *float64      `json:"last_thinking_ms"`
-	FirstOutputMS       *float64      `json:"first_output_ms"`
-	LastOutputMS        *float64      `json:"last_output_ms"`
-	TerminalEvent       string        `json:"terminal_event,omitempty"`
-	TerminalEventMS     *float64      `json:"terminal_event_ms,omitempty"`
-	ClosedAfterTerminal bool          `json:"closed_after_terminal,omitempty"`
-	ThinkingChars       int64         `json:"thinking_chars"`
-	OutputChars         int64         `json:"output_chars"`
-	Usage               liveHTTPUsage `json:"usage"`
-	StopReason          string        `json:"stop_reason,omitempty"`
-	Errors              []string      `json:"errors,omitempty"`
+	RequestID           int                  `json:"request_id"`
+	RunID               string               `json:"run_id"`
+	Model               string               `json:"model"`
+	MaxTokens           int                  `json:"max_tokens"`
+	ToolCount           int                  `json:"tool_count"`
+	InputBytes          liveHTTPRequestBytes `json:"input_bytes"`
+	StartedAt           time.Time            `json:"started_at"`
+	FinishedAt          time.Time            `json:"finished_at"`
+	HTTPStatus          int                  `json:"http_status"`
+	HeadersMS           *float64             `json:"headers_ms"`
+	FirstEventMS        *float64             `json:"first_event_ms"`
+	FirstThinkingMS     *float64             `json:"first_thinking_ms"`
+	LastThinkingMS      *float64             `json:"last_thinking_ms"`
+	FirstOutputMS       *float64             `json:"first_output_ms"`
+	LastOutputMS        *float64             `json:"last_output_ms"`
+	TerminalEvent       string               `json:"terminal_event,omitempty"`
+	TerminalEventMS     *float64             `json:"terminal_event_ms,omitempty"`
+	ClosedAfterTerminal bool                 `json:"closed_after_terminal,omitempty"`
+	ThinkingChars       int64                `json:"thinking_chars"`
+	OutputChars         int64                `json:"output_chars"`
+	Usage               liveHTTPUsage        `json:"usage"`
+	StopReason          string               `json:"stop_reason,omitempty"`
+	Errors              []string             `json:"errors,omitempty"`
 }
 
 type liveProxyRecorder struct {
 	mu           sync.Mutex
 	observations []liveHTTPObservation
+	// Only hashes survive request parsing. Empty run IDs are never grouped.
+	seenMessages map[string]map[string]struct{}
 }
 
 func (r *liveProxyRecorder) Snapshot() []liveHTTPObservation {
@@ -69,6 +104,7 @@ func (r *liveProxyRecorder) Snapshot() []liveHTTPObservation {
 	out := append([]liveHTTPObservation(nil), r.observations...)
 	for i := range out {
 		out[i].Errors = append([]string(nil), out[i].Errors...)
+		out[i].InputBytes.MessageFingerprints = append([]liveMessageFingerprint(nil), out[i].InputBytes.MessageFingerprints...)
 		for _, timing := range []**float64{&out[i].HeadersMS, &out[i].FirstEventMS, &out[i].FirstThinkingMS, &out[i].LastThinkingMS, &out[i].FirstOutputMS, &out[i].LastOutputMS, &out[i].TerminalEventMS} {
 			if *timing != nil {
 				value := **timing
@@ -98,6 +134,96 @@ func (a *liveProxyAttempt) failure(kind string) {
 			}
 		}
 		o.Errors = append(o.Errors, kind)
+	})
+}
+
+func liveBytesSHA256(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func (a *liveProxyAttempt) observeRequest(raw []byte) {
+	var request struct {
+		Model     string          `json:"model"`
+		MaxTokens int             `json:"max_tokens"`
+		System    json.RawMessage `json:"system"`
+		Tools     json.RawMessage `json:"tools"`
+		Messages  json.RawMessage `json:"messages"`
+	}
+	if json.Unmarshal(raw, &request) != nil {
+		return
+	}
+	input := liveHTTPRequestBytes{Body: len(raw), System: len(request.System), Tools: len(request.Tools), Messages: len(request.Messages), SystemSHA256: liveBytesSHA256(request.System), ToolsSHA256: liveBytesSHA256(request.Tools)}
+	var tools, messages []json.RawMessage
+	_ = json.Unmarshal(request.Tools, &tools)
+	_ = json.Unmarshal(request.Messages, &messages)
+	input.MessageCount = len(messages)
+	for _, message := range messages {
+		input.MessageFingerprints = append(input.MessageFingerprints, liveMessageFingerprint{SHA256: liveBytesSHA256(message), Bytes: len(message)})
+		var envelope struct {
+			Content json.RawMessage `json:"content"`
+		}
+		if json.Unmarshal(message, &envelope) != nil {
+			continue
+		}
+		content := bytes.TrimSpace(envelope.Content)
+		if len(content) > 0 && content[0] == '"' {
+			input.TextBlocks += len(envelope.Content)
+			continue
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal(content, &blocks) != nil {
+			continue
+		}
+		for _, block := range blocks {
+			var metadata struct {
+				Type string `json:"type"`
+			}
+			_ = json.Unmarshal(block, &metadata)
+			switch metadata.Type {
+			case "thinking", "redacted_thinking":
+				input.ThinkingBlocks += len(block)
+			case "tool_result":
+				input.ToolResultBlocks += len(block)
+			case "text":
+				input.TextBlocks += len(block)
+			case "tool_use":
+				input.ToolUseBlocks += len(block)
+			default:
+				input.OtherBlocks += len(block)
+			}
+		}
+	}
+	a.update(func(o *liveHTTPObservation) {
+		o.Model, o.MaxTokens, o.ToolCount = request.Model, request.MaxTokens, len(tools)
+		if o.RunID != "" {
+			if a.recorder.seenMessages == nil {
+				a.recorder.seenMessages = make(map[string]map[string]struct{})
+			}
+			seen := a.recorder.seenMessages[o.RunID]
+			if seen == nil {
+				seen = make(map[string]struct{})
+				a.recorder.seenMessages[o.RunID] = seen
+			}
+			// Compare against previous requests only, then register this request.
+			// Repeated transmissions can be normal history replay or HTTP retries;
+			// this count does not claim their provider tokens were uncached/wasted.
+			for i := range input.MessageFingerprints {
+				fingerprint := &input.MessageFingerprints[i]
+				if _, ok := seen[fingerprint.SHA256]; ok {
+					fingerprint.Repeated = true
+					input.RepeatedMessageBytes += fingerprint.Bytes
+					input.RepeatedMessageCount++
+				}
+			}
+			for _, fingerprint := range input.MessageFingerprints {
+				seen[fingerprint.SHA256] = struct{}{}
+			}
+		}
+		o.InputBytes = input
 	})
 }
 
@@ -191,16 +317,7 @@ func newLiveModelProxy(upstream, token string) (*httptest.Server, *liveProxyReco
 				io.Closer
 			}{io.MultiReader(bytes.NewReader(raw), body), body}
 			if len(raw) <= 32<<20 {
-				var metadata struct {
-					Model     string            `json:"model"`
-					MaxTokens int               `json:"max_tokens"`
-					Tools     []json.RawMessage `json:"tools"`
-				}
-				if json.Unmarshal(raw, &metadata) == nil {
-					attempt.update(func(o *liveHTTPObservation) {
-						o.Model, o.MaxTokens, o.ToolCount = metadata.Model, metadata.MaxTokens, len(metadata.Tools)
-					})
-				}
+				attempt.observeRequest(raw)
 			}
 		}
 		proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), liveProxyContextKey{}, attempt)))
@@ -388,6 +505,104 @@ func liveFinishedObservations(t *testing.T, recorder *liveProxyRecorder) []liveH
 	}
 }
 
+func TestLiveModelProxyRequestCompositionAndPrivateMetadata(t *testing.T) {
+	const system = `"private-system-条件"`
+	const tools = `[{"name":"fixture","description":"private-schema"}]`
+	const textBlock = `{"type":"text","text":"private-text-中"}`
+	const thinkingBlock = `{"type":"thinking","thinking":"private-thought","signature":"private-signature"}`
+	const redactedBlock = `{"type":"redacted_thinking","data":"private-redacted"}`
+	const toolUseBlock = `{"type":"tool_use","id":"call-1","name":"fixture","input":{"value":"private-argument"}}`
+	const resultBlock = `{"type":"tool_result","tool_use_id":"call-1","content":"private-result-证据"}`
+	const otherBlock = `{"type":"image","source":{"type":"base64","data":"private-image"}}`
+	const plainText = `"private-plain-text"`
+	messages := []string{
+		`{"role":"user","content":[` + textBlock + `,` + otherBlock + `]}`,
+		`{"role":"assistant","content":[` + thinkingBlock + `,` + redactedBlock + `,` + toolUseBlock + `]}`,
+		`{"role":"user","content":[` + resultBlock + `]}`,
+		`{"role":"user","content":` + plainText + `}`,
+	}
+	messageJSON := `[` + strings.Join(messages, ",") + `]`
+	body := `{"model":"fixture","max_tokens":42,"system":` + system + `,"tools":` + tools + `,"messages":` + messageJSON + `}`
+	recorder := &liveProxyRecorder{observations: []liveHTTPObservation{{RunID: "composition-run"}}}
+	attempt := &liveProxyAttempt{recorder: recorder}
+	attempt.observeRequest([]byte(body))
+	items := recorder.Snapshot()
+	input := items[0].InputBytes
+	if input.Body != len(body) || input.System != len(system) || input.Tools != len(tools) || input.Messages != len(messageJSON) || input.MessageCount != len(messages) {
+		t.Fatalf("request JSON value byte counts changed: %+v", input)
+	}
+	if input.TextBlocks != len(textBlock)+len(plainText) || input.ThinkingBlocks != len(thinkingBlock)+len(redactedBlock) || input.ToolResultBlocks != len(resultBlock) || input.ToolUseBlocks != len(toolUseBlock) || input.OtherBlocks != len(otherBlock) {
+		t.Fatalf("message block byte counts changed: %+v", input)
+	}
+	if input.SystemSHA256 != liveBytesSHA256([]byte(system)) || input.ToolsSHA256 != liveBytesSHA256([]byte(tools)) || input.RepeatedMessageBytes != 0 || input.RepeatedMessageCount != 0 || len(input.MessageFingerprints) != len(messages) {
+		t.Fatalf("initial request fingerprints changed: %+v", input)
+	}
+	for i, message := range messages {
+		fingerprint := input.MessageFingerprints[i]
+		if fingerprint.SHA256 != liveBytesSHA256([]byte(message)) || fingerprint.Bytes != len(message) || fingerprint.Repeated {
+			t.Fatalf("wrong message fingerprint at %d: %+v", i, fingerprint)
+		}
+	}
+	if items[0].Model != "fixture" || items[0].MaxTokens != 42 || items[0].ToolCount != 1 {
+		t.Fatal("request composition displaced existing protocol metadata")
+	}
+	encoded, err := json.Marshal(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "request-metrics.json")
+	if err := os.WriteFile(path, encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, private := range []string{"private-system", "private-schema", "private-text", "private-thought", "private-signature", "private-redacted", "private-argument", "private-result", "private-image", "private-plain-text"} {
+		if bytes.Contains(persisted, []byte(private)) {
+			t.Fatal("serialized request metadata retained private body content")
+		}
+	}
+	items[0].InputBytes.MessageFingerprints[0].SHA256 = "changed"
+	if recorder.Snapshot()[0].InputBytes.MessageFingerprints[0].SHA256 == "changed" {
+		t.Fatal("Snapshot request fingerprint slice aliases recorder state")
+	}
+}
+
+func TestLiveModelProxyRepeatedMessagesAreRunScoped(t *testing.T) {
+	const first = `{"role":"user","content":"private-first"}`
+	const second = `{"role":"assistant","content":[{"type":"text","text":"private-second"}]}`
+	const changed = `{"role":"user","content":"private-first-updated"}`
+	// Exact message bytes define identity, so formatting changes do not count.
+	const spaced = `{"role": "user","content":"private-first"}`
+	recorder := &liveProxyRecorder{}
+	for _, tc := range []struct {
+		name, run string
+		messages  []string
+		bytes     int
+		count     int
+	}{
+		{"first_request_duplicates_are_not_history", "run-a", []string{first, first, second}, 0, 0},
+		{"same_run_replay", "run-a", []string{first, second, changed}, len(first) + len(second), 2},
+		{"different_run", "run-b", []string{first, second}, 0, 0},
+		{"different_run_own_replay", "run-b", []string{second}, len(second), 1},
+		{"unchanged_and_changed_messages", "run-a", []string{changed, first, spaced}, len(changed) + len(first), 2},
+		{"missing_run_first", "", []string{first}, 0, 0},
+		{"missing_run_second", "", []string{first}, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			index := len(recorder.observations)
+			recorder.observations = append(recorder.observations, liveHTTPObservation{RunID: tc.run})
+			attempt := &liveProxyAttempt{recorder: recorder, index: index}
+			attempt.observeRequest([]byte(`{"messages":[` + strings.Join(tc.messages, ",") + `]}`))
+			input := recorder.Snapshot()[index].InputBytes
+			if input.RepeatedMessageBytes != tc.bytes || input.RepeatedMessageCount != tc.count {
+				t.Fatalf("history replay crossed request/run boundaries: %+v", input)
+			}
+		})
+	}
+}
+
 func TestLiveModelProxyPreservesStreamAndRecordsOnlyMetrics(t *testing.T) {
 	const secret = "upstream-secret-not-for-recording"
 	const thinking = "private-thinking-证据"
@@ -431,6 +646,9 @@ func TestLiveModelProxyPreservesStreamAndRecordsOnlyMetrics(t *testing.T) {
 	o := items[0]
 	if len(items) != 1 || o.RequestID != 1 || o.RunID != "fixture-run" || o.Model != "fixture-model" || o.MaxTokens != 123 || o.ToolCount != 1 || o.HTTPStatus != 200 || len(o.Errors) != 0 || o.StopReason != "end_turn" {
 		t.Fatalf("unexpected HTTP metadata: %+v", o)
+	}
+	if o.InputBytes.Body != len(requestBody) || o.InputBytes.MessageCount != 1 || o.InputBytes.RepeatedMessageBytes != 0 || len(o.InputBytes.MessageFingerprints) != 1 {
+		t.Fatalf("proxy did not record the forwarded request composition: %+v", o.InputBytes)
 	}
 	if o.Usage.InputTokens != 10 || o.Usage.OutputTokens != 7 || o.Usage.CacheCreationInputTokens != 20 || o.Usage.CacheReadInputTokens != 30 || o.Usage.CacheCreation.Ephemeral5mInputTokens != 12 || o.Usage.CacheCreation.Ephemeral1hInputTokens != 8 || o.ThinkingChars != int64(utf8.RuneCountInString(thinking)) || o.OutputChars != 2 {
 		t.Fatalf("cumulative usage or character counts changed: %+v", o)

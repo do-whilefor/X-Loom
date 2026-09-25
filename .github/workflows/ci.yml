@@ -37,5 +37,7 @@ jobs:
           for script in web/static/*.js; do node --check "$script"; done
           node --test web/*_test.cjs
 
-      - name: Check live-run analysis
-        run: python3 -m unittest discover -s tests/integration -p test_analyze_live_contention.py
+      - name: Check live-run analysis and efficiency fixture
+        run: |
+          python3 -m unittest discover -s tests/integration -p 'test_analyze*.py'
+          python3 -m unittest discover -s tests/integration -p test_efficiency_fixture.py

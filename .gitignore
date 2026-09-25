@@ -28,6 +28,11 @@
 !/tests/integration/live_proxy_test.go
 !/tests/integration/analyze_live_contention.py
 !/tests/integration/test_analyze_live_contention.py
+!/tests/integration/analyze_efficiency.py
+!/tests/integration/test_analyze_efficiency.py
+!/tests/integration/efficiency_fixture.py
+!/tests/integration/test_efficiency_fixture.py
+!/tests/integration/efficiency_project_test.go
 *.test.*
 *.spec.*
 
