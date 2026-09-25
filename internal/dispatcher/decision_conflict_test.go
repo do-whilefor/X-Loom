@@ -78,7 +78,10 @@ func TestDecisionConflictSchedulesChangedInputWithoutRetryingOldSnapshot(t *test
 	for _, op := range []string{"decision_preview", "decision_commit"} {
 		t.Run(op, func(t *testing.T) {
 			fixture, _, store, _ := automaticRetryFixture(t, 0, "")
-			runner := &conflictDecisionRunner{client: fixture.Client, conflictOp: op}
+			runner := &conflictDecisionRunner{batchProtocolRunner: batchProtocolRunner{directions: 1}, client: fixture.Client, conflictOp: op}
+			// Publish an executable replacement plan while keeping Execute out
+			// of the test's count of fresh planner attempts.
+			fixture.Config.Workers[0].TaskTypes = []string{"reason"}
 			scheduler := New(fixture.Config, runner)
 			retryTicks(t, scheduler, 1)
 			original := testExecutions(t, store)[0]

@@ -217,12 +217,30 @@ func TestDecisionCannotWithdrawRootOrCompleteWithoutObservedSupport(t *testing.T
 }
 
 func TestDecisionBatchNoopEndsExecutionWithoutChangingSharedState(t *testing.T) {
-	f := newDecisionBatchFixture(t)
+	f := newExecutionProtocolFixture(t)
+	f.newIntent()
+	live := true
+	f.registerWithFields("reason", &live, 2, map[string]any{"decision": map[string]any{"version": 2, "state_version": board.DecisionStateVersion(f.state())}}, http.StatusCreated)
 	before := f.state()
 	receipt := f.decision("commit", f.batch([]board.DecisionAction{}...), http.StatusOK)
 	after := f.state()
 	if !receipt.Committed || receipt.Completed || receipt.StateVersion != board.DecisionStateVersion(before) || after.Revision != before.Revision || after.DecisionRevision != before.DecisionRevision || after.Graph.Project.Reason != nil {
 		t.Fatal("empty commit changed shared content or retained its lease")
+	}
+}
+
+func TestDecisionBatchNoopRejectsIdleProjectAndAllowsCorrection(t *testing.T) {
+	f := newDecisionBatchFixture(t)
+	before := f.state()
+	for _, op := range []string{"preview", "commit"} {
+		f.decision(op, f.batch(), http.StatusUnprocessableEntity)
+		if !reflect.DeepEqual(before, f.state()) || f.decisionReceipt(http.StatusOK).Committed {
+			t.Fatal("idle empty batch consumed state or the planning lease")
+		}
+	}
+	batch := f.batch(batchAction("step", "work", `{"action":"add","from":["origin"],"description":"Inspect the current scope"}`))
+	if !f.decision("commit", batch, http.StatusOK).Committed || len(f.state().Steps) != 1 {
+		t.Fatal("corrected plan could not progress within the same execution")
 	}
 }
 

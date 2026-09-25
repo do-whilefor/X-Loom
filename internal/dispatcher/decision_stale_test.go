@@ -49,8 +49,10 @@ func staleDecisionFailure(t *testing.T, store *board.Store) board.Execution {
 
 func assertFreshDecisionReplacement(t *testing.T, scheduler *Scheduler, runner *staleDecisionRunner, store *board.Store, original board.Execution) {
 	t.Helper()
-	// Once the first no-op commit consumes the new input, further ticks must
-	// neither restart the stale snapshot nor schedule the replacement twice.
+	// The replacement publishes a viable Step. Keep Execute outside this
+	// planner-replacement test so later ticks isolate duplicate Decide runs.
+	runner.directions = 1
+	scheduler.Config.Workers[0].TaskTypes = []string{"reason"}
 	retryTicks(t, scheduler, 6)
 	runs := testExecutions(t, store)
 	runner.mu.Lock()

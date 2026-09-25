@@ -88,6 +88,43 @@ func TestDecisionDraftRejectsMissingFieldsWithoutReservingKey(t *testing.T) {
 	}
 }
 
+func TestDecisionDraftRejectsAliasesAsEvidenceAndAllowsCorrection(t *testing.T) {
+	for _, seed := range []board.StateAction{
+		draftTestAction("goal", "seed", `{"action":"add","condition":"Investigate"}`),
+		draftTestAction("step", "seed", `{"action":"add","from":["origin"],"description":"Investigate"}`),
+	} {
+		t.Run(seed.Op, func(t *testing.T) {
+			ctx, commits := context.Background(), 0
+			d := &decisionDraft{request: func(_ context.Context, request GraphRequest) (string, error) {
+				commits++
+				if request.Op != "decision_commit" || len(request.Batch.Actions) != 2 || strings.Contains(string(request.Batch.Actions[1].Payload), "$seed") {
+					t.Fatalf("invalid dependency reached the board: %+v", request)
+				}
+				return `{"committed":true}`, nil
+			}}
+			if _, err := d.action(ctx, seed, "original"); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := json.Marshal(d.actions)
+			invalid := draftTestAction("step", "dependent", `{"action":"add","from":["origin","$seed"],"description":"Review future evidence"}`)
+			if _, err := d.action(ctx, invalid, "later"); err == nil || !strings.Contains(err.Error(), "published fact") {
+				t.Fatalf("draft alias was accepted as evidence: %v", err)
+			}
+			after, _ := json.Marshal(d.actions)
+			if string(before) != string(after) || d.version != "original" || len(d.keys) != 1 || commits != 0 {
+				t.Fatal("invalid dependency changed or published the draft")
+			}
+			corrected := draftTestAction("step", "dependent", `{"action":"add","from":["origin","f001"],"description":"Review published evidence"}`)
+			if _, err := d.action(ctx, corrected, "later"); err != nil {
+				t.Fatal("rejected key could not be corrected:", err)
+			}
+			if _, err := d.action(ctx, draftTestAction("commit", "commit", ""), "later"); err != nil || commits != 1 || !d.committed {
+				t.Fatalf("corrected draft did not commit: %v, commits=%d", err, commits)
+			}
+		})
+	}
+}
+
 func TestDecisionDraftRejectsNonemptyControlPayload(t *testing.T) {
 	for _, op := range []string{"preview", "commit", "reset"} {
 		for _, payload := range []string{`null`, `[]`, `{"action":"add"}`} {

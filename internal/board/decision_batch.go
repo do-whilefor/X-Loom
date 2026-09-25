@@ -308,6 +308,11 @@ func (t *Tx) decisionBatch(project string, fence ExecutionFence, batch DecisionB
 			out.IDs[action.Ref] = result.ID
 		}
 	}
+	if len(actions) == 0 && !slices.ContainsFunc(state.Steps, func(step Step) bool {
+		return (step.Status == "open" || step.Status == "running") && len(step.InvalidSources) == 0
+	}) {
+		return out, Err(422, "empty decision would leave the project idle: add an executable Step or propose complete with supporting facts and proof; draft unchanged")
+	}
 	out.StateVersion = DecisionStateVersion(state)
 	if !commit {
 		out.ValidationScope = "protocol_only"

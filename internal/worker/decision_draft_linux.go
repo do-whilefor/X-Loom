@@ -189,6 +189,9 @@ func (d *decisionDraft) action(ctx context.Context, a board.StateAction, current
 			if source == "goal" {
 				return "", errors.New("step from cannot include root goal; use goal_id to bind the target; from accepts evidence (origin is allowed); draft unchanged")
 			}
+			if id, ok := source.(string); ok && strings.HasPrefix(id, "$") {
+				return "", errors.New("step from requires published fact IDs or origin, not draft goal/step aliases; wait for a Step to publish evidence before planning work that depends on it; draft unchanged")
+			}
 		}
 	}
 	canonical, _ := json.Marshal(payload)
