@@ -132,7 +132,7 @@ func TestCompletionReviewReachesModelBeforeCommit(t *testing.T) {
 				if len(m.Content) == 3 {
 					id = "premature"
 				}
-				m.Content = append(m.Content, agent.Block{Type: "tool_use", ID: id, Name: "graph_action", Input: json.RawMessage(`{"op":"` + op + `","idempotency_key":"` + id + `","payload":{}}`)})
+				m.Content = append(m.Content, agent.Block{Type: "tool_use", ID: id, Name: "graph_action", Input: json.RawMessage(`{"op":"` + op + `","idempotency_key":"` + id + `"}`)})
 			}
 			return m, nil
 		}
@@ -146,7 +146,7 @@ func TestCompletionReviewReachesModelBeforeCommit(t *testing.T) {
 		if !strings.Contains(string(results[2].Content), `not_checked`) || !strings.Contains(string(results[2].Content), `Obtain an actual response`) {
 			t.Fatal("next request lost the authoritative completion review")
 		}
-		return draftModelCall("final", "graph_action", `{"op":"commit","idempotency_key":"final","payload":{}}`), nil
+		return draftModelCall("final", "graph_action", `{"op":"commit","idempotency_key":"final"}`), nil
 	})
 	result, err := Run(context.Background(), job, Options{RunDir: runDir, Provider: p, Output: bridge})
 	if err != nil || result.Status != "success" || calls != 2 || previews != 1 || commits != 1 {

@@ -49,6 +49,46 @@ func TestPromptExamplesMatchRegisteredResultProtocol(t *testing.T) {
 	}
 }
 
+// A project-level output requirement must remain visible for coverage without
+// becoming an instruction for every independent Step to overwrite that output.
+func TestExploreKeepsRootCoverageAndAssignedDeliverableBoundary(t *testing.T) {
+	for _, version := range []int{0, 1, 2} {
+		origin := "Verify the controls and deliver a consolidated final report."
+		job := Job{
+			Kind: "explore", ResultContractVersion: version,
+			Graph:  board.Graph{Facts: []board.Fact{{ID: "origin", Description: origin}}},
+			Intent: &board.Intent{ID: "i001", Description: "Verify the assigned control and publish supporting evidence."},
+		}
+		job.Graph.Intents = []board.Intent{*job.Intent}
+		prompt, err := Prompt(job, false, t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, required := range []string{origin, job.Intent.Description,
+			"Project-wide deliverables in the original request do not expand this Step",
+			"only when the current intent explicitly assigns them"} {
+			if !strings.Contains(prompt, required) {
+				t.Fatalf("v%d lost root coverage or the Step's output boundary: %q", version, required)
+			}
+		}
+	}
+}
+
+func TestPlannerKeepsSingleWriterAndEvidenceReview(t *testing.T) {
+	for _, rpc := range []bool{false, true} {
+		prompt, err := taskTemplate(Job{Kind: "reason", GraphRPC: rpc, Budget: config.Task{MaxIntents: 3}}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, required := range []string{"Give each shared deliverable one writer", "after the relevant exploration Steps finish",
+			"unless the user requests it earlier", "evidence review and targeted corrections", "producing Step's completion"} {
+			if !strings.Contains(prompt, required) {
+				t.Fatalf("rpc=%t lost deliverable ordering or verification: %q", rpc, required)
+			}
+		}
+	}
+}
+
 func TestPhaseInstructionsDoNotCopyTaskInputOrScenario(t *testing.T) {
 	for _, version := range []int{0, 1, 2} {
 		for _, kind := range []string{"bootstrap", "explore"} {

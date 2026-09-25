@@ -174,7 +174,7 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 	}
 	if o.decision != nil {
 		allowed = append(allowed, "complete", "preview", "commit", "reset")
-		description += " Actions are private drafts until commit. Keys for draft actions are letters/digits/underscore/hyphen, start with a letter, at most 64 characters. New goal/step returns $key: use this alias in later reference fields. complete payload {from:[fact IDs],description:proof} must be last; first explicitly abandon unnecessary active Steps and withdraw only auxiliary subgoals. Completion requires preview and a later model turn reviewing completion_review before commit. preview validates protocol without publishing; commit publishes the entire batch and ends this run, including an unchanged plan; reset discards uncommitted draft. preview/commit/reset use payload {}. A state_changed conflict at preview/commit ends this attempt for replanning from fresh input. InvalidSources mark premises requiring review before further execution, never silently assume they remain effective."
+		description += " Actions are private drafts until commit. Keys for draft actions are letters/digits/underscore/hyphen, start with a letter, at most 64 characters. New goal/step returns $key: use this alias in later reference fields. Ordinary plan actions and commit can share one response; preview is optional. complete payload {from:[fact IDs],description:proof} must be last; first explicitly abandon unnecessary active Steps and withdraw only auxiliary subgoals. Completion requires preview and a later model turn reviewing completion_review before commit. preview validates protocol without publishing; commit publishes the entire batch and ends this run, including an unchanged plan; reset discards uncommitted draft. preview/commit/reset omit payload or use {}; other actions require payload. A state_changed conflict at preview/commit ends this attempt for replanning from fresh input. InvalidSources mark premises requiring review before further execution, never silently assume they remain effective."
 	} else if j.Kind != "reason" && j.ResultContractVersion >= 2 {
 		description += " Reuse a published evidence Fact in the final completed.data.fact_id to finish this Step without duplicating observations."
 	}
@@ -184,6 +184,7 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 	ids := map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
 	payload := map[string]any{"type": "object", "properties": map[string]any{
 		"from": ids, "sources": ids,
+		"priority": map[string]any{"type": "integer", "minimum": 0, "maximum": 1000000},
 		"evidence": map[string]any{"type": "array", "items": map[string]any{
 			"type": "object", "properties": map[string]any{
 				"path":       map[string]any{"type": "string"},
@@ -194,7 +195,11 @@ func ConfigureRuntimeTools(j Job, o *Options) error {
 			},
 		}},
 	}}
-	schema, _ := json.Marshal(map[string]any{"type": "object", "properties": map[string]any{"op": map[string]any{"type": "string", "enum": allowed}, "idempotency_key": map[string]any{"type": "string", "minLength": 1, "maxLength": 128}, "payload": payload}, "required": []string{"op", "idempotency_key", "payload"}, "additionalProperties": false})
+	required := []string{"op", "idempotency_key", "payload"}
+	if o.decision != nil {
+		required = required[:2] // Only payload-free draft controls may omit payload.
+	}
+	schema, _ := json.Marshal(map[string]any{"type": "object", "properties": map[string]any{"op": map[string]any{"type": "string", "enum": allowed}, "idempotency_key": map[string]any{"type": "string", "minLength": 1, "maxLength": 128}, "payload": payload}, "required": required, "additionalProperties": false})
 	action := agent.Tool{Definition: agent.Definition{Name: "graph_action", Description: description, Schema: schema}, Execute: func(ctx context.Context, raw json.RawMessage) (string, error) {
 		if o.decisionConflict != nil && *o.decisionConflict != "" {
 			return "", errors.New(*o.decisionConflict)

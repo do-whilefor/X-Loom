@@ -50,6 +50,97 @@ func TestDecisionDraftStagesAliasesWithoutPublishing(t *testing.T) {
 	}
 }
 
+func TestDecisionDraftRejectsMissingFieldsWithoutReservingKey(t *testing.T) {
+	for _, tc := range []struct{ op, payload string }{
+		{"goal", `{}`},
+		{"goal", `{"action":"add","condition":" "}`},
+		{"goal", `{"action":"achieve","id":"g001","reason":"Done"}`},
+		{"goal", `{"action":"withdraw","reason":"No longer needed"}`},
+		{"step", `{}`},
+		{"step", `{"action":"add","description":"Inspect"}`},
+		{"step", `{"action":"add","description":"Inspect","from":[]}`},
+		{"step", `{"action":"add","description":"Inspect","from":[""]}`},
+		{"step", `{"action":"add","from":["origin"]}`},
+		{"step", `{"action":"abandon","id":"i001"}`},
+		{"step", `{"action":"priority","id":"i001","reason":"First","priority":"high"}`},
+		{"step", `{"action":"priority","id":"i001","reason":"First","priority":-1}`},
+		{"step", `{"action":"priority","id":"i001","reason":"First","priority":1000001}`},
+		{"fact_relation", `{"kind":"supersedes","source":"f001","target":"f002"}`},
+	} {
+		t.Run(tc.op+tc.payload, func(t *testing.T) {
+			d := &decisionDraft{}
+			if _, err := d.action(context.Background(), draftTestAction(tc.op, "correctable", tc.payload), "bad"); err == nil || !strings.Contains(err.Error(), "draft unchanged") {
+				t.Fatalf("invalid draft accepted: %v", err)
+			}
+			if len(d.actions) != 0 || len(d.keys) != 0 || d.version != "" {
+				t.Fatal("invalid action reserved its key or version")
+			}
+			if _, err := d.action(context.Background(), draftTestAction("step", "correctable", `{"action":"add","from":["origin"],"description":"Inspect"}`), "good"); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	for _, priority := range []string{"0", "1000000"} {
+		d := &decisionDraft{}
+		if _, err := d.action(context.Background(), draftTestAction("step", "valid", `{"action":"add","from":["origin"],"description":"Inspect","priority":`+priority+`}`), "good"); err != nil {
+			t.Fatalf("valid priority %s rejected: %v", priority, err)
+		}
+	}
+}
+
+func TestDecisionDraftRejectsNonemptyControlPayload(t *testing.T) {
+	for _, op := range []string{"preview", "commit", "reset"} {
+		for _, payload := range []string{`null`, `[]`, `{"action":"add"}`} {
+			t.Run(op+payload, func(t *testing.T) {
+				d := &decisionDraft{version: "original", reviewData: "retained", reviewReady: true, request: func(context.Context, GraphRequest) (string, error) {
+					t.Fatal("malformed control reached the board")
+					return "", nil
+				}}
+				if _, err := d.action(context.Background(), draftTestAction(op, "control", payload), "new"); err == nil {
+					t.Fatal("malformed control was accepted")
+				}
+				if d.version != "original" || d.reviewData != "retained" || !d.reviewReady || d.uncertain || d.committed {
+					t.Fatalf("malformed control changed the draft: %+v", d)
+				}
+			})
+		}
+	}
+}
+
+func TestDecisionDraftOrdinaryPlanCommitsInOneModelResponse(t *testing.T) {
+	job, runDir := draftRunJob(t), t.TempDir()
+	calls, commits := 0, 0
+	bridge := &draftTestBridge{dir: runDir, handle: func(r GraphRequest) (any, error) {
+		switch r.Op {
+		case "decision_receipt":
+			return board.DecisionReceipt{}, nil
+		case "decision_commit":
+			commits++
+			if r.Batch == nil || len(r.Batch.Actions) != 2 || r.Batch.Actions[0].Ref != "goal1" || r.Batch.Actions[1].Ref != "step1" || !strings.Contains(string(r.Batch.Actions[1].Payload), `"goal_id":"$goal1"`) {
+				t.Fatalf("lost ordered draft actions or aliases: %+v", r.Batch)
+			}
+			return board.DecisionReceipt{Committed: true, StateVersion: job.Decision.StateVersion}, nil
+		default:
+			t.Fatalf("ordinary plan made an unnecessary request: %s", r.Op)
+			return nil, nil
+		}
+	}}
+	provider := scenarioProvider(func(context.Context, []agent.Message, []agent.Definition, agent.Emit) (agent.Message, error) {
+		calls++
+		if calls > 1 {
+			return agent.Message{}, errors.New("extra model turn after compact commit")
+		}
+		m := draftModelCall("goal", "graph_action", `{"op":"goal","idempotency_key":"goal1","payload":{"action":"add","condition":"Check one boundary"}}`)
+		m.Content = append(m.Content, draftModelCall("step", "graph_action", `{"op":"step","idempotency_key":"step1","payload":{"action":"add","goal_id":"$goal1","from":["origin"],"description":"Inspect once","priority":1000000}}`).Content...)
+		m.Content = append(m.Content, draftModelCall("commit", "graph_action", `{"op":"commit","idempotency_key":"commit"}`).Content...)
+		return m, nil
+	})
+	result, err := Run(context.Background(), job, Options{RunDir: runDir, Provider: provider, Output: bridge})
+	if err != nil || result.Status != "success" || calls != 1 || commits != 1 {
+		t.Fatalf("ordinary plan did not commit in one turn: %+v %v calls=%d commits=%d", result, err, calls, commits)
+	}
+}
+
 func TestDecisionDraftRejectsRootGoalWithoutConsumingDraftOrKey(t *testing.T) {
 	for _, transition := range []string{"achieve", "withdraw", "add"} {
 		for _, seeded := range []bool{false, true} {

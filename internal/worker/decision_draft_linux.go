@@ -99,6 +99,12 @@ func (d *decisionDraft) action(ctx context.Context, a board.StateAction, current
 	if d.reread && a.Op != "reset" {
 		return "", errors.New("read the current overview and affected graph section after state_changed or recovery before rebuilding the draft")
 	}
+	if a.Op == "reset" || a.Op == "preview" || a.Op == "commit" {
+		var payload map[string]json.RawMessage
+		if len(a.Payload) != 0 && (json.Unmarshal(a.Payload, &payload) != nil || payload == nil || len(payload) != 0) {
+			return "", errors.New("preview/commit/reset payload must be omitted or {}; draft unchanged")
+		}
+	}
 	switch a.Op {
 	case "reset":
 		d.keys, d.actions, d.version = nil, nil, ""
@@ -163,6 +169,9 @@ func (d *decisionDraft) action(ctx context.Context, a board.StateAction, current
 	if a.Op == "goal" && payload["id"] == "goal" {
 		return "", errors.New("root goal cannot be changed by goal actions; use complete with supporting facts and proof; draft unchanged")
 	}
+	if err := validateDraftFields(a.Op, payload); err != nil {
+		return "", err
+	}
 	if a.Op == "complete" {
 		var completion struct {
 			From        []string `json:"from"`
@@ -209,6 +218,64 @@ func (d *decisionDraft) action(ctx context.Context, a board.StateAction, current
 	d.keys, d.actions = append(d.keys, a.IdempotencyKey), append(d.actions, item)
 	d.reviewData, d.reviewReady = "", false
 	return draftReply(item), nil
+}
+
+// Reject missing action fields before a bad draft reserves its key. The board
+// remains authoritative for references, state transitions and evidence.
+func validateDraftFields(op string, payload map[string]any) error {
+	text := func(key string) bool {
+		value, ok := payload[key].(string)
+		return ok && strings.TrimSpace(value) != ""
+	}
+	ids := func(key string) bool {
+		values, ok := payload[key].([]any)
+		if !ok || len(values) == 0 {
+			return false
+		}
+		for _, value := range values {
+			id, ok := value.(string)
+			if !ok || strings.TrimSpace(id) == "" {
+				return false
+			}
+		}
+		return true
+	}
+	valid := true
+	switch op {
+	case "goal":
+		switch payload["action"] {
+		case "add":
+			valid = text("condition")
+		case "achieve":
+			valid = text("id") && text("reason") && ids("sources")
+		case "withdraw":
+			valid = text("id") && text("reason")
+		default:
+			valid = false
+		}
+	case "step":
+		if value, exists := payload["priority"]; exists {
+			priority, ok := value.(float64)
+			if !ok || priority < 0 || priority > 1000000 || priority != float64(int(priority)) {
+				return errors.New("step priority must be an integer between 0 and 1000000; draft unchanged")
+			}
+		}
+		switch payload["action"] {
+		case "add":
+			valid = ids("from") && text("description")
+		case "priority", "abandon":
+			valid = text("id") && text("reason")
+		default:
+			valid = false
+		}
+	case "fact_relation":
+		kind, _ := payload["kind"].(string)
+		valid = (kind == "supersedes" || kind == "refutes" || kind == "narrows") && text("source") && text("target") && text("reason")
+	}
+	if !valid {
+		return errors.New(op + " payload is missing required action fields; see the tool contract; draft unchanged")
+	}
+	return nil
 }
 
 func draftReply(item board.DecisionAction) string {

@@ -17,6 +17,10 @@ func TestGraphActionRejectsMalformedCollectionsBeforeExecution(t *testing.T) {
 		{"from object", "reason", "step", `{"action":"add","from":{"item":"origin"},"description":"Inspect"}`, "from"},
 		{"from null", "reason", "step", `{"action":"add","from":null}`, "from"},
 		{"from element", "reason", "step", `{"action":"add","from":[{"item":"origin"}]}`, "from[0]"},
+		{"priority string", "reason", "step", `{"action":"add","from":["origin"],"description":"Inspect","priority":"high"}`, "priority"},
+		{"priority fraction", "reason", "step", `{"action":"priority","id":"i001","reason":"First","priority":1.5}`, "priority"},
+		{"priority negative", "reason", "step", `{"action":"priority","id":"i001","reason":"First","priority":-1}`, "priority"},
+		{"priority excessive", "reason", "step", `{"action":"priority","id":"i001","reason":"First","priority":1000001}`, "priority"},
 		{"sources object", "reason", "goal", `{"action":"achieve","sources":{"item":"fact001"}}`, "sources"},
 		{"sources element", "explore", "finding", `{"sources":[7]}`, "sources[0]"},
 		{"evidence object", "explore", "fact", `{"evidence":{"path":"result.txt"}}`, "evidence"},
@@ -132,6 +136,61 @@ func TestGraphActionCollectionSchemaPreservesSupportedPayloads(t *testing.T) {
 		raw := json.RawMessage(`{"op":"finding","idempotency_key":"probe","payload":` + payload + `}`)
 		if err := agent.ValidateArguments(action.Schema, raw); err != nil {
 			t.Errorf("supported shape rejected: %s: %v", payload, err)
+		}
+	}
+}
+
+func TestGraphActionOptionalPayloadOnlyForDraftControls(t *testing.T) {
+	for _, op := range []string{"preview", "commit", "reset"} {
+		for _, suffix := range []string{"", `,"payload":{}`} {
+			t.Run(op+suffix, func(t *testing.T) {
+				requests := 0
+				opts, _, action := draftTestTools(t, func(request GraphRequest) (any, error) {
+					requests++
+					if request.Op != "decision_"+op {
+						t.Fatalf("unexpected request: %+v", request)
+					}
+					return board.DecisionReceipt{Committed: op == "commit", StateVersion: strings.Repeat("a", 64)}, nil
+				})
+				raw := json.RawMessage(`{"op":"` + op + `","idempotency_key":"control"` + suffix + `}`)
+				if err := agent.ValidateArguments(action.Schema, raw); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := action.Execute(context.Background(), raw); err != nil {
+					t.Fatal(err)
+				}
+				wantRequests := 1
+				if op == "reset" {
+					wantRequests = 0
+				}
+				if requests != wantRequests || opts.decision.committed != (op == "commit") {
+					t.Fatalf("wrong control result: requests=%d draft=%+v", requests, opts.decision)
+				}
+			})
+		}
+	}
+	for _, op := range []string{"goal", "step", "fact_relation", "complete"} {
+		t.Run(op, func(t *testing.T) {
+			opts, _, action := draftTestTools(t, func(GraphRequest) (any, error) {
+				t.Fatal("missing business payload reached the board")
+				return nil, nil
+			})
+			raw := json.RawMessage(`{"op":"` + op + `","idempotency_key":"missing"}`)
+			if _, err := action.Execute(context.Background(), raw); err == nil || !strings.Contains(err.Error(), "payload must be an object") {
+				t.Fatalf("missing business payload was accepted: %v", err)
+			}
+			if len(opts.decision.actions) != 0 || opts.decision.version != "" {
+				t.Fatal("missing payload changed the draft")
+			}
+		})
+	}
+	for _, kind := range []string{"reason", "explore"} {
+		opts := Options{Tools: []agent.Tool{}}
+		if err := ConfigureRuntimeTools(Job{Kind: kind}, &opts); err != nil {
+			t.Fatal(err)
+		}
+		if err := agent.ValidateArguments(opts.Tools[1].Schema, json.RawMessage(`{"op":"step","idempotency_key":"missing"}`)); err == nil || !strings.Contains(err.Error(), "missing argument arguments.payload") {
+			t.Fatalf("non-batch %s no longer requires payload: %v", kind, err)
 		}
 	}
 }

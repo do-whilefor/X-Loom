@@ -29,6 +29,15 @@ type Runner interface {
 	Projects(context.Context) ([]string, error)
 }
 type checkpoint struct{ Facts, Hints, Open int }
+type reasonWait struct {
+	First, Changed time.Time
+	Revision       int64
+	Urgent         bool
+}
+
+const reasonQuietPeriod = 15 * time.Second
+const reasonMaxWait = time.Minute
+
 type task struct {
 	Job          worker.Job
 	Worker       config.Worker
@@ -55,6 +64,7 @@ type Scheduler struct {
 	running           map[string]*task
 	admitted          map[string]bool
 	checkpoints       map[string]checkpoint
+	reasonWaits       map[string]reasonWait
 	unhealthy         map[string]time.Time
 	rejected          map[string]time.Time
 	cleanup           map[string]string
@@ -80,6 +90,7 @@ func New(c config.Config, r Runner) *Scheduler {
 	s.schedules = map[string]board.SchedulePage{}
 	s.generations = map[string]int64{}
 	s.restartCleaned = map[string]int64{}
+	s.reasonWaits = map[string]reasonWait{}
 	return s
 }
 func (s *Scheduler) Health(ctx context.Context, force bool) error {
@@ -239,6 +250,11 @@ func (s *Scheduler) Step(ctx context.Context) error {
 			delete(s.checkpoints, id)
 		}
 	}
+	for id := range s.reasonWaits {
+		if states[id] != "active" {
+			delete(s.reasonWaits, id)
+		}
+	}
 	for _, t := range s.running {
 		id := t.Job.Graph.Project.ID
 		if t.Job.Graph.Project.Generation != s.generations[id] {
@@ -334,7 +350,7 @@ func (s *Scheduler) Step(ctx context.Context) error {
 func bootstrap(i board.Intent) bool {
 	return i.To == nil && i.ConcludedAt == nil && i.Description == "bootstrap" && i.Creator == "dispatcher.bootstrap" && len(i.From) == 1 && i.From[0] == "origin"
 }
-func (s *Scheduler) trigger(g board.Graph, check board.ExecutionCheck) string {
+func (s *Scheduler) trigger(g board.Graph, check board.ExecutionCheck, previous board.SchedulePage, now time.Time) string {
 	if check.PreviousRunID != "" {
 		return "explicit_retry"
 	}
@@ -349,9 +365,58 @@ func (s *Scheduler) trigger(g board.Graph, check board.ExecutionCheck) string {
 		facts, hints, open = input.FactCount, input.HintCount, input.OpenCount
 	}
 	if facts > p.Facts || hints > p.Hints || (p.Open > 0 && open == 0) || s.stateRevisions[g.Project.ID] > s.decisionRevisions[g.Project.ID] {
+		// User input and a drained execution phase need an immediate decision.
+		// Ordinary Execute updates often arrive in bursts; deciding between
+		// them starts model requests that the next heartbeat must cancel.
+		if hints <= p.Hints && open > 0 && s.waitForReason(g, previous, now) {
+			return ""
+		}
 		return "new_facts_or_hints_or_finished_intents"
 	}
+	delete(s.reasonWaits, g.Project.ID)
 	return ""
+}
+
+func (s *Scheduler) waitForReason(g board.Graph, previous board.SchedulePage, now time.Time) bool {
+	id := g.Project.ID
+	busy := false
+	for _, t := range s.running {
+		busy = busy || t.Job.Graph.Project.ID == id && t.Job.Kind != "reason"
+	}
+	for _, intent := range g.Intents {
+		busy = busy || intent.Worker != nil && intent.To == nil && intent.ConcludedAt == nil
+	}
+	if !busy {
+		return false
+	}
+	input := s.schedules[id]
+	s.noteInvalidDependencies(id, previous, input)
+	wait, ok := s.reasonWaits[id]
+	if !ok || wait.First.IsZero() {
+		wait.First, wait.Changed, wait.Revision = now, now, input.DecisionRevision
+	} else if wait.Revision != input.DecisionRevision {
+		wait.Changed, wait.Revision = now, input.DecisionRevision
+	}
+	s.reasonWaits[id] = wait
+	return !wait.Urgent && now.Sub(wait.Changed) < reasonQuietPeriod && now.Sub(wait.First) < reasonMaxWait
+}
+
+func (s *Scheduler) noteInvalidDependencies(id string, previous, input board.SchedulePage) {
+	// A newly invalid dependency must be reconsidered promptly, including
+	// when a planner slot only becomes available on a later tick. Old invalid
+	// steps must not disable coalescing for every subsequent ordinary update.
+	oldInvalid := map[string]bool{}
+	for _, step := range previous.Steps {
+		oldInvalid[step.ID] = len(step.InvalidSources) > 0
+	}
+	for _, step := range input.Steps {
+		if len(step.InvalidSources) > 0 && !oldInvalid[step.ID] {
+			wait := s.reasonWaits[id]
+			wait.Urgent = true
+			s.reasonWaits[id] = wait
+			return
+		}
+	}
 }
 
 // Restart keeps the project ID but replaces its execution round. Forget the
@@ -365,6 +430,7 @@ func (s *Scheduler) observeGeneration(project board.Project) {
 		delete(s.decisionRevisions, project.ID)
 		delete(s.stateRevisions, project.ID)
 		delete(s.schedules, project.ID)
+		delete(s.reasonWaits, project.ID)
 		s.generations[project.ID] = project.Generation
 	}
 }
@@ -425,6 +491,7 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 	g := board.Graph{Project: input.Project, Intents: input.Intents}
 	state := board.State{Graph: g, Steps: input.Steps, Revision: input.Revision, DecisionRevision: input.DecisionRevision}
 	s.observeGeneration(g.Project)
+	previous := s.schedules[id]
 	s.schedules[id] = input
 	// Cancellation may take time in a container. Do not start the new round
 	// in the same workspace until every old local execution has actually left.
@@ -521,8 +588,13 @@ func (s *Scheduler) dispatch(ctx context.Context, id string) (bool, error) {
 		}
 		return s.launch(ctx, g, "bootstrap", boot, "", check)
 	}
+	if g.Project.Reason != nil || localReason {
+		// Still record invalidation while a stale planner is cancelling; the
+		// next page already includes it and cannot rediscover the transition.
+		s.noteInvalidDependencies(id, previous, input)
+	}
 	if g.Project.Reason == nil && !localReason {
-		if trigger := s.trigger(g, reasonCheck); trigger != "" {
+		if trigger := s.trigger(g, reasonCheck, previous, time.Now()); trigger != "" {
 			if ok, err := s.launch(ctx, g, "reason", nil, trigger, reasonCheck); ok || err != nil {
 				return ok, err
 			}
@@ -648,6 +720,9 @@ func (s *Scheduler) launch(ctx context.Context, g board.Graph, kind string, inte
 		return false, err
 	}
 	s.start(ctx, t)
+	if kind == "reason" {
+		delete(s.reasonWaits, g.Project.ID)
+	}
 	return true, nil
 }
 func (s *Scheduler) runTask(ctx context.Context, t *task) (outcome string, runErr error) {
