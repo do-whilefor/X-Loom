@@ -6,6 +6,7 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -291,8 +292,28 @@ func collectLiveWorkspace(ctx context.Context, container, output string) (map[st
 	if response.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("workspace archive HTTP %d", response.StatusCode)
 	}
-	files := map[string][]byte{}
-	reader := tar.NewReader(response.Body)
+	return retainLiveWorkspace(response.Body, output)
+}
+
+// The original archive is authoritative when the output filesystem cannot
+// represent every Linux filename (for example, names differing only in case).
+func retainLiveWorkspace(source io.Reader, output string) (files map[string][]byte, err error) {
+	if err = os.MkdirAll(output, 0700); err != nil {
+		return nil, err
+	}
+	archive, err := os.OpenFile(filepath.Join(output, "workspace.tar"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, err
+	}
+	stream := io.TeeReader(source, archive)
+	defer func() {
+		// tar.Reader stops at its end markers, before any remaining padding.
+		// Also retain the unread archive when extraction fails partway through.
+		_, drainErr := io.Copy(io.Discard, stream)
+		err = errors.Join(err, drainErr, archive.Close())
+	}()
+	files = map[string][]byte{}
+	reader := tar.NewReader(stream)
 	for {
 		header, err := reader.Next()
 		if err == io.EOF {

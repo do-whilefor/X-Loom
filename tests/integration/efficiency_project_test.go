@@ -3,11 +3,16 @@
 package integration
 
 import (
+	"archive/tar"
+	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -205,4 +210,78 @@ func TestEfficiencyReportRequiresDeliverables(t *testing.T) {
 			t.Fatal("incomplete or unbound evidence passed")
 		}
 	}
+}
+
+func retainedWorkspaceArchive(t *testing.T) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	writer := tar.NewWriter(&buffer)
+	for _, member := range []struct{ name, body string }{
+		{"workspace/auditlab/Response.txt", "uppercase evidence"},
+		{"workspace/auditlab/response.txt", "lowercase evidence"},
+	} {
+		if err := writer.WriteHeader(&tar.Header{Name: member.name, Mode: 0600, Size: int64(len(member.body)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(writer, member.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Include bytes beyond tar's logical EOF to exercise the stream drain.
+	buffer.Write(make([]byte, 2048))
+	buffer.WriteString("retained transport trailer")
+	return buffer.Bytes()
+}
+
+func assertRetainedArchive(t *testing.T, output string, original []byte) {
+	t.Helper()
+	retained, err := os.ReadFile(filepath.Join(output, "workspace.tar"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(retained, original) {
+		t.Fatalf("retained archive differs from original stream: got %d bytes, want %d", len(retained), len(original))
+	}
+}
+
+func TestRetainLiveWorkspacePreservesCaseAndOriginalArchive(t *testing.T) {
+	output, original := t.TempDir(), retainedWorkspaceArchive(t)
+	files, err := retainLiveWorkspace(bytes.NewReader(original), output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 || string(files["/workspace/auditlab/Response.txt"]) != "uppercase evidence" || string(files["/workspace/auditlab/response.txt"]) != "lowercase evidence" {
+		t.Fatalf("case-distinct members were lost from evidence map: %v", files)
+	}
+	assertRetainedArchive(t, output, original)
+}
+
+func TestRetainLiveWorkspaceKeepsArchiveAfterExtractionFailure(t *testing.T) {
+	output, original := t.TempDir(), retainedWorkspaceArchive(t)
+	// A regular file blocks the extraction directory without relying on modes
+	// that root or a bind-mounted filesystem might ignore.
+	if err := os.WriteFile(filepath.Join(output, "workspace"), []byte("blocked"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := retainLiveWorkspace(bytes.NewReader(original), output); err == nil {
+		t.Fatal("extraction failure was discarded")
+	}
+	assertRetainedArchive(t, output, original)
+}
+
+type retainedArchiveReadError struct{ err error }
+
+func (reader retainedArchiveReadError) Read([]byte) (int, error) { return 0, reader.err }
+
+func TestRetainLiveWorkspaceReportsReadErrorAfterTarEnd(t *testing.T) {
+	output, original := t.TempDir(), retainedWorkspaceArchive(t)
+	want := errors.New("synthetic archive transport failure")
+	source := io.MultiReader(bytes.NewReader(original), retainedArchiveReadError{want})
+	if _, err := retainLiveWorkspace(source, output); !errors.Is(err, want) {
+		t.Fatalf("archive drain error = %v, want %v", err, want)
+	}
+	assertRetainedArchive(t, output, original)
 }
