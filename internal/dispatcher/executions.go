@@ -181,6 +181,7 @@ func (s *Scheduler) start(ctx context.Context, t *task) {
 		defer cancel()
 		outcome, err := s.runTask(runCtx, t)
 		s.done <- finished{t, outcome, err}
+		s.wake()
 	}()
 }
 func executionPath(t *task) string {

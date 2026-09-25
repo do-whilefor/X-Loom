@@ -71,6 +71,7 @@ type Scheduler struct {
 	cleaned           map[string]string
 	done              chan finished
 	cleanupDone       chan cleaned
+	wakeup            chan struct{}
 	wg                sync.WaitGroup
 	cursor            int
 	pendingExecutions []board.ExecutionSummary
@@ -91,6 +92,7 @@ func New(c config.Config, r Runner) *Scheduler {
 	s.generations = map[string]int64{}
 	s.restartCleaned = map[string]int64{}
 	s.reasonWaits = map[string]reasonWait{}
+	s.wakeup = make(chan struct{}, 1)
 	return s
 }
 func (s *Scheduler) Health(ctx context.Context, force bool) error {
@@ -161,9 +163,20 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-tick.C:
+		case <-s.wakeup:
 		}
 	}
 }
+
+// Completion records stay in their existing queues until Step reaps them.
+// Coalesce notifications without blocking workers or losing queued outcomes.
+func (s *Scheduler) wake() {
+	select {
+	case s.wakeup <- struct{}{}:
+	default:
+	}
+}
+
 func (s *Scheduler) reap() {
 	for {
 		select {
@@ -445,6 +458,10 @@ func (s *Scheduler) queueCleanup(ctx context.Context, id, state string) {
 		err := s.Runner.Cleanup(cleanupCtx, id, state)
 		select {
 		case s.cleanupDone <- cleaned{id, state, err}:
+			// A cleanup failure must not trigger its own immediate retry loop.
+			if err == nil {
+				s.wake()
+			}
 		case <-ctx.Done():
 		}
 	}()
