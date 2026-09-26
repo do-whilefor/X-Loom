@@ -9,7 +9,7 @@ const contextAdmissionReserve = 1024
 
 func ValidateContextCapacity(state State) error {
 	check := func(step string) error {
-		if _, err := ContextView(state, step, DefaultContextViewBytes-contextAdmissionReserve); err != nil {
+		if _, err := contextView(state, step, DefaultContextViewBytes-contextAdmissionReserve, true); err != nil {
 			return Err(422, fmt.Sprintf("input_context_limit: mandatory input for %s exceeds the %d-byte context budget (including runtime reserve): %v; shorten the proposed input or step; existing requirements are not truncated", contextTarget(step), DefaultContextViewBytes, err))
 		}
 		return nil

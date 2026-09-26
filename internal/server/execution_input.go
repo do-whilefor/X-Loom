@@ -22,12 +22,33 @@ func (s *Server) schedulingInput(t *b.Tx, _ *request, r *http.Request) (int, any
 		}
 		offset = n
 	}
-	p, err := t.ScheduleInput(r.PathValue("pid"), offset, r.URL.Query().Get("expected_version"))
+	limit := 100
+	if r.URL.Query().Has("limit") {
+		var err error
+		limit, err = strconv.Atoi(r.URL.Query().Get("limit"))
+		if err != nil {
+			return 0, nil, b.Err(422, "invalid scheduling limit")
+		}
+	}
+	p, err := t.ScheduleInputPage(r.PathValue("pid"), offset, limit, r.URL.Query().Get("expected_version"))
 	if err == nil && r.URL.Query().Has("namespace") {
 		var namespace string
 		namespace, err = executionNamespace(r)
 		if err == nil {
-			p.ExecutionChecks, err = t.ScheduleExecutionChecks(p.Project.ID, namespace, p.Intents, p.Steps)
+			// Bound SQL parameters while checking all candidates against the same
+			// transaction that produced the state version and current leases.
+			p.ExecutionChecks = make(map[string]b.ExecutionCheck)
+			for start := 0; start < len(p.Intents); start += 100 {
+				end := min(start+100, len(p.Intents))
+				var checks map[string]b.ExecutionCheck
+				checks, err = t.ScheduleExecutionChecks(p.Project.ID, namespace, p.Intents[start:end], p.Steps[start:end])
+				if err != nil {
+					break
+				}
+				for key, check := range checks {
+					p.ExecutionChecks[key] = check
+				}
+			}
 		}
 	}
 	return 200, p, err

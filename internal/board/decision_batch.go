@@ -247,7 +247,7 @@ func (t *Tx) decisionBatch(project string, fence ExecutionFence, batch DecisionB
 		}
 		return prior, nil
 	}
-	state, err := t.State(project)
+	state, data, err := t.stateAndData(project)
 	if err != nil {
 		return out, err
 	}
@@ -286,7 +286,7 @@ func (t *Tx) decisionBatch(project string, fence ExecutionFence, batch DecisionB
 			return out, resolveErr
 		}
 		before := state
-		result, actionErr := t.stateAction(&state, fence, StateAction{Op: action.Op, Payload: payload, IdempotencyKey: fmt.Sprintf("decision:%s:%d", fence.Run, n)})
+		result, actionErr := t.stateAction(&state, &data, fence, StateAction{Op: action.Op, Payload: payload, IdempotencyKey: fmt.Sprintf("decision:%s:%d", fence.Run, n)})
 		if actionErr != nil {
 			var api *APIError
 			if errors.As(actionErr, &api) {
@@ -313,7 +313,10 @@ func (t *Tx) decisionBatch(project string, fence ExecutionFence, batch DecisionB
 	}) {
 		return out, Err(422, "empty decision would leave the project idle: add an executable Step or propose complete with supporting facts and proof; draft unchanged")
 	}
-	out.StateVersion = DecisionStateVersion(state)
+	out.StateVersion = batch.ExpectedVersion
+	if len(out.Results) > 0 {
+		out.StateVersion = out.Results[len(out.Results)-1].StateVersion
+	}
 	if !commit {
 		out.ValidationScope = "protocol_only"
 		return out, nil

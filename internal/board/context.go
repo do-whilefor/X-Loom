@@ -19,6 +19,12 @@ type contextFact struct {
 // registered graph snapshot. Original user input and the active step are
 // mandatory; omitted history can be obtained through paginated graph reads.
 func ContextView(state State, stepID string, maxBytes int) (json.RawMessage, error) {
+	return contextView(state, stepID, maxBytes, false)
+}
+
+// Admission shares the execution projection through its mandatory budget
+// check. It need not serialize optional history, which only fills spare space.
+func contextView(state State, stepID string, maxBytes int, mandatoryOnly bool) (json.RawMessage, error) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultContextViewBytes
 	}
@@ -117,6 +123,9 @@ func ContextView(state State, stepID string, maxBytes int) (json.RawMessage, err
 	used := len(base)
 	if used > maxBytes {
 		return nil, errors.New("context view: original user inputs, hints, goal ancestry and current step exceed the budget")
+	}
+	if mandatoryOnly {
+		return base, nil
 	}
 	remaining := maxBytes - used
 	sectionLimit := used + remaining/2

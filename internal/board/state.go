@@ -161,15 +161,29 @@ func (t *Tx) stateData(project string) (stateData, int64, int64, error) {
 }
 
 func (t *Tx) State(project string) (State, error) {
+	s, _, err := t.stateAndData(project)
+	return s, err
+}
+
+func (t *Tx) stateAndData(project string) (State, stateData, error) {
 	g, err := t.Load(project)
 	if err != nil {
-		return State{}, err
+		return State{}, stateData{}, err
 	}
 	d, revision, decision, err := t.stateData(project)
 	if err != nil {
-		return State{}, err
+		return State{}, d, err
 	}
-	s := State{Graph: g, Goals: []Goal{}, Steps: []Step{}, FactRecords: []FactRecord{}, Findings: d.Findings, FactRelations: d.FactRelations, Revision: revision, DecisionRevision: decision}
+	s, err := t.projectState(g, d, revision, decision)
+	return s, d, err
+}
+
+// Reuse transaction-owned graph and metadata after a mutation. Runtime status
+// still comes from its authoritative execution rows; derived support flags must
+// not modify the metadata retained for the next action.
+func (t *Tx) projectState(g Graph, d stateData, revision, decision int64) (State, error) {
+	project := g.Project.ID
+	s := State{Graph: g, Goals: []Goal{}, Steps: []Step{}, FactRecords: []FactRecord{}, Findings: slices.Clone(d.Findings), FactRelations: d.FactRelations, Revision: revision, DecisionRevision: decision}
 	root := Goal{ID: "goal", Status: "open", Sources: []string{}, CreatedAt: g.Project.CreatedAt}
 	for _, f := range g.Facts {
 		if f.ID == "goal" {
@@ -441,16 +455,16 @@ func (t *Tx) StateAction(project string, fence ExecutionFence, action StateActio
 			return StateActionResult{}, err
 		}
 	}
-	s, err := t.State(project)
+	s, d, err := t.stateAndData(project)
 	if err != nil {
 		return StateActionResult{}, err
 	}
-	return t.stateAction(&s, fence, action)
+	return t.stateAction(&s, &d, fence, action)
 }
 
-// A batch owns this snapshot for one transaction and replaces it only after a
-// successful action. Each next action sees the persisted result of its parent.
-func (t *Tx) stateAction(snapshot *State, fence ExecutionFence, action StateAction) (StateActionResult, error) {
+// A batch owns these values for one savepoint. Any failed action discards them
+// together with its SQL writes; no mutable state survives preview or rollback.
+func (t *Tx) stateAction(snapshot *State, d *stateData, fence ExecutionFence, action StateAction) (StateActionResult, error) {
 	s := *snapshot
 	project := s.Graph.Project.ID
 	var err error
@@ -505,24 +519,20 @@ func (t *Tx) stateAction(snapshot *State, fence ExecutionFence, action StateActi
 			return StateActionResult{}, err
 		}
 	}
-	d, _, _, err := t.stateData(project)
-	if err != nil {
-		return StateActionResult{}, err
-	}
 	var id string
 	var result any
 	changed := true
 	switch action.Op {
 	case "fact":
-		id, result, err = t.addStateFact(&s, &d, fence, action.Payload)
+		id, result, err = t.addStateFact(&s, d, fence, action.Payload)
 	case "fact_relation":
-		id, result, changed, err = t.addFactRelation(s, &d, fence, action.Payload)
+		id, result, changed, err = t.addFactRelation(s, d, fence, action.Payload)
 	case "finding":
-		id, result, changed, err = t.upsertFinding(s, &d, fence, action.Payload)
+		id, result, changed, err = t.upsertFinding(s, d, fence, action.Payload)
 	case "goal":
-		id, result, changed, err = t.changeGoal(s, &d, action.Payload)
+		id, result, changed, err = t.changeGoal(s, d, action.Payload)
 	case "step":
-		id, result, changed, err = t.changeStep(&s, &d, fence, action.Payload)
+		id, result, changed, err = t.changeStep(&s, d, fence, action.Payload)
 	case "complete":
 		var input struct {
 			From        []string `json:"from"`
@@ -532,6 +542,9 @@ func (t *Tx) stateAction(snapshot *State, fence ExecutionFence, action StateActi
 			var completed Intent
 			completed, err = t.CompleteProject(project, fence, input.From, input.Description)
 			id, result = completed.ID, completed
+			if err == nil {
+				s.Graph, err = t.Load(project)
+			}
 		}
 	}
 	if err != nil {
@@ -554,9 +567,12 @@ func (t *Tx) stateAction(snapshot *State, fence ExecutionFence, action StateActi
 	if err != nil {
 		return StateActionResult{}, err
 	}
-	current, err := t.State(project)
-	if err != nil {
-		return StateActionResult{}, err
+	current := s
+	if changed {
+		current, err = t.projectState(s.Graph, *d, s.Revision, s.DecisionRevision)
+		if err != nil {
+			return StateActionResult{}, err
+		}
 	}
 	if changed && (action.Op == "goal" || action.Op == "step") {
 		var transition struct {
@@ -915,6 +931,11 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 		d.Steps = append(d.Steps, stepMetadataFrom(step))
 		intent := Intent{ID: id, From: input.From, Description: step.Description, Creator: fence.Run, CreatedAt: t.Now}
 		s.Graph.Intents = append(s.Graph.Intents, intent)
+		// Load orders by created_at,rowid. A clock rollback can put a new
+		// intent before existing rows; equal timestamps retain insertion order.
+		for n := len(s.Graph.Intents) - 1; n > 0 && s.Graph.Intents[n-1].CreatedAt > intent.CreatedAt; n-- {
+			s.Graph.Intents[n-1], s.Graph.Intents[n] = s.Graph.Intents[n], s.Graph.Intents[n-1]
+		}
 		return id, step, true, t.saveIntent(s.Graph.Project.ID, intent)
 	}
 	if !slices.Contains([]string{"priority", "abandon"}, input.Action) || !required(input.Reason, 8192) || input.GoalID != "" || len(input.From) != 0 || input.Description != "" {
