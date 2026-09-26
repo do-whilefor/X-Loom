@@ -21,7 +21,6 @@ func graphActionPayloadSchema(kind string) map[string]any {
 		}
 		properties["from"] = ids
 		properties["priority"] = map[string]any{"type": "integer", "minimum": 0, "maximum": 1000000}
-		properties["final_report"] = map[string]any{"type": "boolean", "description": "Required true for final report Steps. All non-report Steps in this goal subtree and explicit source producers must be completed or abandoned; valid scoped facts are added to from automatically."}
 		properties["kind"] = map[string]any{"type": "string", "enum": []string{"supersedes", "refutes", "narrows"}}
 	} else {
 		properties["scope"] = text

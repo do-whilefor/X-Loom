@@ -321,8 +321,19 @@ func (s *Server) settings(t *b.Tx, q *request, r *http.Request) (int, any, error
 }
 func (s *Server) projects(t *b.Tx, q *request, r *http.Request) (int, any, error) {
 	if r.Method == "GET" {
-		out, err := t.ProjectSummaries()
-		return 200, out, err
+		ids, err := t.IDs()
+		if err != nil {
+			return 0, nil, err
+		}
+		out := []b.Summary{}
+		for _, id := range ids {
+			g, err := t.Load(id)
+			if err != nil {
+				return 0, nil, err
+			}
+			out = append(out, g.Summarize())
+		}
+		return 200, out, nil
 	}
 	title, origin, goal, bootstrap := q.text("title"), q.text("origin"), q.text("goal"), q.bootstrap()
 	scenario := ""

@@ -19,12 +19,6 @@ type contextFact struct {
 // registered graph snapshot. Original user input and the active step are
 // mandatory; omitted history can be obtained through paginated graph reads.
 func ContextView(state State, stepID string, maxBytes int) (json.RawMessage, error) {
-	return contextView(state, stepID, maxBytes, false)
-}
-
-// Admission shares the execution projection through its mandatory budget
-// check. It need not serialize optional history, which only fills spare space.
-func contextView(state State, stepID string, maxBytes int, mandatoryOnly bool) (json.RawMessage, error) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultContextViewBytes
 	}
@@ -123,9 +117,6 @@ func contextView(state State, stepID string, maxBytes int, mandatoryOnly bool) (
 	used := len(base)
 	if used > maxBytes {
 		return nil, errors.New("context view: original user inputs, hints, goal ancestry and current step exceed the budget")
-	}
-	if mandatoryOnly {
-		return base, nil
 	}
 	remaining := maxBytes - used
 	sectionLimit := used + remaining/2
@@ -256,7 +247,6 @@ type contextOverviewNode struct {
 	TextTruncated         bool     `json:"text_truncated,omitempty"`
 	Status                string   `json:"status,omitempty"`
 	GoalID                string   `json:"goal_id,omitempty"`
-	FinalReport           bool     `json:"final_report,omitempty"`
 	ParentID              string   `json:"parent_id,omitempty"`
 	Sources               []string `json:"sources,omitempty"`
 	SourcesOmitted        int      `json:"sources_omitted,omitempty"`
@@ -311,7 +301,7 @@ func buildContextOverview(state State, maxBytes int) (*contextOverview, error) {
 			priority = 0
 		}
 		invalid := append([]string(nil), step.InvalidSources[:min(len(step.InvalidSources), 16)]...)
-		add(1, priority, i, contextOverviewNode{ID: step.ID, Status: step.Status, GoalID: step.GoalID, FinalReport: step.FinalReport, InvalidSources: invalid, InvalidSourcesOmitted: len(step.InvalidSources) - len(invalid)}, step.Description, step.From)
+		add(1, priority, i, contextOverviewNode{ID: step.ID, Status: step.Status, GoalID: step.GoalID, InvalidSources: invalid, InvalidSourcesOmitted: len(step.InvalidSources) - len(invalid)}, step.Description, step.From)
 	}
 	for i, fact := range state.FactRecords {
 		priority := 3

@@ -12,15 +12,6 @@ func (t *Tx) CheckLegacyConclusion(project, worker string) error {
 	var raw []byte
 	err := t.QueryRow("SELECT job FROM xloom_executions WHERE project_id=? AND lease=?", project, worker).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
-		state, err := t.State(project)
-		if err != nil {
-			return err
-		}
-		for _, step := range state.Steps {
-			if step.FinalReport && Value(step.Worker) == worker {
-				return Err(409, "final_report requires a registered evidence-contract execution")
-			}
-		}
 		return nil
 	}
 	if err != nil {
@@ -56,9 +47,6 @@ func (t *Tx) ConcludeEvidenceStep(project string, fence ExecutionFence, factID s
 		return Conclusion{}, Err(403, "evidence conclusion requires an Execute lease")
 	}
 	if err = t.CheckExecution(s.Graph, fence); err != nil {
-		return Conclusion{}, err
-	}
-	if err = t.checkReportCompletion(s, fence); err != nil {
 		return Conclusion{}, err
 	}
 	if len(factPayload) != 0 {

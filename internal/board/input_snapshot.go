@@ -115,19 +115,7 @@ type SchedulePage struct {
 	ExecutionChecks  map[string]ExecutionCheck `json:"execution_checks,omitempty"`
 }
 
-const MaxSchedulePageSize = 1000
-
 func (t *Tx) ScheduleInput(project string, offset int, expected string) (SchedulePage, error) {
-	return t.ScheduleInputPage(project, offset, 100, expected)
-}
-
-// ScheduleInputPage amortizes state reconstruction across a larger, bounded
-// compact projection. Each page still reads current runtime fields and validates
-// its content version inside this transaction, without retaining a graph cache.
-func (t *Tx) ScheduleInputPage(project string, offset, limit int, expected string) (SchedulePage, error) {
-	if limit < 1 || limit > MaxSchedulePageSize {
-		return SchedulePage{}, Err(422, "scheduling limit must be between 1 and 1000")
-	}
 	s, err := t.State(project)
 	if err != nil {
 		return SchedulePage{}, err
@@ -155,7 +143,7 @@ func (t *Tx) ScheduleInputPage(project string, offset, limit int, expected strin
 		boot := i.To == nil && i.ConcludedAt == nil && i.Description == "bootstrap" && i.Creator == "dispatcher.bootstrap" && len(i.From) == 1 && i.From[0] == "origin"
 		p.Initial = p.Initial && boot
 	}
-	end := min(offset+limit, len(s.Graph.Intents))
+	end := min(offset+100, len(s.Graph.Intents))
 	for _, i := range s.Graph.Intents[offset:end] {
 		boot := i.Description == "bootstrap" && i.Creator == "dispatcher.bootstrap" && len(i.From) == 1 && i.From[0] == "origin"
 		if !boot {

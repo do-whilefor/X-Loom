@@ -12,9 +12,7 @@ import (
 func (s *Scheduler) scheduleInput(ctx context.Context, id string) (board.SchedulePage, error) {
 	var input board.SchedulePage
 	for offset := 0; ; {
-		// Larger compact pages avoid rebuilding the same graph every 100 steps.
-		// Older servers ignore limit and keep their existing paging behavior.
-		query := url.Values{"offset": {strconv.Itoa(offset)}, "limit": {strconv.Itoa(board.MaxSchedulePageSize)}, "namespace": {s.namespace()}}
+		query := url.Values{"offset": {strconv.Itoa(offset)}, "namespace": {s.namespace()}}
 		if offset > 0 {
 			query.Set("expected_version", input.StateVersion)
 		}
