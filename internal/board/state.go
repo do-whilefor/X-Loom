@@ -79,6 +79,7 @@ type Step struct {
 	Reason         string   `json:"reason,omitempty"`
 	CreatedAt      string   `json:"created_at"`
 	InvalidSources []string `json:"invalid_sources,omitempty"`
+	FinalReport    bool     `json:"final_report,omitempty"`
 }
 type Finding struct {
 	ID           string        `json:"id"`
@@ -126,15 +127,16 @@ type stateData struct {
 // Keep the legacy status key for rollback readers, but persist only the one
 // status not projected from the authoritative Intent and execution records.
 type stepMetadata struct {
-	ID       string `json:"id"`
-	GoalID   string `json:"goal_id"`
-	Priority int    `json:"priority"`
-	Reason   string `json:"reason,omitempty"`
-	Status   string `json:"status,omitempty"`
+	ID          string `json:"id"`
+	GoalID      string `json:"goal_id"`
+	Priority    int    `json:"priority"`
+	Reason      string `json:"reason,omitempty"`
+	Status      string `json:"status,omitempty"`
+	FinalReport bool   `json:"final_report,omitempty"`
 }
 
 func stepMetadataFrom(step Step) stepMetadata {
-	metadata := stepMetadata{ID: step.ID, GoalID: step.GoalID, Priority: step.Priority, Reason: step.Reason}
+	metadata := stepMetadata{ID: step.ID, GoalID: step.GoalID, Priority: step.Priority, Reason: step.Reason, FinalReport: step.FinalReport}
 	if step.Status == "abandoned" {
 		metadata.Status = "abandoned"
 	}
@@ -256,6 +258,7 @@ func (t *Tx) projectState(g Graph, d stateData, revision, decision int64) (State
 		for _, metadata := range d.Steps {
 			if metadata.ID == i.ID {
 				step.GoalID, step.Priority, step.Reason = metadata.GoalID, metadata.Priority, metadata.Reason
+				step.FinalReport = metadata.FinalReport
 				if metadata.Status == "abandoned" {
 					step.Status = "abandoned"
 				}
@@ -893,6 +896,7 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 		Description string   `json:"description"`
 		Priority    int      `json:"priority"`
 		Reason      string   `json:"reason"`
+		FinalReport bool     `json:"final_report"`
 	}
 	if err := decodeAction(raw, &input); err != nil {
 		return "", nil, false, err
@@ -917,7 +921,21 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 		if !goalOpen {
 			return "", nil, false, Err(409, "step requires an open goal")
 		}
+		if input.FinalReport {
+			scope, err := reportScope(*s, Step{GoalID: input.GoalID, From: input.From, FinalReport: true})
+			if err != nil {
+				return "", nil, false, err
+			}
+			for _, fact := range scope.FactRecords {
+				if fact.Status == "valid" && !slices.Contains(input.From, fact.ID) {
+					input.From = append(input.From, fact.ID)
+				}
+			}
+		}
 		if existing, ok := s.MatchingStep(input.GoalID, input.From, input.Description); ok {
+			if existing.FinalReport != input.FinalReport {
+				return "", nil, false, Err(409, "existing Step final_report designation is immutable")
+			}
 			return existing.ID, existing, false, nil
 		}
 		if err := t.CheckNewStepLimit(s.Graph.Project.ID, fence.Run); err != nil {
@@ -927,7 +945,7 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 		if err != nil {
 			return "", nil, false, err
 		}
-		step := Step{ID: id, From: input.From, GoalID: input.GoalID, Description: strings.TrimSpace(input.Description), Status: "open", Priority: input.Priority, CreatedAt: t.Now}
+		step := Step{ID: id, From: input.From, GoalID: input.GoalID, Description: strings.TrimSpace(input.Description), Status: "open", Priority: input.Priority, CreatedAt: t.Now, FinalReport: input.FinalReport}
 		d.Steps = append(d.Steps, stepMetadataFrom(step))
 		intent := Intent{ID: id, From: input.From, Description: step.Description, Creator: fence.Run, CreatedAt: t.Now}
 		s.Graph.Intents = append(s.Graph.Intents, intent)
@@ -938,7 +956,7 @@ func (t *Tx) changeStep(s *State, d *stateData, fence ExecutionFence, raw json.R
 		}
 		return id, step, true, t.saveIntent(s.Graph.Project.ID, intent)
 	}
-	if !slices.Contains([]string{"priority", "abandon"}, input.Action) || !required(input.Reason, 8192) || input.GoalID != "" || len(input.From) != 0 || input.Description != "" {
+	if !slices.Contains([]string{"priority", "abandon"}, input.Action) || !required(input.Reason, 8192) || input.GoalID != "" || len(input.From) != 0 || input.Description != "" || input.FinalReport {
 		return "", nil, false, Err(422, "step change requires a reason; existing task inputs are immutable")
 	}
 	for _, current := range s.Steps {
@@ -1041,6 +1059,9 @@ func (t *Tx) ValidateStateCompletion(project string, from []string) error {
 		return err
 	}
 	if err = s.ValidateFactSources(from, true); err != nil {
+		return err
+	}
+	if err = t.checkCompletionReports(s, from); err != nil {
 		return err
 	}
 	for _, goal := range s.Goals {

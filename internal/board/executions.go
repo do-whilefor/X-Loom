@@ -122,7 +122,7 @@ func (t *Tx) RegisterExecution(e Execution) error {
 		return err
 	}
 	if e.Kind != "reason" {
-		if err = t.StepReady(e.ProjectID, e.Intent); err != nil {
+		if err = t.executionStepReady(e); err != nil {
 			return err
 		}
 	}
@@ -201,7 +201,7 @@ func (t *Tx) ExecutionStatus(e Execution, status string, result json.RawMessage)
 		return Err(409, "only a pending result can be applied successfully")
 	}
 	if status == "running" && current.Status != "running" && current.Kind != "reason" {
-		if err = t.StepReady(current.ProjectID, current.Intent); err != nil {
+		if err = t.executionStepReady(current); err != nil {
 			return err
 		}
 	}
@@ -257,7 +257,7 @@ func (t *Tx) ResumeExecution(e Execution) error {
 			return err
 		}
 		if e.Status != "result_pending" {
-			if err = t.StepReady(e.ProjectID, e.Intent); err != nil {
+			if err = t.executionStepReady(e); err != nil {
 				return err
 			}
 		}

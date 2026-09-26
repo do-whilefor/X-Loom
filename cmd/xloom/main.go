@@ -13,7 +13,7 @@ import (
 	"syscall"
 )
 
-const usage = "Usage: xloom <serve|dispatch|worker> [options]\n"
+const usage = "Usage: xloom <serve|dispatch|worker|report> [options]\n"
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -39,6 +39,8 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		err = dispatch(ctx, args[1:], errOut)
 	case "worker":
 		err = work(ctx, args[1:], out, errOut)
+	case "report":
+		err = renderReport(args[1:], out, errOut)
 	default:
 		err = fmt.Errorf("unknown command %q", args[0])
 	}

@@ -19,7 +19,7 @@ func TestGraphActionSchemaDescribesModeFields(t *testing.T) {
 		kind   string
 		fields string
 	}{
-		{"reason", "action condition description from goal_id id kind parent_id priority reason source sources target"},
+		{"reason", "action condition description final_report from goal_id id kind parent_id priority reason source sources target"},
 		{"explore", "claim description evidence observed_at reason replace_support scope sources status"},
 	} {
 		t.Run(tc.kind, func(t *testing.T) {
@@ -50,7 +50,7 @@ func TestGraphActionSchemaDescribesModeFields(t *testing.T) {
 					want = "array"
 				case "priority":
 					want = "integer"
-				case "replace_support":
+				case "replace_support", "final_report":
 					want = "boolean"
 				}
 				if field.Type != want {
@@ -81,6 +81,7 @@ func TestGraphActionSchemaPreservesOperationPayloads(t *testing.T) {
 		{"reason", "goal", `{"action":"achieve","id":"g001","reason":"Verified","sources":["fact001"]}`},
 		{"reason", "goal", `{"action":"withdraw","id":"g001","reason":"No longer needed"}`},
 		{"reason", "step", `{"action":"add","from":["origin"],"description":"Inspect","goal_id":"g001","priority":1000000}`},
+		{"reason", "step", `{"action":"add","from":["origin"],"description":"Report","final_report":true}`},
 		{"reason", "step", `{"action":"abandon","id":"i001","reason":"Covered"}`},
 		{"reason", "step", `{"action":"priority","id":"i001","reason":"First","priority":0}`},
 		{"reason", "fact_relation", `{"kind":"supersedes","source":"fact002","target":"fact001","reason":"Corrected"}`},
@@ -113,6 +114,7 @@ func TestGraphActionSchemaRejectsMalformedScalarFields(t *testing.T) {
 		{"reason", "description", `7`},
 		{"reason", "condition", `null`},
 		{"reason", "goal_id", `{}`},
+		{"reason", "final_report", `"true"`},
 		{"explore", "scope", `false`},
 		{"explore", "observed_at", `7`},
 		{"explore", "claim", `[]`},
